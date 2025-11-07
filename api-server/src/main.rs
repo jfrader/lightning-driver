@@ -4,12 +4,12 @@ use actix_web::{
     delete, get,
     middleware::Logger,
     post,
-    web::{self, Data, Json},
+    web::{self, Data, Json, Query},
     App, HttpResponse, HttpServer, Responder,
 };
 use anyhow::Result;
 use argon2::{Argon2, PasswordHash, PasswordVerifier};
-use lightning_client::{connect_from_config, LightningClientDyn};
+use lightning_client::{connect_from_config, Invoice, LightningClientDyn};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::fs;
@@ -31,9 +31,44 @@ struct InvoiceReq {
     desc: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ListInvoicesReq {
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Deserialize)]
+struct DecodeReq {
+    bolt11: String,
+}
+
+#[derive(Deserialize)]
+struct PayReq {
+    bolt11: String,
+}
+
 #[derive(Serialize)]
 struct InvoiceResp {
     bolt11: String,
+}
+
+#[derive(Serialize)]
+struct ListInvoicesResp {
+    invoices: Vec<Invoice>,
+}
+
+#[derive(Serialize)]
+struct DecodeResp {
+    amount_msat: Option<u64>,
+    desc: Option<String>,
+    payee: Option<String>,
+}
+
+#[derive(Serialize)]
+struct PayResp {
+    hash: String,
+    amount_msat: u64,
+    fee_msat: Option<u64>,
 }
 
 // ---------------------------------------------------------------------
@@ -98,7 +133,7 @@ async fn login(payload: Json<LoginReq>, session: Session, cfg: Data<ApiConfig>) 
 
 #[delete("/logout")]
 async fn logout(session: Session) -> impl Responder {
-    session.purge(); // <-- Fixed: was `spy()`
+    session.purge();
     HttpResponse::Ok().json(json!({ "status": "logged out" }))
 }
 
@@ -143,6 +178,79 @@ async fn create_invoice(
     let desc = payload.desc.as_deref();
     match guard.create_invoice(payload.msat, None, desc).await {
         Ok(bolt11) => HttpResponse::Ok().json(InvoiceResp { bolt11 }),
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
+}
+
+#[get("/balance")]
+async fn get_balance(driver: Data<LightningClientDyn>, mut session: Session) -> impl Responder {
+    if require_auth(&mut session).await.is_err() {
+        return HttpResponse::Unauthorized().json(json!({ "error": "login required" }));
+    }
+
+    let mut guard = driver.lock().unwrap();
+    match guard.get_balance().await {
+        Ok(balance) => HttpResponse::Ok().json(balance),
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
+}
+
+#[get("/invoices")]
+async fn list_invoices(
+    driver: Data<LightningClientDyn>,
+    query: Query<ListInvoicesReq>,
+    mut session: Session,
+) -> impl Responder {
+    if require_auth(&mut session).await.is_err() {
+        return HttpResponse::Unauthorized().json(json!({ "error": "login required" }));
+    }
+
+    let limit = query.limit.unwrap_or(10);
+    let mut guard = driver.lock().unwrap();
+    match guard.list_invoices(Some(limit)).await {
+        Ok(invoices) => HttpResponse::Ok().json(ListInvoicesResp { invoices }),
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
+}
+
+#[post("/decode")]
+async fn decode_invoice(
+    driver: Data<LightningClientDyn>,
+    payload: Json<DecodeReq>,
+    mut session: Session,
+) -> impl Responder {
+    if require_auth(&mut session).await.is_err() {
+        return HttpResponse::Unauthorized().json(json!({ "error": "login required" }));
+    }
+
+    let mut guard = driver.lock().unwrap();
+    match guard.decode_invoice(&payload.bolt11).await {
+        Ok(decoded) => HttpResponse::Ok().json(DecodeResp {
+            amount_msat: decoded.amount_msat,
+            desc: decoded.desc,
+            payee: decoded.payee,
+        }),
+        Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
+    }
+}
+
+#[post("/pay")]
+async fn pay_invoice(
+    driver: Data<LightningClientDyn>,
+    payload: Json<PayReq>,
+    mut session: Session,
+) -> impl Responder {
+    if require_auth(&mut session).await.is_err() {
+        return HttpResponse::Unauthorized().json(json!({ "error": "login required" }));
+    }
+
+    let mut guard = driver.lock().unwrap();
+    match guard.pay_invoice(&payload.bolt11).await {
+        Ok(payment) => HttpResponse::Ok().json(PayResp {
+            hash: payment.hash,
+            amount_msat: payment.amount_msat,
+            fee_msat: payment.fee_msat,
+        }),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
     }
 }
@@ -201,7 +309,15 @@ async fn main() -> Result<()> {
             .wrap(session_mw)
             .service(login)
             .service(logout)
-            .service(web::scope("/api").service(get_info).service(create_invoice))
+            .service(
+                web::scope("/api")
+                    .service(get_info)
+                    .service(create_invoice)
+                    .service(get_balance)
+                    .service(list_invoices)
+                    .service(decode_invoice)
+                    .service(pay_invoice),
+            )
     })
     .bind(addr)?
     .run()

@@ -2,3 +2,8 @@
 config.toml
 session_key.bin
 cookies.txt
+project_source_bundled_for_ai.txt
+
+graphify-out/
+.idea/
+source-to-txt.sh
