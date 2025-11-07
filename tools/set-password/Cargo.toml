@@ -1,0 +1,10 @@
+[package]
+name = "set-password"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow    = { workspace = true }
+argon2    = { workspace = true }
+dialoguer = { workspace = true }
+toml_edit = { workspace = true }

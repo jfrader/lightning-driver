@@ -1,0 +1,19 @@
+[package]
+name = "api-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+actix-web = { workspace = true }
+anyhow = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+config = { workspace = true }
+
+# Auth
+actix-session = { version = "0.9", features = ["cookie-session"] }
+actix-web-lab = "0.20"
+argon2 = { workspace = true }
+
+lightning-client = { path = "../lightning-client", features = ["lnd-grpc", "cln"] }
