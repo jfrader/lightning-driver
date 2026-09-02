@@ -1,0 +1,261 @@
+{
+  "communities": {
+    "0": [
+      "api_server_src_main_listinvoicesresp",
+      "api_server_src_main_rs_vec",
+      "lightning_client_src_cln_clnclient_decode_invoice",
+      "lightning_client_src_cln_clnclient_pay_invoice",
+      "lightning_client_src_lib",
+      "lightning_client_src_lib_decodedinvoice",
+      "lightning_client_src_lib_invoice",
+      "lightning_client_src_lib_lightningclient",
+      "lightning_client_src_lib_nodeinfo",
+      "lightning_client_src_lib_paymentresult",
+      "lightning_client_src_lib_rs_option",
+      "lightning_client_src_lib_rs_string",
+      "lightning_client_src_lnd_grpc_lndgrpcwrapper_get_info",
+      "lightning_client_src_lnd_rest",
+      "lightning_client_src_lnd_rest_lndrestclient",
+      "lightning_client_src_lnd_rest_lndrestclient_create_invoice",
+      "lightning_client_src_lnd_rest_lndrestclient_decode_invoice",
+      "lightning_client_src_lnd_rest_lndrestclient_get_info",
+      "lightning_client_src_lnd_rest_lndrestclient_list_invoices",
+      "lightning_client_src_lnd_rest_lndrestclient_new",
+      "lightning_client_src_lnd_rest_lndrestclient_pay_invoice",
+      "lightning_client_src_lnd_rest_rs_client",
+      "lightning_client_src_lnd_rest_rs_option",
+      "lightning_client_src_lnd_rest_rs_result",
+      "lightning_client_src_lnd_rest_rs_self",
+      "lightning_client_src_lnd_rest_rs_string",
+      "lightning_client_src_lnd_rest_rs_vec"
+    ],
+    "1": [
+      "api_server_src_main",
+      "api_server_src_main_apiconfig",
+      "api_server_src_main_decodereq",
+      "api_server_src_main_decoderesp",
+      "api_server_src_main_default_host",
+      "api_server_src_main_default_port",
+      "api_server_src_main_invoicereq",
+      "api_server_src_main_invoiceresp",
+      "api_server_src_main_listinvoicesreq",
+      "api_server_src_main_load_or_create_session_key",
+      "api_server_src_main_loginreq",
+      "api_server_src_main_main",
+      "api_server_src_main_payreq",
+      "api_server_src_main_payresp",
+      "api_server_src_main_rs_option",
+      "api_server_src_main_rs_result",
+      "api_server_src_main_rs_string",
+      "key"
+    ],
+    "2": [
+      "api_server_src_main_create_invoice",
+      "api_server_src_main_decode_invoice",
+      "api_server_src_main_get_balance",
+      "api_server_src_main_get_info",
+      "api_server_src_main_list_invoices",
+      "api_server_src_main_login",
+      "api_server_src_main_logout",
+      "api_server_src_main_pay_invoice",
+      "api_server_src_main_require_auth",
+      "api_server_src_main_rs_lightningclientdyn",
+      "data",
+      "httpresponse",
+      "json",
+      "query",
+      "responder",
+      "session"
+    ],
+    "3": [
+      "lightning_client_src_lib_balance",
+      "lightning_client_src_lnd_grpc",
+      "lightning_client_src_lnd_grpc_lndgrpcwrapper",
+      "lightning_client_src_lnd_grpc_lndgrpcwrapper_connect",
+      "lightning_client_src_lnd_grpc_lndgrpcwrapper_create_invoice",
+      "lightning_client_src_lnd_grpc_lndgrpcwrapper_decode_invoice",
+      "lightning_client_src_lnd_grpc_lndgrpcwrapper_get_balance",
+      "lightning_client_src_lnd_grpc_lndgrpcwrapper_list_invoices",
+      "lightning_client_src_lnd_grpc_lndgrpcwrapper_pay_invoice",
+      "lightning_client_src_lnd_grpc_rs_option",
+      "lightning_client_src_lnd_grpc_rs_result",
+      "lightning_client_src_lnd_grpc_rs_self",
+      "lightning_client_src_lnd_grpc_rs_string",
+      "lightning_client_src_lnd_grpc_rs_vec",
+      "lightning_client_src_lnd_rest_lndrestclient_get_balance",
+      "lndclient"
+    ],
+    "4": [
+      "lightning_client_src_cln",
+      "lightning_client_src_cln_clnclient",
+      "lightning_client_src_cln_clnclient_create_invoice",
+      "lightning_client_src_cln_clnclient_get_balance",
+      "lightning_client_src_cln_clnclient_get_info",
+      "lightning_client_src_cln_clnclient_list_invoices",
+      "lightning_client_src_cln_clnclient_new",
+      "lightning_client_src_cln_rs_client",
+      "lightning_client_src_cln_rs_option",
+      "lightning_client_src_cln_rs_result",
+      "lightning_client_src_cln_rs_self",
+      "lightning_client_src_cln_rs_string",
+      "lightning_client_src_cln_rs_vec"
+    ],
+    "5": [
+      "lightning_client_src_config",
+      "lightning_client_src_config_clnconfig",
+      "lightning_client_src_config_lndgrpcconfig",
+      "lightning_client_src_config_lndrestconfig",
+      "lightning_client_src_config_nodeconfig",
+      "lightning_client_src_config_rs_option",
+      "lightning_client_src_config_rs_string",
+      "lightning_client_src_config_settings",
+      "lightning_client_src_factory",
+      "lightning_client_src_factory_connect_from_config",
+      "lightning_client_src_factory_rs_lightningclientdyn",
+      "lightning_client_src_factory_rs_result"
+    ],
+    "6": [
+      "pathbuf",
+      "tools_set_password_src_main",
+      "tools_set_password_src_main_find_config_toml",
+      "tools_set_password_src_main_main",
+      "tools_set_password_src_main_rs_result"
+    ],
+    "7": [
+      "pkg_api_server",
+      "pkg_lightning_client"
+    ],
+    "8": [
+      "source_to_txt",
+      "source_to_txt_sh__entry"
+    ],
+    "9": [
+      "pkg_set_password"
+    ]
+  },
+  "cohesion": {
+    "0": 0.11965811965811966,
+    "1": 0.21568627450980393,
+    "2": 0.35,
+    "3": 0.175,
+    "4": 0.23076923076923078,
+    "5": 0.2727272727272727,
+    "6": 0.6,
+    "7": 1.0,
+    "8": 1.0,
+    "9": 1.0
+  },
+  "gods": [
+    {
+      "id": "lightning_client_src_cln_clnclient",
+      "label": "ClnClient",
+      "degree": 11
+    },
+    {
+      "id": "lightning_client_src_lnd_rest_lndrestclient",
+      "label": "LndRestClient",
+      "degree": 11
+    },
+    {
+      "id": "api_server_src_main_require_auth",
+      "label": "require_auth()",
+      "degree": 10
+    },
+    {
+      "id": "lightning_client_src_lnd_grpc_lndgrpcwrapper",
+      "label": "LndGrpcWrapper",
+      "degree": 10
+    },
+    {
+      "id": "api_server_src_main_create_invoice",
+      "label": "create_invoice()",
+      "degree": 8
+    },
+    {
+      "id": "api_server_src_main_list_invoices",
+      "label": "list_invoices()",
+      "degree": 8
+    },
+    {
+      "id": "api_server_src_main_decode_invoice",
+      "label": "decode_invoice()",
+      "degree": 8
+    },
+    {
+      "id": "api_server_src_main_pay_invoice",
+      "label": "pay_invoice()",
+      "degree": 8
+    },
+    {
+      "id": "api_server_src_main_login",
+      "label": "login()",
+      "degree": 7
+    },
+    {
+      "id": "lightning_client_src_lib_invoice",
+      "label": "Invoice",
+      "degree": 7
+    }
+  ],
+  "surprises": [
+    {
+      "source": "main()",
+      "target": "connect_from_config()",
+      "source_files": [
+        "api-server/src/main.rs",
+        "lightning-client/src/factory.rs"
+      ],
+      "confidence": "INFERRED",
+      "relation": "calls",
+      "why": "inferred connection - not explicitly stated in source; connects across different repos/directories; bridges separate communities"
+    },
+    {
+      "source": "api-server",
+      "target": "lightning-client",
+      "source_files": [
+        "api-server/Cargo.toml",
+        "lightning-client/Cargo.toml"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "depends_on",
+      "why": "connects across different repos/directories"
+    },
+    {
+      "source": "ListInvoicesResp",
+      "target": "Invoice",
+      "source_files": [
+        "api-server/src/main.rs",
+        "lightning-client/src/lib.rs"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "references",
+      "why": "connects across different repos/directories"
+    },
+    {
+      "source": "ClnClient",
+      "target": "LightningClient",
+      "source_files": [
+        "lightning-client/src/cln.rs",
+        "lightning-client/src/lib.rs"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "implements",
+      "why": "bridges separate communities"
+    },
+    {
+      "source": "LndGrpcWrapper",
+      "target": "LightningClient",
+      "source_files": [
+        "lightning-client/src/lnd_grpc.rs",
+        "lightning-client/src/lib.rs"
+      ],
+      "confidence": "EXTRACTED",
+      "relation": "implements",
+      "why": "bridges separate communities"
+    }
+  ],
+  "tokens": {
+    "input": 0,
+    "output": 0
+  }
+}
