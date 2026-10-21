@@ -206,6 +206,15 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
     assert!(policy.get("database").is_none());
     assert!(policy.get("invoice_key_file").is_none());
     assert!(policy.get("nodes").is_none());
+    let response = test::call_service(
+        &app,
+        get("/api/v1/nodes").cookie(old_cookie.clone()).to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let fleet: Value = test::read_body_json(response).await;
+    assert_eq!(fleet["items"], json!([]));
+    assert_eq!(fleet["stale"], false);
 
     let fixtures: Value = serde_json::from_str(include_str!("fixtures/api-examples.json")).unwrap();
     let mut operation: Operation =
@@ -407,7 +416,6 @@ async fn legacy_routes_and_deferred_resources_cannot_grant_sessions_or_fake_succ
     for path in [
         "/api/info",
         "/api/balance",
-        "/api/v1/nodes",
         "/api/v1/nodes/lnd-lab/balances",
     ] {
         let response = test::call_service(&app, get(path).to_request()).await;

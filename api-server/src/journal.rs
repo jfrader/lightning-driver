@@ -342,23 +342,7 @@ impl Journal {
         node_id: String,
         max_items: usize,
     ) -> Result<(Vec<Operation>, bool), JournalError> {
-        self.run(move |connection| {
-            let count = i64::try_from(max_items.checked_add(1).ok_or(JournalError::Storage)?)
-                .map_err(|_| JournalError::Storage)?;
-            let mut statement = connection.prepare(
-                "SELECT body FROM operations WHERE node_id=?1 ORDER BY rowid DESC LIMIT ?2",
-            )?;
-            let rows =
-                statement.query_map(params![node_id, count], |row| row.get::<_, String>(0))?;
-            let mut operations = Vec::new();
-            for row in rows {
-                operations.push(serde_json::from_str(&row?)?);
-            }
-            let truncated = operations.len() > max_items;
-            operations.truncate(max_items);
-            Ok((operations, truncated))
-        })
-        .await
+        self.history(node_id, None, None, max_items).await
     }
 
     pub async fn claim(
@@ -523,31 +507,18 @@ fn save(connection: &Connection, operation: &Operation) -> Result<(), JournalErr
     Ok(())
 }
 
-fn expire_reviews(connection: &Connection, now: DateTime<Utc>) -> Result<(), JournalError> {
-    let mut statement = connection.prepare("SELECT body FROM operations WHERE dispatched=0")?;
-    let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-    let mut expired = Vec::new();
-    for row in rows {
-        let mut operation: Operation = serde_json::from_str(&row?)?;
-        if operation.state == OperationState::AwaitingConfirmation
-            && operation.review.expires_at <= now
-        {
-            operation.state = OperationState::Expired;
-            operation.updated_at = Utc::now();
-            expired.push(operation);
-        }
-    }
-    drop(statement);
-    for operation in expired {
-        save(connection, &operation)?;
-        connection.execute(
-            "DELETE FROM resource_claims WHERE operation_id=?1",
-            [operation.id.to_string()],
-        )?;
-        connection.execute(
-            "DELETE FROM pending_invoice_secrets WHERE operation_id=?1",
-            [operation.id.to_string()],
-        )?;
+pub(crate) fn expire_reviews(
+    connection: &Connection,
+    now: DateTime<Utc>,
+) -> Result<(), JournalError> {
+    crate::history::register_time_functions(connection)?;
+    connection.execute("UPDATE operations SET body=json_set(body,'$.state','expired','$.updated_at',?1)
+        WHERE dispatched=0 AND json_extract(body,'$.state')='awaiting_confirmation'
+        AND (creation_seconds(json_extract(body,'$.review.expires_at'))<?2 OR
+        (creation_seconds(json_extract(body,'$.review.expires_at'))=?2 AND creation_nanos(json_extract(body,'$.review.expires_at'))<=?3))",
+        params![Utc::now().to_rfc3339(),now.timestamp(),i64::from(now.timestamp_subsec_nanos())])?;
+    for table in ["resource_claims", "pending_invoice_secrets"] {
+        connection.execute(&format!("DELETE FROM {table} WHERE operation_id IN (SELECT id FROM operations WHERE dispatched=0 AND json_extract(body,'$.state')='expired')"),[])?;
     }
     Ok(())
 }

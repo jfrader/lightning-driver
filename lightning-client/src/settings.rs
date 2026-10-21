@@ -15,6 +15,8 @@ use url::Url;
 
 const MAX_SECRET_BYTES: u64 = 65536;
 pub const MAX_JSON_REQUEST_BYTES: usize = 128 * 1024;
+pub const MAX_BOLT11_BYTES: usize = 16384;
+pub const MAX_INVOICE_DESCRIPTION_CHARS: usize = 640;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -68,9 +70,12 @@ pub struct PaginationPolicy {
     pub snapshot_max_items: usize,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Limits {
+    pub snapshot_max_entries: usize,
+    pub snapshot_per_session: usize,
+    pub snapshot_cache_bytes: usize,
     pub session_absolute_seconds: u32,
     pub session_idle_seconds: u32,
     pub preauth_seconds: u32,
@@ -89,6 +94,9 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Self {
+            snapshot_max_entries: 64,
+            snapshot_per_session: 8,
+            snapshot_cache_bytes: 16 * 1024 * 1024,
             session_absolute_seconds: 28800,
             session_idle_seconds: 900,
             preauth_seconds: 300,
@@ -128,7 +136,7 @@ pub struct NodeSettings {
     pub peer_policy: PeerPolicy,
 }
 
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PeerPolicy {
     pub allowed_hosts: Vec<String>,
@@ -298,6 +306,13 @@ impl ApiSettings {
             return Err(SettingsError("Invalid server reauthentication policy"));
         }
         let l = &self.limits;
+        if l.pagination.snapshot_max_items.checked_add(1).is_none()
+            || l.snapshot_max_entries == 0
+            || l.snapshot_per_session == 0
+            || l.snapshot_cache_bytes == 0
+        {
+            return Err(SettingsError("Invalid snapshot cache bounds"));
+        }
         let p = &l.pagination;
         if [
             l.session_absolute_seconds,

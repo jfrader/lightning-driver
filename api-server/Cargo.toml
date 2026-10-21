@@ -11,7 +11,7 @@ serde_json = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 
 lightning-client = { path = "../lightning-client", features = ["lnd-grpc", "cln"] }
-rusqlite = { version = "=0.40.2", features = ["bundled"] }
+rusqlite = { version = "=0.40.2", features = ["bundled", "functions"] }
 chrono = { workspace = true }
 uuid = { workspace = true }
 sha2 = { workspace = true }
@@ -27,6 +27,8 @@ webauthn-rs = "=0.5.5"
 url = { workspace = true }
 
 [dev-dependencies]
+bitcoin = "0.32"
+lightning-invoice = "=0.34.1"
 reqwest = { workspace = true }
 tempfile = "3"
 webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }

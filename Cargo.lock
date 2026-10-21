@@ -313,12 +313,14 @@ name = "api-server"
 version = "0.1.0"
 dependencies = [
  "actix-web",
+ "bitcoin",
  "chacha20poly1305",
  "chrono",
  "clap",
  "hex",
  "libc",
  "lightning-client",
+ "lightning-invoice",
  "rand 0.8.5",
  "reqwest",
  "rusqlite",

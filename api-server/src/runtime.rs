@@ -58,7 +58,12 @@ pub async fn open_auth(settings: &Settings) -> Result<AuthHttp, StartupError> {
     let journal = Journal::open(settings.api.database.clone())
         .await
         .map_err(|_| StartupError::Storage)?;
-    AuthHttp::new(settings.api.clone(), journal).map_err(|_| StartupError::Configuration)
+    let mut auth =
+        AuthHttp::new(settings.api.clone(), journal).map_err(|_| StartupError::Configuration)?;
+    auth.registry = std::sync::Arc::new(
+        crate::registry::Registry::new(settings).map_err(|_| StartupError::Configuration)?,
+    );
+    Ok(auth)
 }
 
 fn instance_lock(database: &Path) -> Result<File, StartupError> {

@@ -1,6 +1,6 @@
 # Lightning node-manager backend
 
-This branch currently runs the **stage-1 passkey/session/configuration API**, not the complete node manager. Node resources, all three operational adapters, operation orchestration and the synthetic Lightning harness are still pending. Missing endpoints return JSON 404 errors; they do not report invented nodes, balances or successful actions.
+This branch currently runs the **passkey API, sanitized configured-node registry, durable operation history reads and local invoice decoding**, not the complete node manager. Live node collections, all three operational adapters, operation orchestration and the synthetic Lightning harness are still pending. Missing endpoints return JSON 404 errors; they do not report invented balances or successful actions.
 
 The versioned wire contract is [`api-server/openapi.json`](api-server/openapi.json). The frozen contract includes later-stage endpoints; their presence in that file is not an implementation claim.
 
@@ -13,7 +13,7 @@ The versioned wire contract is [`api-server/openapi.json`](api-server/openapi.js
 
 Copy `config.example.toml` into that directory and replace the example public hostname and RP ID with the exact intended hostname **before enrolling authenticators**. Relative database/key/certificate references resolve against the configuration file's directory, not the command's working directory.
 
-The example has `nodes = []`. No node credentials, certificates or real nodes are required for this checkpoint. `invoice_key_file` is a required typed configuration field reserved for the later operation engine; stage 1 does not open or create it. No money limits are inferred from this example.
+The example has `nodes = []`. No node credentials, certificates or real nodes are required for this checkpoint. `invoice_key_file` is a required typed configuration field reserved for the later operation engine; this checkpoint does not open or create it. No money limits are inferred from this example.
 
 Run the API:
 
@@ -97,6 +97,20 @@ recent_auth_seconds = 120
 
 This policy is exposed now and exercised in the core tests. Sensitive operation HTTP endpoints are deferred; this checkpoint must not be used to move funds.
 
+## Registry, history and decode reads
+
+Authenticated GET `/api/v1/nodes` returns the sorted configured registry, including a genuine fresh empty list when no nodes are configured. GET `/nodes/{node_id}`, `/status` and `/policy` under the same API prefix return sanitized registry/status/effective policy. No transport is connected in this checkpoint: node status is `unsupported` with `node_unverified`, nested freshness is stale with no observation, observed identity/revision/sync are null and network is `unknown`. The fleet snapshot itself is a fresh local observation. Mutation capabilities are disabled (`read_only` takes precedence, otherwise `unverified`). Configured expected identity/network are not advertised as verified observations.
+
+GET `/nodes/{node_id}/operations` and `/operations/{operation_id}` read the durable journal even for removed or retargeted node IDs. Lists support `state` (including `nonterminal`) and `kind`, ordered by exact creation time descending then ID ascending. Filters apply in SQLite before the snapshot bound. Unresolved counts use all nonterminal records, not a capped page. Historical review identities are never rewritten to the current configured binding. Mixed historical bindings produce page network `unknown`; a single historical binding retains its original network. These reads perform no node reconciliation or mutation.
+
+POST `/nodes/{node_id}/decode` requires the normal session/Origin/CSRF boundary and JSON `{ "bolt11": "..." }`. It uses the maintained local BOLT11 parser even for read-only/unverified nodes; an unobserved node network yields `network_matches_node: null`. Malformed invoices fail; valid expired invoices decode with `expired: true`. This call never pays or acquires a journal claim.
+
+Collection cursors are random opaque server-held snapshot tokens. They bind authenticated session, resource, node/config/history identity scope, filters and limit. Immutable rows and observation time do not shift between pages. TTL/restart returns `410 cursor_expired`; malformed cursors or changed selectors/session return `400 invalid_cursor`. A truncated snapshot remains truncated on its final page even with no next cursor. Query keys are explicit; duplicate/unknown keys and noncanonical/invalid explicit limits fail rather than falling back to defaults.
+
+Central `[api.limits]` cache defaults are `snapshot_max_entries=64`, `snapshot_per_session=8`, `snapshot_cache_bytes=16777216`. `[api.limits.pagination]` defaults are `default_limit=50`, `max_limit=200`, `snapshot_ttl_seconds=120`, `snapshot_max_items=10000`. Cache entry counts, serialized row bytes and per-snapshot row/token counts are bounded; expired allocations are reclaimed on requests without background workers. Repeated abandoned reads can hit `429 rate_limited` until expiry. Restart discards cursors, not history.
+
+Fingerprints are centralized SHA-256 digests of deterministic typed JSON tuples. Internal binding input is `binding-v1`, node ID, backend, expected pubkey/network, endpoint and certificate/credential file references (not file contents). Policy input is `policy-v1`, that binding digest, money policy, peer egress policy, read-only flag, public origin, RP ID, explicit development exception, global reauth policy and runtime limits. File-reference rotation changes the digest; credential bytes are deliberately not read in this checkpoint. Actual transport observations must extend verified identity binding in the adapter stage; no verified identity revision is exposed yet. History scope hashes sorted distinct immutable review bindings; fleet scope hashes sorted IDs/binding/policy digests. Neither raw endpoint nor credential references are returned in DTOs.
+
 ## Verification
 
 From the workspace root:
@@ -109,6 +123,6 @@ CARGO_BUILD_JOBS=2 cargo check -p lightning-client --no-default-features
 CARGO_BUILD_JOBS=2 cargo check -p lightning-client --all-features
 ```
 
-The stage-1 integration tests use the production application factory, real software-authenticator ceremonies, temporary synthetic configuration and finite CLI subprocesses. They cover token hashing/one-use, recovery refusal/revocation, restart persistence, instance locking, legacy-route rejection, safe config/error responses and a finite loopback serve smoke test. Spawned children are awaited/terminated; no real Lightning node or funds are involved. Feature compilation is not proof that the deferred adapters satisfy the complete MVP.
+Integration tests use the production application factory, real software-authenticator ceremonies, temporary synthetic configuration and finite CLI subprocesses. Registry/history/decode tests additionally cover safe projection, strict boundaries, stable filtered snapshots, session/selector/TTL/restart binding, cache limits, exact unresolved counts, removed/retargeted identities, nanosecond ordering and signed synthetic invoices. Set `STAGE2A_EVIDENCE_DIR` to a scratch directory while running `cargo test -p api-server --test stage2a` to capture representative actual response JSON tagged with frozen schema names for independent validation. No real Lightning node or funds are involved. Feature compilation is not proof that the deferred adapters satisfy the complete MVP.
 
 For an intentional local reset, stop the API and remove **only the synthetic state directory you created** under `/tmp/lightning-driver/`, then recreate it and enroll again. Authentication recovery is the alternative when operation history must be retained. Do not delete a real journal, rotate its key or copy a live SQLite main file alone as a substitute for a reviewed backup/recovery procedure.
