@@ -512,13 +512,33 @@ pub(crate) fn expire_reviews(
     now: DateTime<Utc>,
 ) -> Result<(), JournalError> {
     crate::history::register_time_functions(connection)?;
-    connection.execute("UPDATE operations SET body=json_set(body,'$.state','expired','$.updated_at',?1)
-        WHERE dispatched=0 AND json_extract(body,'$.state')='awaiting_confirmation'
-        AND (creation_seconds(json_extract(body,'$.review.expires_at'))<?2 OR
-        (creation_seconds(json_extract(body,'$.review.expires_at'))=?2 AND creation_nanos(json_extract(body,'$.review.expires_at'))<=?3))",
-        params![Utc::now().to_rfc3339(),now.timestamp(),i64::from(now.timestamp_subsec_nanos())])?;
+    connection.execute(
+        "UPDATE operations
+         SET body=json_set(body,'$.state','expired','$.updated_at',?1)
+         WHERE dispatched=0
+           AND json_extract(body,'$.state')='awaiting_confirmation'
+           AND (
+             creation_seconds(json_extract(body,'$.review.expires_at'))<?2
+             OR (
+               creation_seconds(json_extract(body,'$.review.expires_at'))=?2
+               AND creation_nanos(json_extract(body,'$.review.expires_at'))<=?3
+             )
+           )",
+        params![
+            Utc::now().to_rfc3339(),
+            now.timestamp(),
+            i64::from(now.timestamp_subsec_nanos()),
+        ],
+    )?;
     for table in ["resource_claims", "pending_invoice_secrets"] {
-        connection.execute(&format!("DELETE FROM {table} WHERE operation_id IN (SELECT id FROM operations WHERE dispatched=0 AND json_extract(body,'$.state')='expired')"),[])?;
+        let statement = format!(
+            "DELETE FROM {table}
+             WHERE operation_id IN (
+               SELECT id FROM operations
+               WHERE dispatched=0 AND json_extract(body,'$.state')='expired'
+             )"
+        );
+        connection.execute(&statement, [])?;
     }
     Ok(())
 }
