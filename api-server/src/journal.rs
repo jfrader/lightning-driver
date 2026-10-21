@@ -21,6 +21,8 @@ use uuid::Uuid;
 use zeroize::Zeroizing;
 
 const SQLITE_BUSY_SECONDS: u64 = 3;
+const SQLITE_WORKERS: usize = 4;
+const PAYMENT_RESOURCE_PREFIX: &str = "payment:";
 
 #[derive(Debug, thiserror::Error)]
 pub enum JournalError {
@@ -58,6 +60,7 @@ impl From<serde_json::Error> for JournalError {
 #[derive(Clone)]
 pub struct Journal {
     path: Arc<PathBuf>,
+    workers: Arc<tokio::sync::Semaphore>,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +74,30 @@ pub enum Claimed {
     New(Box<Operation>),
     Existing(Box<Operation>),
 }
+
+#[derive(Clone)]
+pub enum Resource {
+    Intent(String),
+    Payment(String),
+    Wallet,
+    Peer(String),
+    Channel(String),
+}
+
+impl Resource {
+    fn key(&self) -> String {
+        match self {
+            Self::Intent(hash) => format!("intent:{hash}"),
+            Self::Payment(hash) => format!("{PAYMENT_RESOURCE_PREFIX}{hash}"),
+            Self::Wallet => "wallet".into(),
+            Self::Peer(key) => format!("peer:{key}"),
+            Self::Channel(id) => format!("channel:{id}"),
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct SealedInvoiceSecret(Vec<u8>);
 
 pub struct PendingSecretKey {
     bytes: Zeroizing<[u8; 32]>,
@@ -87,7 +114,7 @@ impl PendingSecretKey {
         &self,
         operation: &Operation,
         secret: &[u8; 32],
-    ) -> Result<Vec<u8>, JournalError> {
+    ) -> Result<SealedInvoiceSecret, JournalError> {
         let mut nonce = [0u8; 24];
         OsRng.fill_bytes(&mut nonce);
         let context = serde_json::to_vec(&(
@@ -108,14 +135,15 @@ impl PendingSecretKey {
             .map_err(|_| JournalError::Secret)?;
         let mut sealed = nonce.to_vec();
         sealed.extend(encrypted);
-        Ok(sealed)
+        Ok(SealedInvoiceSecret(sealed))
     }
 
     pub fn decrypt(
         &self,
         operation: &Operation,
-        sealed: &[u8],
+        sealed: &SealedInvoiceSecret,
     ) -> Result<Zeroizing<[u8; 32]>, JournalError> {
+        let sealed = &sealed.0;
         if sealed.len() != 24 + 32 + 16 {
             return Err(JournalError::Secret);
         }
@@ -150,6 +178,7 @@ impl Journal {
     pub async fn open(path: PathBuf) -> Result<Self, JournalError> {
         let journal = Self {
             path: Arc::new(path),
+            workers: Arc::new(tokio::sync::Semaphore::new(SQLITE_WORKERS)),
         };
         journal.run(|connection| {
             connection.execute_batch("PRAGMA journal_mode=WAL;
@@ -171,7 +200,13 @@ impl Journal {
         action: impl FnOnce(&mut Connection) -> Result<T, JournalError> + Send + 'static,
     ) -> Result<T, JournalError> {
         let path = self.path.clone();
+        let permit = self
+            .workers
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| JournalError::Storage)?;
         tokio::task::spawn_blocking(move || {
+            let _permit = permit;
             ensure_protected(&path)?;
             let mut connection = Connection::open(path.as_path())?;
             connection.busy_timeout(Duration::from_secs(SQLITE_BUSY_SECONDS))?;
@@ -248,9 +283,17 @@ impl Journal {
         &self,
         operation: Operation,
         request_key: Uuid,
-        resources: Vec<String>,
-        secret: Option<Vec<u8>>,
+        resources: Vec<Resource>,
+        secret: Option<SealedInvoiceSecret>,
     ) -> Result<Created, JournalError> {
+        if secret.is_some()
+            && !matches!(
+                operation.request,
+                lightning_client::model::OperationRequest::CreateInvoice(_)
+            )
+        {
+            return Err(JournalError::NotReviewable);
+        }
         let digest = Sha256::digest(serde_json::to_vec(&operation.request)?).to_vec();
         self.run(move |connection| {
             let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -261,16 +304,16 @@ impl Journal {
             }
             expire_reviews(&tx,Utc::now())?;
             for resource in &resources {
-                if let Some(blocker)=tx.query_row("SELECT operation_id FROM resource_claims WHERE node_id=?1 AND resource=?2",params![operation.node_id,resource],|row|row.get::<_,String>(0)).optional()? {
+                if let Some(blocker)=tx.query_row("SELECT operation_id FROM resource_claims WHERE node_id=?1 AND resource=?2",params![operation.node_id,resource.key()],|row|row.get::<_,String>(0)).optional()? {
                     let id=Uuid::parse_str(&blocker).map_err(|_|JournalError::Storage)?;
                     let previous=load(&tx,id)?;
-                    if previous.state==OperationState::Succeeded && resource.starts_with("payment:") { return Err(JournalError::AlreadyPaid(id)); }
+                    if previous.state==OperationState::Succeeded && matches!(resource,Resource::Payment(_)) { return Err(JournalError::AlreadyPaid(id)); }
                     return Err(JournalError::ResourceBusy(id));
                 }
             }
             tx.execute("INSERT INTO operations(id,node_id,request_key,request_digest,body) VALUES(?1,?2,?3,?4,?5)",params![operation.id.to_string(),operation.node_id,request_key.to_string(),digest,serde_json::to_string(&operation)?])?;
-            for resource in resources { tx.execute("INSERT INTO resource_claims(node_id,resource,operation_id) VALUES(?1,?2,?3)",params![operation.node_id,resource,operation.id.to_string()])?; }
-            if let Some(ciphertext)=secret { tx.execute("INSERT INTO pending_invoice_secrets(operation_id,ciphertext) VALUES(?1,?2)",params![operation.id.to_string(),ciphertext])?; }
+            for resource in resources { tx.execute("INSERT INTO resource_claims(node_id,resource,operation_id) VALUES(?1,?2,?3)",params![operation.node_id,resource.key(),operation.id.to_string()])?; }
+            if let Some(ciphertext)=secret { tx.execute("INSERT INTO pending_invoice_secrets(operation_id,ciphertext) VALUES(?1,?2)",params![operation.id.to_string(),ciphertext.0])?; }
             tx.commit()?;
             Ok(Created::New(Box::new(operation)))
         }).await
@@ -383,7 +426,7 @@ impl Journal {
             save(&tx,&operation)?;
             if state.terminal() {
                 if state==OperationState::Succeeded && matches!(operation.request,lightning_client::model::OperationRequest::PayInvoice(_)) {
-                    tx.execute("DELETE FROM resource_claims WHERE operation_id=?1 AND resource NOT LIKE 'payment:%'",[id.to_string()])?;
+                    tx.execute("DELETE FROM resource_claims WHERE operation_id=?1 AND resource NOT LIKE ?2",params![id.to_string(),format!("{PAYMENT_RESOURCE_PREFIX}%")])?;
                 } else { tx.execute("DELETE FROM resource_claims WHERE operation_id=?1",[id.to_string()])?; }
                 tx.execute("DELETE FROM pending_invoice_secrets WHERE operation_id=?1",[id.to_string()])?;
             }
@@ -391,7 +434,10 @@ impl Journal {
         }).await
     }
 
-    pub async fn pending_secret(&self, id: Uuid) -> Result<Option<Vec<u8>>, JournalError> {
+    pub async fn pending_secret(
+        &self,
+        id: Uuid,
+    ) -> Result<Option<SealedInvoiceSecret>, JournalError> {
         self.run(move |connection| {
             Ok(connection
                 .query_row(
@@ -399,7 +445,8 @@ impl Journal {
                     [id.to_string()],
                     |row| row.get(0),
                 )
-                .optional()?)
+                .optional()?
+                .map(SealedInvoiceSecret))
         })
         .await
     }
@@ -564,7 +611,7 @@ mod tests {
         let (directory, journal) = store().await;
         let original = operation();
         let key = Uuid::new_v4();
-        let resources = vec!["payment:synthetic".into(), "wallet".into()];
+        let resources = vec![Resource::Payment("synthetic".into()), Resource::Wallet];
         assert!(matches!(
             journal
                 .create(original.clone(), key, resources.clone(), None)
@@ -611,7 +658,7 @@ mod tests {
         ));
         assert!(matches!(
             reopened
-                .create(operation(), Uuid::new_v4(), vec!["wallet".into()], None)
+                .create(operation(), Uuid::new_v4(), vec![Resource::Wallet], None)
                 .await,
             Err(JournalError::ResourceBusy(_))
         ));
@@ -640,7 +687,12 @@ mod tests {
         let mut expired = operation();
         expired.review.expires_at = Utc::now() - chrono::Duration::seconds(1);
         journal
-            .create(expired.clone(), Uuid::new_v4(), vec!["wallet".into()], None)
+            .create(
+                expired.clone(),
+                Uuid::new_v4(),
+                vec![Resource::Wallet],
+                None,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -653,7 +705,12 @@ mod tests {
         );
         let current = operation();
         journal
-            .create(current.clone(), Uuid::new_v4(), vec!["wallet".into()], None)
+            .create(
+                current.clone(),
+                Uuid::new_v4(),
+                vec![Resource::Wallet],
+                None,
+            )
             .await
             .unwrap();
         journal.recover(Utc::now()).await.unwrap();
@@ -718,7 +775,7 @@ mod tests {
         let original = operation();
         let secret = [8; 32];
         let sealed = key.encrypt(&original, &secret).unwrap();
-        assert!(!sealed.windows(32).any(|bytes| bytes == secret));
+        assert!(!sealed.0.windows(32).any(|bytes| bytes == secret));
         assert_eq!(*key.decrypt(&original, &sealed).unwrap(), secret);
         let mut retargeted = original.clone();
         retargeted.review.node.identity_revision.push_str("changed");
@@ -727,7 +784,7 @@ mod tests {
             Err(JournalError::Secret)
         ));
         let mut tampered = sealed.clone();
-        tampered[25] ^= 1;
+        tampered.0[25] ^= 1;
         assert!(matches!(
             key.decrypt(&original, &tampered),
             Err(JournalError::Secret)
