@@ -10,7 +10,7 @@ serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 clap = { version = "4.5", features = ["derive"] }
 
-lightning-client = { path = "../lightning-client", features = ["lnd-grpc", "cln"] }
+lightning-client = { path = "../lightning-client" }
 rusqlite = { version = "=0.40.2", features = ["bundled", "functions"] }
 chrono = { workspace = true }
 uuid = { workspace = true }

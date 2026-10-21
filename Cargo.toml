@@ -6,8 +6,6 @@ members = [
 resolver = "2"
 
 [workspace.dependencies]
-anyhow      = "1"
-async-trait = "0.1"
 base64      = "0.21"
 config      = "0.14"
 hex         = "0.4"

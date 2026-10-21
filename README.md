@@ -4,6 +4,8 @@ This branch currently runs the **passkey API, sanitized configured-node registry
 
 The versioned wire contract is [`api-server/openapi.json`](api-server/openapi.json). The frozen contract includes later-stage endpoints; their presence in that file is not an implementation claim.
 
+`lightning-client` owns the shared `model`, `money`, `settings` and `validation` modules. The legacy single-node `LightningClient` interface, configuration factory and transport wrappers are removed; CLN and LND adapters live in `api-server` without client-crate feature flags.
+
 ## Requirements and configuration
 
 - Rust/Cargo 1.93.1; workspace edition remains 2021.
