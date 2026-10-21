@@ -28,6 +28,7 @@ url = { workspace = true }
 bitcoin = "0.32"
 lightning-invoice = "=0.34.1"
 libc = "0.2"
+ipnet = { version = "2", features = ["serde"] }
 
 # -----------------------------------------------------------------
 # Features

@@ -10,6 +10,7 @@ pub struct ApiError {
     pub code: ErrorCode,
     pub operation_id: Option<Uuid>,
     pub outcome: ErrorOutcome,
+    retry_after: Option<u64>,
 }
 
 #[derive(Serialize)]
@@ -23,6 +24,7 @@ impl ApiError {
             code,
             operation_id: None,
             outcome: ErrorOutcome::NotDispatched,
+            retry_after: None,
         }
     }
     fn message(&self) -> &'static str {
@@ -93,7 +95,7 @@ impl ResponseError for ApiError {
         let mut response = HttpResponse::build(self.status_code());
         response.insert_header(("Cache-Control", "no-store"));
         if self.code == ErrorCode::RateLimited {
-            response.insert_header(("Retry-After", "60"));
+            response.insert_header(("Retry-After", self.retry_after.unwrap_or(60).to_string()));
         }
         response.json(ErrorEnvelope {
             error: ErrorDetail {
@@ -109,6 +111,11 @@ impl ResponseError for ApiError {
 
 impl From<AuthError> for ApiError {
     fn from(error: AuthError) -> Self {
+        if let AuthError::AllocationLimited(seconds) = error {
+            let mut error = Self::new(ErrorCode::RateLimited);
+            error.retry_after = Some(seconds);
+            return error;
+        }
         Self::new(match error {
             AuthError::Session => ErrorCode::SessionRequired,
             AuthError::Csrf => ErrorCode::Csrf,
@@ -116,6 +123,7 @@ impl From<AuthError> for ApiError {
             AuthError::Challenge => ErrorCode::ChallengeInvalid,
             AuthError::Expired => ErrorCode::ChallengeExpired,
             AuthError::Limited => ErrorCode::RateLimited,
+            AuthError::AllocationLimited(_) => ErrorCode::RateLimited,
             AuthError::Authorization => ErrorCode::AuthorizationInvalid,
             AuthError::NotRequired => ErrorCode::AuthorizationNotRequired,
             AuthError::Storage => ErrorCode::StorageUnavailable,
@@ -139,6 +147,7 @@ impl From<JournalError> for ApiError {
             code,
             operation_id: id,
             outcome: ErrorOutcome::NotDispatched,
+            retry_after: None,
         }
     }
 }

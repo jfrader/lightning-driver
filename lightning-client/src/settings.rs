@@ -40,9 +40,33 @@ pub struct ApiSettings {
     #[serde(default)]
     pub allow_insecure_loopback: bool,
     #[serde(default)]
+    pub client_identity: ClientIdentitySettings,
+    #[serde(default)]
     pub reauth: ReauthPolicy,
     #[serde(default)]
     pub limits: Limits,
+}
+
+#[derive(Clone, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ClientIdentitySettings {
+    pub mode: ClientIdentityMode,
+    pub trusted_proxy_cidrs: Vec<ipnet::IpNet>,
+    pub header: Option<ClientIdentityHeader>,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientIdentityMode {
+    #[default]
+    SocketPeer,
+    TrustedSingleProxy,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+pub enum ClientIdentityHeader {
+    #[serde(rename = "x-real-ip")]
+    XRealIp,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -274,6 +298,16 @@ impl ApiSettings {
     }
     pub fn validate(&self) -> Result<(), SettingsError> {
         let origin = &self.public_origin;
+        let identity = &self.client_identity;
+        if identity
+            .trusted_proxy_cidrs
+            .iter()
+            .any(|cidr| cidr.prefix_len() == 0)
+            || (identity.mode == ClientIdentityMode::TrustedSingleProxy
+                && (identity.trusted_proxy_cidrs.is_empty() || identity.header.is_none()))
+        {
+            return Err(SettingsError("Invalid trusted client identity policy"));
+        }
         let origin_loopback = match origin.host() {
             Some(url::Host::Domain("localhost")) => true,
             Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
@@ -437,6 +471,7 @@ mod tests {
             database: PathBuf::from("unused.sqlite"),
             invoice_key_file: PathBuf::from("unused.key"),
             allow_insecure_loopback: development,
+            client_identity: Default::default(),
             reauth: ReauthPolicy::default(),
             limits: Limits::default(),
         }
@@ -466,6 +501,29 @@ mod tests {
             recent_auth_seconds: Some(0),
         };
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn trusted_identity_requires_explicit_bounded_cidrs_and_fixed_header() {
+        let mut settings = api("https://manager.example.invalid", false);
+        settings.client_identity.mode = ClientIdentityMode::TrustedSingleProxy;
+        assert!(settings.validate().is_err());
+        settings.client_identity.trusted_proxy_cidrs = vec!["192.0.2.10/32".parse().unwrap()];
+        assert!(settings.validate().is_err());
+        settings.client_identity.header = Some(ClientIdentityHeader::XRealIp);
+        assert!(settings.validate().is_ok());
+        for cidr in ["0.0.0.0/0", "::/0"] {
+            settings.client_identity.trusted_proxy_cidrs = vec![cidr.parse().unwrap()];
+            assert!(settings.validate().is_err());
+        }
+        for value in [
+            serde_json::json!({"mode":"auto"}),
+            serde_json::json!({"header":"x-forwarded-for"}),
+            serde_json::json!({"trusted_proxy_cidrs":["not a cidr"]}),
+            serde_json::json!({"hops":2}),
+        ] {
+            assert!(serde_json::from_value::<ClientIdentitySettings>(value).is_err());
+        }
     }
     #[test]
     fn peer_input_is_not_a_url_or_credentials() {
