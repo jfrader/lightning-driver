@@ -75,7 +75,7 @@ pub enum Claimed {
     Existing(Box<Operation>),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub enum Resource {
     Intent(String),
     Payment(String),
@@ -286,6 +286,13 @@ impl Journal {
         resources: Vec<Resource>,
         secret: Option<SealedInvoiceSecret>,
     ) -> Result<Created, JournalError> {
+        let resources: std::collections::BTreeSet<Resource> = resources.into_iter().collect();
+        if !operation.binding_is_valid()
+            || operation.state != OperationState::AwaitingConfirmation
+            || operation.stage != OperationStage::NotDispatched
+        {
+            return Err(JournalError::NotReviewable);
+        }
         if secret.is_some()
             && !matches!(
                 operation.request,
@@ -767,6 +774,59 @@ mod tests {
             Err(JournalError::Revoked)
         ));
         assert_eq!(journal.authentication().await.unwrap().1, generation + 1);
+    }
+
+    #[tokio::test]
+    async fn invalid_identity_or_sensitivity_binding_is_not_journalled() {
+        let (_directory, journal) = store().await;
+        let mut invalid = operation();
+        invalid.review.operation_id = Uuid::new_v4();
+        assert!(matches!(
+            journal.create(invalid, Uuid::new_v4(), vec![], None).await,
+            Err(JournalError::NotReviewable)
+        ));
+        let mut invalid = operation();
+        invalid.review.node.node_id = "different-node".into();
+        assert!(matches!(
+            journal.create(invalid, Uuid::new_v4(), vec![], None).await,
+            Err(JournalError::NotReviewable)
+        ));
+        let mut invalid = operation();
+        invalid.review.sensitive = false;
+        assert!(matches!(
+            journal.create(invalid, Uuid::new_v4(), vec![], None).await,
+            Err(JournalError::NotReviewable)
+        ));
+        let (operations, truncated) = journal.list("lnd-lab".into(), 1).await.unwrap();
+        assert!(operations.is_empty());
+        assert!(!truncated);
+    }
+
+    #[tokio::test]
+    async fn duplicate_resources_are_one_atomic_claim() {
+        let (_directory, journal) = store().await;
+        let original = operation();
+        journal
+            .create(
+                original.clone(),
+                Uuid::new_v4(),
+                vec![
+                    Resource::Wallet,
+                    Resource::Wallet,
+                    Resource::Payment("synthetic".into()),
+                    Resource::Payment("synthetic".into()),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            claim(&journal, &original).await.unwrap(),
+            Claimed::New(_)
+        ));
+        assert!(
+            matches!(journal.create(operation(),Uuid::new_v4(),vec![Resource::Wallet],None).await,Err(JournalError::ResourceBusy(id)) if id==original.id)
+        );
     }
 
     #[test]

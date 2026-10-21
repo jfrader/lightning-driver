@@ -263,6 +263,16 @@ impl AuthManager {
             last_authenticated_at: authenticated.then_some(now),
         };
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
+        if memory
+            .contexts
+            .values()
+            .any(|context| context.generation > generation)
+        {
+            return Err(AuthError::Session);
+        }
+        memory
+            .contexts
+            .retain(|_, context| context.generation >= generation);
         memory.prune(now);
         if memory
             .contexts
@@ -297,6 +307,9 @@ impl AuthManager {
         }
         let generation = self.journal.authentication().await?.1;
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
+        memory
+            .contexts
+            .retain(|_, context| context.generation >= generation);
         memory.prune(now);
         let context = memory.contexts.get_mut(&key).ok_or(AuthError::Session)?;
         if context.generation != generation
@@ -465,7 +478,10 @@ impl AuthManager {
         operation: &Operation,
         now: DateTime<Utc>,
     ) -> Result<AuthorizationStart, AuthError> {
-        if !operation.review.sensitive {
+        if !operation.binding_is_valid() {
+            return Err(AuthError::Authorization);
+        }
+        if !operation.request.sensitive() {
             return Err(AuthError::NotRequired);
         }
         if operation.state != OperationState::AwaitingConfirmation
@@ -516,7 +532,8 @@ impl AuthManager {
         let Purpose::Operation { state, binding } = ceremony.purpose else {
             return Err(AuthError::Challenge);
         };
-        if binding != GrantBinding::from_operation(operation)
+        if !operation.binding_is_valid()
+            || binding != GrantBinding::from_operation(operation)
             || operation.state != OperationState::AwaitingConfirmation
             || operation.review.expires_at <= now
         {
@@ -543,7 +560,10 @@ impl AuthManager {
         authorization_id: Option<Uuid>,
         now: DateTime<Utc>,
     ) -> Result<(), AuthError> {
-        if !operation.review.sensitive {
+        if !operation.binding_is_valid() {
+            return Err(AuthError::Authorization);
+        }
+        if !operation.request.sensitive() {
             return if authorization_id.is_none() {
                 Ok(())
             } else {
@@ -914,6 +934,17 @@ mod tests {
         let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
         let session = enroll(&manager, &settings, &mut authenticator, now).await;
         let operation = operation();
+        let mut inconsistent = operation.clone();
+        inconsistent.review.sensitive = false;
+        assert!(matches!(
+            manager
+                .start_authorization(&session.context, &inconsistent, now)
+                .await,
+            Err(AuthError::Authorization)
+        ));
+        assert!(manager
+            .consume_grant(&session.context, &inconsistent, None, now)
+            .is_err());
         assert!(manager
             .consume_grant(&session.context, &operation, None, now)
             .is_err());
@@ -1036,6 +1067,14 @@ mod tests {
             .unwrap();
         assert!(manager.context(&session.cookie, true, now).await.is_err());
         assert!(!manager.login_available().await.unwrap());
+        let fresh = manager.anonymous(now).await.unwrap();
+        assert!(manager
+            .memory
+            .lock()
+            .unwrap()
+            .contexts
+            .values()
+            .all(|context| context.generation == fresh.context.generation));
     }
 
     #[tokio::test]
@@ -1089,6 +1128,40 @@ mod tests {
         ));
         let mut good = WebauthnAuthenticator::new(SoftPasskey::new(true));
         enroll(&manager, &settings, &mut good, now).await;
+        let foreign = manager.start_login(&anonymous.context, now).await.unwrap();
+        let wrong_origin = good
+            .do_authentication(
+                "https://evil.manager.example.invalid".parse().unwrap(),
+                foreign.options,
+            )
+            .unwrap();
+        let replay = wrong_origin.clone();
+        assert!(matches!(
+            manager
+                .finish_login(
+                    &anonymous.context,
+                    AuthenticationFinish {
+                        challenge_id: foreign.challenge_id,
+                        credential: wrong_origin
+                    },
+                    now
+                )
+                .await,
+            Err(AuthError::Authentication)
+        ));
+        assert!(matches!(
+            manager
+                .finish_login(
+                    &anonymous.context,
+                    AuthenticationFinish {
+                        challenge_id: foreign.challenge_id,
+                        credential: replay
+                    },
+                    now
+                )
+                .await,
+            Err(AuthError::Challenge)
+        ));
         let challenge = manager.start_login(&anonymous.context, now).await.unwrap();
         let credential = good
             .do_authentication(settings.public_origin.clone(), challenge.options)
