@@ -547,7 +547,7 @@ pub(super) async fn observation_query(
         tx.execute("UPDATE operation_intents SET next_sequence=?1 WHERE operation_id=?2",params![sequence,id.to_string()])?;
         tx.commit()?;
         let (close_type,close_txids)=match operation.result {Some(OperationResult::CloseChannel{close_type,txids,..})=>(Some(close_type),txids),_=>(None,vec![])};
-        Ok(Some(ObservationQuery{operation_id:id,binding:operation.review.node,generation:config.generation,kind:operation.request.kind(),claim_id:Uuid::parse_str(&claim).map_err(|_|failure(ErrorCode::StorageUnavailable))?,sequence,reference:knowledge.reference,close_type,close_txids}))
+        Ok(Some(ObservationQuery{request:operation.request.clone(),operation_id:id,binding:operation.review.node,generation:config.generation,kind:operation.request.kind(),claim_id:Uuid::parse_str(&claim).map_err(|_|failure(ErrorCode::StorageUnavailable))?,sequence,reference:knowledge.reference,close_type,close_txids}))
     }).await
 }
 
