@@ -1,7 +1,8 @@
 use chrono::{DateTime, Utc};
 use lightning_client::{
     model::{
-        Capabilities, CapabilityReason, ErrorCode, Network, NodeConnection, NodeStatus, NodeSummary,
+        Capabilities, Capability, CapabilityReason, ErrorCode, Network, NodeConnection, NodeStatus,
+        NodeSummary,
     },
     money::Decimal,
     settings::{NodePolicy, NodeSettings, Settings},
@@ -154,14 +155,22 @@ impl Entry {
                     Some(capability_reason(code))
                 } else if summary.status.stale || info.status.status != NodeConnection::Online {
                     Some(CapabilityReason::NodeOffline)
-                } else if info.status.synced_to_chain != Some(true)
-                    || info.status.synced_to_graph == Some(false)
-                {
+                } else if info.status.synced_to_chain != Some(true) {
                     Some(CapabilityReason::Syncing)
                 } else {
                     None
                 };
-                summary.capabilities = Capabilities::uniform(reason);
+                let payment_reason = reason.or_else(|| {
+                    (info.status.synced_to_graph == Some(false))
+                        .then_some(CapabilityReason::Syncing)
+                });
+                summary.capabilities = Capabilities {
+                    pay_invoice: Capability {
+                        enabled: payment_reason.is_none(),
+                        reason: payment_reason,
+                    },
+                    ..Capabilities::uniform(reason)
+                };
             }
         }
         if let Ok(error) = self.last_error.lock() {
@@ -205,5 +214,194 @@ fn capability_reason(code: ErrorCode) -> CapabilityReason {
         ErrorCode::Unsupported => CapabilityReason::Unsupported,
         ErrorCode::NodeAuthError => CapabilityReason::PermissionDenied,
         _ => CapabilityReason::NodeOffline,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::operations::InfoObservation;
+    use lightning_client::model::Backend;
+
+    fn observed_entry(now: DateTime<Utc>, backend: Backend, read_only: bool) -> Entry {
+        let fixture: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/api-examples.json")).unwrap();
+        let mut policy: NodePolicy =
+            serde_json::from_value(fixture["fixtures"]["node_policy"]["value"].clone()).unwrap();
+        policy.read_only = read_only;
+        let info = InfoObservation {
+            identity_pubkey: "synthetic".into(),
+            network: Network::Regtest,
+            alias: None,
+            version: None,
+            status: NodeStatus {
+                node_id: policy.node_id.clone(),
+                status: NodeConnection::Online,
+                synced_to_chain: Some(true),
+                synced_to_graph: Some(false),
+                block_height: None,
+                observed_at: Some(now),
+                checked_at: now,
+                stale: false,
+                error_code: None,
+            },
+        };
+        Entry {
+            policy,
+            binding_revision: "synthetic-binding".into(),
+            label: "Synthetic".into(),
+            backend,
+            unavailable: None,
+            freshness_seconds: 30,
+            observation: std::sync::Mutex::new(Some((info, "synthetic-revision".into()))),
+            reads: tokio::sync::Mutex::new(crate::live::Cache::default()),
+            last_error: std::sync::Mutex::new(None),
+        }
+    }
+
+    fn assert_capabilities(
+        summary: NodeSummary,
+        common: Option<CapabilityReason>,
+        payment: Option<CapabilityReason>,
+    ) {
+        let capabilities = serde_json::to_value(summary.capabilities).unwrap();
+        assert_eq!(capabilities.as_object().unwrap().len(), 8);
+        for (kind, capability) in capabilities.as_object().unwrap() {
+            let reason = if kind == "pay_invoice" {
+                payment
+            } else {
+                common
+            };
+            assert_eq!(
+                *capability,
+                serde_json::json!({"enabled": reason.is_none(), "reason": reason}),
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_requirements_are_per_kind_on_every_backend() {
+        let now = Utc::now();
+        for backend in [Backend::ClnRest, Backend::LndRest, Backend::LndGrpc] {
+            for read_only in [false, true] {
+                for chain in [None, Some(false), Some(true)] {
+                    for graph in [None, Some(false), Some(true)] {
+                        let entry = observed_entry(now, backend, read_only);
+                        {
+                            let mut observation = entry.observation.lock().unwrap();
+                            let status = &mut observation.as_mut().unwrap().0.status;
+                            status.synced_to_chain = chain;
+                            status.synced_to_graph = graph;
+                        }
+                        let common = if read_only {
+                            Some(CapabilityReason::ReadOnly)
+                        } else if chain != Some(true) {
+                            Some(CapabilityReason::Syncing)
+                        } else {
+                            None
+                        };
+                        let payment = common.or_else(|| {
+                            (graph == Some(false)).then_some(CapabilityReason::Syncing)
+                        });
+                        assert_capabilities(entry.summary(now, Decimal::ZERO), common, payment);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn common_failures_disable_every_kind_and_read_only_wins() {
+        let now = Utc::now();
+        for read_only in [false, true] {
+            for (connection, stale, age, missing_time, error, expected) in [
+                (
+                    NodeConnection::Offline,
+                    false,
+                    0,
+                    false,
+                    None,
+                    CapabilityReason::NodeOffline,
+                ),
+                (
+                    NodeConnection::Online,
+                    true,
+                    0,
+                    false,
+                    None,
+                    CapabilityReason::NodeOffline,
+                ),
+                (
+                    NodeConnection::Online,
+                    false,
+                    30,
+                    false,
+                    None,
+                    CapabilityReason::NodeOffline,
+                ),
+                (
+                    NodeConnection::Online,
+                    false,
+                    0,
+                    true,
+                    None,
+                    CapabilityReason::NodeOffline,
+                ),
+                (
+                    NodeConnection::Offline,
+                    true,
+                    0,
+                    false,
+                    Some(ErrorCode::NodeAuthError),
+                    CapabilityReason::PermissionDenied,
+                ),
+                (
+                    NodeConnection::Online,
+                    false,
+                    0,
+                    false,
+                    Some(ErrorCode::IdentityChanged),
+                    CapabilityReason::Unverified,
+                ),
+            ] {
+                let entry = observed_entry(now, Backend::LndRest, read_only);
+                {
+                    let mut observation = entry.observation.lock().unwrap();
+                    let status = &mut observation.as_mut().unwrap().0.status;
+                    status.status = connection;
+                    status.stale = stale;
+                    status.observed_at =
+                        (!missing_time).then_some(now - chrono::Duration::seconds(age));
+                    status.error_code = error;
+                }
+                let reason = Some(if read_only {
+                    CapabilityReason::ReadOnly
+                } else {
+                    expected
+                });
+                assert_capabilities(entry.summary(now, Decimal::ZERO), reason, reason);
+            }
+            for code in [
+                ErrorCode::NodeOffline,
+                ErrorCode::NodeAuthError,
+                ErrorCode::IdentityChanged,
+                ErrorCode::NetworkMismatch,
+                ErrorCode::NotConfigured,
+                ErrorCode::Unsupported,
+            ] {
+                let entry = observed_entry(now, Backend::LndGrpc, read_only);
+                *entry.last_error.lock().unwrap() = Some((now, code));
+                let summary = entry.summary(now, Decimal::ZERO);
+                assert!(summary.status.stale);
+                assert_eq!(summary.status.error_code, Some(code));
+                let reason = Some(if read_only {
+                    CapabilityReason::ReadOnly
+                } else {
+                    capability_reason(code)
+                });
+                assert_capabilities(summary, reason, reason);
+            }
+        }
     }
 }
