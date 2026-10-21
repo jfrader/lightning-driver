@@ -40,7 +40,7 @@ cln      = []
 
 [dependencies.tonic]
 version = "0.7"
-features = ["tls", "tls-roots"]
+features = ["tls"]
 optional = true
 
 [dev-dependencies]

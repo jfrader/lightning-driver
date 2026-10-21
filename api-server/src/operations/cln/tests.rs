@@ -901,6 +901,7 @@ fn query(
     reference: RecoveryReference,
 ) -> ObservationQuery {
     ObservationQuery {
+        request: request(kind),
         operation_id: Uuid::new_v4(),
         binding: config.binding.clone(),
         generation: config.generation,

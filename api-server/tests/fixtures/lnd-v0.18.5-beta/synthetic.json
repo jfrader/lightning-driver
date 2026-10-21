@@ -1,0 +1,23 @@
+{
+  "provenance": {
+    "kind": "Synthetic shapes, not daemon recordings or compatibility tests",
+    "tag": "v0.18.5-beta",
+    "sources": ["lnrpc/lightning.proto", "lnrpc/lightning.yaml", "lnrpc/routerrpc/router.proto", "lnrpc/routerrpc/router.yaml", "lnrpc/routerrpc/router.pb.gw.go", "lnrpc/walletrpc/walletkit.proto", "lnrpc/rpc_utils.go", "macaroons/service.go", "rpcserver.go", "channeldb/payment_control.go"],
+    "wire_corrections": "Raw gRPC metadata uses macaroon (macaroons/service.go RawMacaroonFromContext); REST uses Grpc-Metadata-macaroon. REST TrackPaymentV2 path bytes use padded URL-safe base64 (router.pb.gw.go and grpc-gateway v2.5.0 runtime/convert.go Bytes).",
+    "tls": "Shared synthetic localhost-only test CA/leaf/key in cln-v25.02; no daemon certificate or credential"
+  },
+  "info": {"identity_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","alias":"Synthetic","version":"0.18.5-beta synthetic","chains":[{"chain":"bitcoin","network":"regtest"}],"synced_to_chain":true,"synced_to_graph":false,"block_height":100},
+  "wallet": {"confirmed_balance":"9007199254740993","unconfirmed_balance":"0","locked_balance":"2","reserved_balance_anchor_chan":"3","total_balance":"9007199254740993"},
+  "channel_balance": {"local_balance":{"sat":"1","msat":"1001"},"remote_balance":{"sat":"2","msat":"2000"},"balance":"999999"},
+  "invoices": {"invoices":[{"r_hash":"+CYaVrvI78VnVCnFEtOxTef2oIZsEkf+SGXTloMUoc0=","value_msat":"1001","amt_paid_msat":"1002","state":"SETTLED","settled":false,"creation_date":"1750000000","settle_date":"1750000020","expiry":"3600","payment_request":"SYNTHETIC_BOLT11_REPLACED_IN_TEST","memo":"Synthetic invoice","r_preimage":"PREIMAGE_CANARY"}]},
+  "payments": {"payments":[{"payment_hash":"f8261a56bbc8efc5675429c512d3b14de7f6a0866c1247fe4865d3968314a1cd","value_msat":"1001","fee_msat":"2","creation_time_ns":"1750000000123456789","payment_index":"7","status":"SUCCEEDED","payment_preimage":"PREIMAGE_CANARY","htlcs":[{"preimage":"HTLC_PREIMAGE_CANARY"}]}]},
+  "peers": {"peers":[{"pub_key":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","address":"192.0.2.1:9735","inbound":true}]},
+  "channels": {"channels":[{"remote_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","channel_point":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f:1","chan_id":"9007199254740993","capacity":"3","local_balance":"1","remote_balance":"2","active":true,"private":true}]},
+  "pending": {"pending_open_channels":[],"pending_closing_channels":[],"pending_force_closing_channels":[],"waiting_close_channels":[]},
+  "closed": {"channels":[]},
+  "transactions": {"transactions":[{"tx_hash":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","amount":"-10002","total_fees":"2","num_confirmations":0,"block_height":0,"time_stamp":"1750000000","output_details":[{"output_index":0,"address":"SYNTHETIC_ADDRESS","amount":"10000","is_our_address":false}],"raw_tx_hex":"RAW_TX_CANARY"}]},
+  "open": {"funding_txid_bytes":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","output_index":1},
+  "send": {"txid":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"},
+  "close": {"close_pending":{"txid":"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=","output_index":0}},
+  "permission": {"valid":true}
+}

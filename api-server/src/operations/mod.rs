@@ -5,6 +5,7 @@ mod adapter;
 mod cln;
 mod evidence;
 mod intent;
+mod lnd;
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -185,6 +186,7 @@ impl RecoveryReference {
     }
 }
 struct ObservationQuery {
+    request: OperationRequest,
     operation_id: Uuid,
     binding: NodeBinding,
     generation: Uuid,
