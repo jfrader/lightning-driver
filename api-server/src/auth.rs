@@ -796,7 +796,11 @@ mod tests {
     use webauthn_authenticator_rs::{softpasskey::SoftPasskey, WebauthnAuthenticator};
 
     async fn manager(mode: ReauthMode) -> (tempfile::TempDir, AuthManager, ApiSettings) {
-        let directory = tempfile::tempdir_in("/tmp/opencode").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in("/tmp/opencode")
+            .unwrap();
         let settings = ApiSettings {
             bind: "127.0.0.1:8080".parse().unwrap(),
             public_origin: "https://manager.example.invalid".parse().unwrap(),

@@ -186,12 +186,33 @@ pub struct NodePolicy {
 
 impl Settings {
     pub fn load(path: &Path) -> Result<Self, SettingsError> {
-        let settings: Self = config::Config::builder()
-            .add_source(config::File::from(path))
+        let path = path
+            .canonicalize()
+            .map_err(|_| SettingsError("Cannot locate configuration"))?;
+        let base = path
+            .parent()
+            .ok_or(SettingsError("Configuration has no parent directory"))?;
+        let mut settings: Self = config::Config::builder()
+            .add_source(config::File::from(path.as_path()))
             .build()
             .map_err(|_| SettingsError("Cannot read configuration"))?
             .try_deserialize()
             .map_err(|_| SettingsError("Invalid typed configuration"))?;
+        for reference in [
+            &mut settings.api.database,
+            &mut settings.api.invoice_key_file,
+        ] {
+            if reference.is_relative() {
+                *reference = base.join(&*reference);
+            }
+        }
+        for node in &mut settings.nodes {
+            for reference in [&mut node.certificate_file, &mut node.credential_file] {
+                if reference.is_relative() {
+                    *reference = base.join(&*reference);
+                }
+            }
+        }
         settings.validate()?;
         Ok(settings)
     }
