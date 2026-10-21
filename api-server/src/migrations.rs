@@ -66,7 +66,28 @@ CREATE INDEX operations_nonterminal_history ON operations(node_id,terminal,creat
 CREATE INDEX operations_kind_nonterminal_history ON operations(node_id,kind,terminal,created_at_ns DESC,id ASC);
 ";
 
-const MIGRATIONS: &[&str] = &[BASELINE, METADATA];
+const ENGINE: &str = "
+CREATE TABLE operation_intents (
+ operation_id TEXT PRIMARY KEY REFERENCES operations(id),
+ encoding_version INTEGER NOT NULL CHECK(encoding_version IN (0,1)),
+ intent TEXT,
+ claim_id TEXT UNIQUE,
+ next_sequence INTEGER NOT NULL DEFAULT 0,
+ evidence TEXT
+);
+INSERT INTO operation_intents(operation_id,encoding_version) SELECT id,0 FROM operations;
+CREATE TABLE paid_hashes (
+ node_id TEXT NOT NULL, payment_hash TEXT NOT NULL,
+ operation_id TEXT NOT NULL REFERENCES operations(id),
+ PRIMARY KEY(node_id,payment_hash)
+);
+INSERT OR IGNORE INTO paid_hashes(node_id,payment_hash,operation_id)
+ SELECT node_id,json_extract(body,'$.review.payment_hash'),id FROM operations
+ WHERE kind='pay_invoice' AND state='succeeded'
+ AND json_extract(body,'$.review.payment_hash') IS NOT NULL;
+";
+
+const MIGRATIONS: &[&str] = &[BASELINE, METADATA, ENGINE];
 
 pub(crate) fn register_functions(connection: &Connection) -> Result<(), JournalError> {
     connection.create_scalar_function(
@@ -141,6 +162,70 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use uuid::Uuid;
 
+    #[test]
+    fn version_two_checkpoint_upgrade_keeps_legacy_review_and_claim_bytes() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        register_functions(&connection).unwrap();
+        apply(&mut connection, &MIGRATIONS[..2]).unwrap();
+        let fixtures: serde_json::Value =
+            serde_json::from_str(include_str!("../tests/fixtures/api-examples.json")).unwrap();
+        let operation: Operation =
+            serde_json::from_value(fixtures["fixtures"]["operation_review"]["value"].clone())
+                .unwrap();
+        let body = serde_json::to_string(&operation).unwrap();
+        let id = operation.id.to_string();
+        connection.execute("INSERT INTO operations(id,node_id,request_key,request_digest,body,dispatched) VALUES(?1,?2,'checkpoint-key',x'0102',?3,1)",params![id,operation.node_id,body]).unwrap();
+        connection
+            .execute(
+                "INSERT INTO resource_claims VALUES(?1,'wallet',?2)",
+                params![operation.node_id, id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO pending_invoice_secrets VALUES(?1,x'030405')",
+                [&id],
+            )
+            .unwrap();
+        migrate(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            3
+        );
+        let row: (String, Vec<u8>, bool) = connection
+            .query_row(
+                "SELECT body,request_digest,dispatched FROM operations WHERE id=?1",
+                [&id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(row, (body, vec![1, 2], true));
+        let provenance:(i64,Option<String>,Option<String>)=connection.query_row("SELECT encoding_version,intent,claim_id FROM operation_intents WHERE operation_id=?1",[&id],|row|Ok((row.get(0)?,row.get(1)?,row.get(2)?))).unwrap();
+        assert_eq!(provenance, (0, None, None));
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT hex(ciphertext) FROM pending_invoice_secrets WHERE operation_id=?1",
+                    [&id],
+                    |row| row.get::<_, String>(0)
+                )
+                .unwrap(),
+            "030405"
+        );
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM resource_claims WHERE operation_id=?1",
+                    [&id],
+                    |row| row.get::<_, i64>(0)
+                )
+                .unwrap(),
+            1
+        );
+    }
+
     #[tokio::test]
     async fn checkpoint_upgrade_preserves_rows_and_backfills_exact_metadata() {
         let directory = tempfile::Builder::new()
@@ -212,7 +297,7 @@ mod tests {
         let journal = crate::journal::Journal::open(path.clone()).await.unwrap();
         assert_eq!(journal.authentication().await.unwrap(), (Uuid::nil(), 7));
         journal.run(move |connection| {
-            assert_eq!(connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?, 2);
+            assert_eq!(connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?, 3);
             for (operation, body) in expected {
                 let (stored, created, updated, kind, state, terminal, sensitive, dispatched): (String,i64,i64,String,String,bool,bool,bool) = connection.query_row("SELECT body,created_at_ns,updated_at_ns,kind,state,terminal,sensitivity,dispatched FROM operations WHERE id=?1", [operation.id.to_string()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))?;
                 assert_eq!(stored, body);
