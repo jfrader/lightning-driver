@@ -8,6 +8,9 @@ use actix_web::{
 use lightning_client::settings::{NodeSettings, Settings};
 use serde_json::{json, Value};
 
+#[path = "journey_tests.rs"]
+mod journeys;
+
 const HOST: &str = "manager.example.invalid";
 const ORIGIN: &str = "https://manager.example.invalid";
 static EMITTED: AtomicUsize = AtomicUsize::new(0);

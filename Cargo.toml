@@ -2,7 +2,9 @@
 members = [
     "lightning-client",
     "api-server",
+    "synthetic-node-harness",
 ]
+default-members = ["lightning-client", "api-server"]
 resolver = "2"
 
 [workspace.dependencies]
