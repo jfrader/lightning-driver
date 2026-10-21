@@ -25,10 +25,10 @@ libc = "0.2"
 rustix = { version = "1", features = ["process"] }
 webauthn-rs = "=0.5.5"
 url = { workspace = true }
-
-[dev-dependencies]
 bitcoin = "0.32"
 lightning-invoice = "=0.34.1"
+
+[dev-dependencies]
 reqwest = { workspace = true }
 tempfile = "3"
 webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }

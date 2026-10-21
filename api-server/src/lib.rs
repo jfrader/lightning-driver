@@ -6,6 +6,7 @@ pub mod error;
 pub mod history;
 pub mod journal;
 mod migrations;
+mod operations;
 pub mod pagination;
 pub mod reads;
 pub mod registry;

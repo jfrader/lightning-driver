@@ -87,7 +87,7 @@ pub enum Resource {
 }
 
 impl Resource {
-    fn key(&self) -> String {
+    pub(crate) fn key(&self) -> String {
         match self {
             Self::Intent(hash) => format!("intent:{hash}"),
             Self::Payment(hash) => format!("{PAYMENT_RESOURCE_PREFIX}{hash}"),
@@ -99,7 +99,7 @@ impl Resource {
 }
 
 #[derive(Clone)]
-pub struct SealedInvoiceSecret(Vec<u8>);
+pub struct SealedInvoiceSecret(pub(crate) Vec<u8>);
 
 pub struct PendingSecretKey {
     bytes: Zeroizing<[u8; 32]>,
@@ -177,6 +177,11 @@ impl PendingSecretKey {
 }
 
 impl Journal {
+    #[cfg(test)]
+    pub(crate) fn with_test_capacity(mut self, workers: usize) -> Self {
+        self.workers = Arc::new(tokio::sync::Semaphore::new(workers));
+        self
+    }
     pub async fn open(path: PathBuf) -> Result<Self, JournalError> {
         let journal = Self {
             path: Arc::new(path),
@@ -354,6 +359,9 @@ impl Journal {
         self.run(move |connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             check_generation(&tx, generation)?;
+            if engine_owned(&tx, id)? {
+                return Err(JournalError::NotReviewable);
+            }
             let mut operation = load(&tx, id)?;
             if operation.node_id != node_id {
                 return Err(JournalError::NotFound);
@@ -404,6 +412,7 @@ impl Journal {
     ) -> Result<Operation, JournalError> {
         self.run(move |connection| {
             let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if engine_owned(&tx,id)? {return Err(JournalError::NotReviewable);}
             let mut operation=load(&tx,id)?;
             if operation.state.terminal() { return Ok(operation); }
             let dispatched:bool=tx.query_row("SELECT dispatched FROM operations WHERE id=?1",[id.to_string()],|row|row.get(0))?;
@@ -486,6 +495,10 @@ fn check_generation(connection: &Connection, generation: i64) -> Result<(), Jour
         return Err(JournalError::Revoked);
     }
     Ok(())
+}
+
+fn engine_owned(connection: &Connection, id: Uuid) -> Result<bool, JournalError> {
+    Ok(connection.query_row("SELECT EXISTS(SELECT 1 FROM operation_intents WHERE operation_id=?1 AND encoding_version=1)", [id.to_string()], |row| row.get(0))?)
 }
 
 fn load(connection: &Connection, id: Uuid) -> Result<Operation, JournalError> {

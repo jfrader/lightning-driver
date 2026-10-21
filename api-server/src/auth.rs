@@ -104,6 +104,62 @@ struct Memory {
     verifying: HashMap<Uuid, usize>,
 }
 
+pub(crate) struct ClaimSession<'a> {
+    memory: &'a mut Memory,
+    context: Context,
+    now: DateTime<Utc>,
+}
+
+impl ClaimSession<'_> {
+    pub(crate) fn consume(
+        &mut self,
+        operation: &Operation,
+        authorization: Option<Uuid>,
+    ) -> Result<(), AuthError> {
+        if !operation.request.sensitive() {
+            return if authorization.is_none() {
+                Ok(())
+            } else {
+                Err(AuthError::Authorization)
+            };
+        }
+        let id = authorization.ok_or(AuthError::Authorization)?;
+        let grant = self
+            .memory
+            .grants
+            .get(&id)
+            .ok_or(AuthError::Authorization)?;
+        if grant.owner != self.context.id
+            || grant.generation != self.context.generation
+            || grant.expires <= self.now
+            || grant.binding != GrantBinding::from_operation(operation)
+        {
+            return Err(AuthError::Authorization);
+        }
+        self.memory.grants.remove(&id);
+        Ok(())
+    }
+
+    pub(crate) fn project(&self, operation: &mut Operation) {
+        if operation.state != OperationState::AwaitingConfirmation || !operation.request.sensitive()
+        {
+            return;
+        }
+        let grant = self.memory.grants.values().find(|grant| {
+            grant.owner == self.context.id
+                && grant.generation == self.context.generation
+                && grant.expires > self.now
+                && grant.binding == GrantBinding::from_operation(operation)
+        });
+        operation.authorization.status = if grant.is_some() {
+            lightning_client::model::AuthorizationState::Authorized
+        } else {
+            lightning_client::model::AuthorizationState::Required
+        };
+        operation.authorization.expires_at = grant.map(|grant| grant.expires);
+    }
+}
+
 struct VerificationGuard {
     memory: Arc<Mutex<Memory>>,
     owner: Uuid,
@@ -245,6 +301,37 @@ impl GrantBinding {
 }
 
 impl AuthManager {
+    // Called only after SQLite's immediate transaction and the engine's local gates.
+    // The callback must be synchronous; retaining this guard through commit linearizes logout.
+    pub(crate) fn with_claim_session<T, E: From<AuthError>>(
+        &self,
+        context: &Context,
+        generation: i64,
+        now: DateTime<Utc>,
+        action: impl FnOnce(&mut ClaimSession<'_>) -> Result<T, E>,
+    ) -> Result<T, E> {
+        let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
+        let live = memory
+            .contexts
+            .get(&context.key)
+            .ok_or(AuthError::Session)?;
+        if live.id != context.id
+            || live.generation != generation
+            || live.generation != context.generation
+            || live.last_authenticated_at.is_none()
+            || live.expires_at <= now
+            || live.idle_expires_at <= now
+        {
+            return Err(AuthError::Session.into());
+        }
+        let context = live.clone();
+        action(&mut ClaimSession {
+            memory: &mut memory,
+            context,
+            now,
+        })
+    }
+
     pub fn new(settings: &ApiSettings, journal: Journal) -> Result<Self, AuthError> {
         let webauthn = WebauthnBuilder::new(&settings.rp_id, &settings.public_origin)
             .map_err(|_| AuthError::Authentication)?
