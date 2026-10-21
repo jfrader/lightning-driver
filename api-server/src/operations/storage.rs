@@ -498,7 +498,7 @@ pub(super) async fn authorization_gate(
     writable(&pinned.config)?;
     let operation = load_local(engine, id).await?;
     binding(&operation, node, digest)?;
-    let facts = pinned.adapter.prepare(&operation.request).await?;
+    let facts = pinned.adapter.prepare_review(&operation).await?;
     let e = engine.clone();
     let context = context.clone();
     let node = node.to_string();
@@ -546,7 +546,8 @@ pub(super) async fn observation_query(
         let sequence=sequence.checked_add(1).ok_or_else(||failure(ErrorCode::InternalError))?;
         tx.execute("UPDATE operation_intents SET next_sequence=?1 WHERE operation_id=?2",params![sequence,id.to_string()])?;
         tx.commit()?;
-        Ok(Some(ObservationQuery{operation_id:id,binding:operation.review.node,generation:config.generation,kind:operation.request.kind(),claim_id:Uuid::parse_str(&claim).map_err(|_|failure(ErrorCode::StorageUnavailable))?,sequence,reference:knowledge.reference}))
+        let (close_type,close_txids)=match operation.result {Some(OperationResult::CloseChannel{close_type,txids,..})=>(Some(close_type),txids),_=>(None,vec![])};
+        Ok(Some(ObservationQuery{operation_id:id,binding:operation.review.node,generation:config.generation,kind:operation.request.kind(),claim_id:Uuid::parse_str(&claim).map_err(|_|failure(ErrorCode::StorageUnavailable))?,sequence,reference:knowledge.reference,close_type,close_txids}))
     }).await
 }
 

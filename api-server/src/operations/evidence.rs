@@ -8,15 +8,23 @@ pub(super) enum Rejection {
     FeeLimit,
     PeerUnavailable,
     Refused,
+    Auth,
+    Unsupported,
+    Expired,
+    Conflict,
 }
 impl Rejection {
-    fn code(self) -> ErrorCode {
+    pub(super) fn code(self) -> ErrorCode {
         match self {
             Self::InsufficientFunds => ErrorCode::InsufficientFunds,
             Self::NoRoute => ErrorCode::NoRoute,
             Self::FeeLimit => ErrorCode::FeeLimitExceeded,
             Self::PeerUnavailable => ErrorCode::PeerUnavailable,
             Self::Refused => ErrorCode::UpstreamRejected,
+            Self::Auth => ErrorCode::NodeAuthError,
+            Self::Unsupported => ErrorCode::Unsupported,
+            Self::Expired => ErrorCode::InvoiceExpired,
+            Self::Conflict => ErrorCode::IdempotencyConflict,
         }
     }
 }
@@ -537,7 +545,8 @@ fn positive(
         ) => {
             if funding_outpoint.as_deref().is_some_and(|s| !outpoint(s))
                 || (channel_id.is_none() && funding_outpoint.is_none())
-                || reference.channel.as_ref() != funding_outpoint.as_ref().or(channel_id.as_ref())
+                || (reference.channel.as_ref() != funding_outpoint.as_ref()
+                    && reference.channel.as_ref() != channel_id.as_ref())
             {
                 return Err(invalid());
             }

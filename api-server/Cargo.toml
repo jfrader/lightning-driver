@@ -27,8 +27,9 @@ webauthn-rs = "=0.5.5"
 url = { workspace = true }
 bitcoin = "0.32"
 lightning-invoice = "=0.34.1"
+reqwest = { workspace = true }
 
 [dev-dependencies]
-reqwest = { workspace = true }
+tokio-rustls = "0.24"
 tempfile = "3"
 webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }
