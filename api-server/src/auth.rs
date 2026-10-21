@@ -19,6 +19,11 @@ use uuid::Uuid;
 use webauthn_rs::prelude::*;
 use zeroize::Zeroizing;
 
+mod nostr_auth;
+pub use nostr_auth::{
+    NostrAuthorizationStart, NostrChallenge, NostrFinish, NostrIdentity, NostrOutcome, NostrStart,
+};
+
 const MAX_AUTHENTICATORS: usize = 16;
 const MAX_RATE_BUCKETS: usize = 256;
 const VERIFICATION_WORKERS: usize = 2;
@@ -52,6 +57,12 @@ impl From<&Limits> for AdmissionLimits {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    #[error("Keep at least one sign-in method")]
+    LastCredential,
+    #[error("Enrollment unavailable")]
+    EnrollmentUnavailable,
+    #[error("Invalid request")]
+    InvalidRequest,
     #[error("Sign in required")]
     Session,
     #[error("Reload the session")]
@@ -86,6 +97,7 @@ impl From<JournalError> for AuthError {
 
 #[derive(Clone)]
 pub struct AuthManager {
+    public_origin: url::Url,
     webauthn: Arc<Webauthn>,
     journal: Journal,
     limits: Limits,
@@ -97,6 +109,8 @@ pub struct AuthManager {
 
 #[derive(Default)]
 struct Memory {
+    nostr_pending: HashMap<Uuid, (Uuid, DateTime<Utc>)>,
+    nostr_failures: HashMap<String, VecDeque<DateTime<Utc>>>,
     contexts: HashMap<[u8; 32], Context>,
     ceremonies: HashMap<Uuid, Ceremony>,
     grants: HashMap<Uuid, Grant>,
@@ -180,6 +194,7 @@ impl Drop for VerificationGuard {
 
 #[derive(Clone)]
 pub struct Context {
+    pub nostr_pubkey: Option<String>,
     key: [u8; 32],
     id: Uuid,
     csrf: Zeroizing<String>,
@@ -204,6 +219,9 @@ pub struct NewContext {
 
 #[derive(Clone, Serialize)]
 pub struct SessionView {
+    pub auth_method: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nostr_pubkey: Option<String>,
     pub authenticated: bool,
     pub csrf_token: String,
     pub expires_at: DateTime<Utc>,
@@ -275,7 +293,7 @@ enum Purpose {
     },
 }
 
-#[derive(Clone, PartialEq)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 struct GrantBinding {
     operation_id: Uuid,
     node: NodeBinding,
@@ -339,6 +357,7 @@ impl AuthManager {
             .build()
             .map_err(|_| AuthError::Authentication)?;
         Ok(Self {
+            public_origin: settings.public_origin.clone(),
             webauthn: Arc::new(webauthn),
             journal,
             limits: settings.limits.clone(),
@@ -393,31 +412,7 @@ impl AuthManager {
         authenticated: bool,
         identity: ClientIdentity,
     ) -> Result<NewContext, AuthError> {
-        let cookie = random_token();
-        let csrf = random_token();
-        let key = token_hash(cookie.as_bytes());
-        let expires_at = now
-            + Duration::seconds(i64::from(if authenticated {
-                self.limits.session_absolute_seconds
-            } else {
-                self.limits.preauth_seconds
-            }));
-        let context = Context {
-            key,
-            id: Uuid::new_v4(),
-            csrf,
-            generation,
-            identity,
-            created_at: now,
-            expires_at,
-            idle_expires_at: if authenticated {
-                (now + Duration::seconds(i64::from(self.limits.session_idle_seconds)))
-                    .min(expires_at)
-            } else {
-                expires_at
-            },
-            last_authenticated_at: authenticated.then_some(now),
-        };
+        let new = self.build_context(now, generation, authenticated, identity);
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
         if memory
             .contexts
@@ -443,8 +438,44 @@ impl AuthManager {
         } else {
             memory.make_anonymous_room(identity, &self.admission, now)?;
         }
-        memory.contexts.insert(key, context.clone());
-        Ok(NewContext { context, cookie })
+        memory.contexts.insert(new.context.key, new.context.clone());
+        Ok(new)
+    }
+
+    fn build_context(
+        &self,
+        now: DateTime<Utc>,
+        generation: i64,
+        authenticated: bool,
+        identity: ClientIdentity,
+    ) -> NewContext {
+        let cookie = random_token();
+        let csrf = random_token();
+        let key = token_hash(cookie.as_bytes());
+        let expires_at = now
+            + Duration::seconds(i64::from(if authenticated {
+                self.limits.session_absolute_seconds
+            } else {
+                self.limits.preauth_seconds
+            }));
+        let context = Context {
+            nostr_pubkey: None,
+            key,
+            id: Uuid::new_v4(),
+            csrf,
+            generation,
+            identity,
+            created_at: now,
+            expires_at,
+            idle_expires_at: if authenticated {
+                (now + Duration::seconds(i64::from(self.limits.session_idle_seconds)))
+                    .min(expires_at)
+            } else {
+                expires_at
+            },
+            last_authenticated_at: authenticated.then_some(now),
+        };
+        NewContext { context, cookie }
     }
 
     pub async fn context(
@@ -499,6 +530,12 @@ impl AuthManager {
 
     pub fn session(&self, context: &Context) -> Result<SessionView, AuthError> {
         Ok(SessionView {
+            auth_method: if context.nostr_pubkey.is_some() {
+                "nostr"
+            } else {
+                "passkey"
+            },
+            nostr_pubkey: context.nostr_pubkey.clone(),
             authenticated: true,
             csrf_token: context.csrf.to_string(),
             expires_at: context.expires_at,
@@ -512,6 +549,9 @@ impl AuthManager {
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
         memory.contexts.remove(&context.key);
         memory
+            .nostr_pending
+            .retain(|_, (owner, _)| *owner != context.id);
+        memory
             .ceremonies
             .retain(|_, ceremony| ceremony.owner != context.id);
         memory.grants.retain(|_, grant| grant.owner != context.id);
@@ -519,6 +559,10 @@ impl AuthManager {
     }
 
     pub async fn login_available(&self) -> Result<bool, AuthError> {
+        Ok(self.passkey_login_available().await? || self.nostr_login_available().await?)
+    }
+
+    pub async fn passkey_login_available(&self) -> Result<bool, AuthError> {
         Ok(!self.passkeys().await?.is_empty())
     }
 
@@ -638,6 +682,9 @@ impl AuthManager {
         operation: &Operation,
         now: DateTime<Utc>,
     ) -> Result<AuthorizationStart, AuthError> {
+        if context.nostr_pubkey.is_some() {
+            return Err(AuthError::Authentication);
+        }
         if !operation.binding_is_valid() {
             return Err(AuthError::Authorization);
         }
@@ -688,6 +735,9 @@ impl AuthManager {
         finish: AuthenticationFinish,
         now: DateTime<Utc>,
     ) -> Result<OperationAuthorization, AuthError> {
+        if context.nostr_pubkey.is_some() {
+            return Err(AuthError::Authentication);
+        }
         let (ceremony, _verification) = self.take_ceremony(context, finish.challenge_id, now)?;
         let Purpose::Operation { state, binding } = ceremony.purpose else {
             return Err(AuthError::Challenge);
@@ -819,7 +869,9 @@ impl AuthManager {
             ceremony.owner != context.id
                 || std::mem::discriminant(&ceremony.purpose) != std::mem::discriminant(&purpose)
         });
-        if memory.ceremonies.len() + memory.verifying.values().sum::<usize>()
+        if memory.ceremonies.len()
+            + memory.nostr_pending.len()
+            + memory.verifying.values().sum::<usize>()
             >= self.limits.max_challenges
         {
             return Err(AuthError::Limited);
@@ -1029,6 +1081,10 @@ impl Memory {
                             .values()
                             .any(|ceremony| ceremony.owner == context.id)
                         && !self.verifying.contains_key(&context.id)
+                        && !self
+                            .nostr_pending
+                            .values()
+                            .any(|(owner, expires)| *owner == context.id && *expires > now)
                 })
                 .min_by_key(|context| (context.created_at, context.id))
                 .map(|context| context.key);
@@ -1060,6 +1116,7 @@ impl Memory {
         }
     }
     fn prune(&mut self, now: DateTime<Utc>) {
+        self.nostr_pending.retain(|_, (_, expires)| *expires > now);
         self.contexts
             .retain(|_, context| context.expires_at > now && context.idle_expires_at > now);
         let owners: std::collections::HashSet<_> =

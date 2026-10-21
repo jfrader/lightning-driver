@@ -7,6 +7,7 @@ pub mod history;
 pub mod journal;
 mod live;
 mod migrations;
+pub mod nostr;
 mod operations;
 pub mod pagination;
 pub mod reads;

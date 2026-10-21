@@ -32,9 +32,10 @@ impl ApiError {
             ErrorCode::SessionRequired => "Sign in required.",
             ErrorCode::Csrf => "Reload the session.",
             ErrorCode::Origin => "Request origin is not allowed.",
-            ErrorCode::AuthenticationFailed => "Passkey verification failed.",
-            ErrorCode::ChallengeExpired => "Passkey challenge expired. Start again.",
-            ErrorCode::ChallengeInvalid => "Passkey challenge is invalid or consumed.",
+            ErrorCode::AuthenticationFailed => "Authentication failed.",
+            ErrorCode::ChallengeExpired => "Authentication challenge expired. Start again.",
+            ErrorCode::ChallengeInvalid => "Authentication challenge is invalid or consumed.",
+            ErrorCode::LastCredential => "Keep at least one sign-in method.",
             ErrorCode::RateLimited => "Too many requests. Wait before starting again.",
             ErrorCode::ReadOnly => "This node is read-only.",
             ErrorCode::NotFound => "Resource not found.",
@@ -117,6 +118,9 @@ impl From<AuthError> for ApiError {
             return error;
         }
         Self::new(match error {
+            AuthError::LastCredential => ErrorCode::LastCredential,
+            AuthError::EnrollmentUnavailable => ErrorCode::EnrollmentUnavailable,
+            AuthError::InvalidRequest => ErrorCode::InvalidRequest,
             AuthError::Session => ErrorCode::SessionRequired,
             AuthError::Csrf => ErrorCode::Csrf,
             AuthError::Authentication => ErrorCode::AuthenticationFailed,

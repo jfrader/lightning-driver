@@ -166,6 +166,7 @@ wire_enum!(ErrorCode {
     ChallengeExpired,
     ChallengeInvalid,
     EnrollmentUnavailable,
+    LastCredential,
     ReadOnly,
     NotFound,
     Unsupported,

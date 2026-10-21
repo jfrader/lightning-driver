@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 
 #[path = "journey_tests.rs"]
 mod journeys;
+#[path = "nostr_http_tests.rs"]
+mod nostr;
 
 const HOST: &str = "manager.example.invalid";
 const ORIGIN: &str = "https://manager.example.invalid";
