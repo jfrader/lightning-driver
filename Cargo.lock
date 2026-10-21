@@ -332,6 +332,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tokio-rustls 0.24.1",
  "url",
  "uuid",
  "webauthn-authenticator-rs",

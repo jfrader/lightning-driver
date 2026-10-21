@@ -1,0 +1,46 @@
+{
+  "provenance": {
+    "kind": "Synthetic fixtures, not daemon recordings or compatibility evidence",
+    "baseline": "ElementsProject/lightning v25.02",
+    "sources": ["doc/schemas/lightning-getinfo.json", "doc/schemas/lightning-listfunds.json", "doc/schemas/lightning-listinvoices.json", "doc/schemas/lightning-listpays.json", "doc/schemas/lightning-listpeers.json", "doc/schemas/lightning-listpeerchannels.json", "doc/schemas/lightning-listclosedchannels.json", "doc/schemas/lightning-listtransactions.json", "doc/schemas/lightning-feerates.json", "doc/schemas/lightning-invoice.json", "doc/schemas/lightning-xpay.json", "doc/schemas/lightning-connect.json", "doc/schemas/lightning-disconnect.json", "doc/schemas/lightning-fundchannel.json", "doc/schemas/lightning-close.json", "doc/schemas/lightning-newaddr.json", "doc/schemas/lightning-withdraw.json", "plugins/pay.c", "plugins/rest-plugin/src/shared.rs", "plugins/rest-plugin/src/handlers.rs", "common/jsonrpc_errors.h"],
+    "notes": "Identifiers and amounts are synthetic. BOLT11 and address placeholders are replaced by signed synthetic library-generated values in tests. Canary strings in stripped secret/raw fields deliberately are not valid transaction encodings. The adjacent TLS root and server key are synthetic test material only."
+  },
+  "getinfo": {"id":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798", "alias":"Synthetic", "color":"abcdef", "num_peers":1, "num_pending_channels":0, "num_active_channels":1, "num_inactive_channels":0, "version":"v25.02", "lightning-dir":"/SYNTHETIC_DO_NOT_EXPOSE", "blockheight":120, "network":"regtest", "fees_collected_msat":0},
+  "listfunds": {"outputs":[{"txid":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f", "output":0,"amount_msat":5000,"status":"confirmed","reserved":false},{"amount_msat":9000,"status":"confirmed","reserved":true},{"amount_msat":2000,"status":"unconfirmed","reserved":false},{"amount_msat":3000,"status":"immature","reserved":false},{"amount_msat":4000,"status":"spent","reserved":false}],"channels":[{"our_amount_msat":1001,"amount_msat":3000}]},
+  "listinvoices": {"invoices":[{"label":"ld-synthetic", "payment_hash":"f8261a56bbc8efc5675429c512d3b14de7f6a0866c1247fe4865d3968314a1cd", "status":"paid", "expires_at":1750003600, "created_index":991, "amount_msat":1001, "amount_received_msat":1002, "paid_at":1750000020, "bolt11":"SYNTHETIC_BOLT11_REPLACED_IN_TEST", "description":"Synthetic invoice", "payment_preimage":"PREIMAGE_CANARY"},{"label":"synthetic-bolt12", "payment_hash":"1111111111111111111111111111111111111111111111111111111111111111", "status":"unpaid", "expires_at":1750003600, "bolt12":"SYNTHETIC_BOLT12"}]},
+  "listpays": {"pays":[{"payment_hash":"f8261a56bbc8efc5675429c512d3b14de7f6a0866c1247fe4865d3968314a1cd","status":"failed","created_at":1750000000,"created_index":1,"amount_sent_msat":99000,"erroronion":"ERROR_ONION_CANARY"},{"payment_hash":"f8261a56bbc8efc5675429c512d3b14de7f6a0866c1247fe4865d3968314a1cd","status":"complete","created_at":1750000010,"created_index":7,"completed_at":1750000030,"amount_msat":1001,"amount_sent_msat":1003,"preimage":"PREIMAGE_CANARY"}]},
+  "listpeers": {"peers":[{"id":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","connected":true,"num_channels":1,"netaddr":["192.0.2.1:9735"],"remote_addr":"198.51.100.2:30000"}]},
+  "listpeerchannels": {"channels":[{"peer_id":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","peer_connected":true,"state":"CHANNELD_NORMAL","opener":"local","features":[],"channel_id":"2222222222222222222222222222222222222222222222222222222222222222","funding_txid":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","funding_outnum":1,"private":true,"total_msat":3000,"to_us_msat":1001,"spendable_msat":900}]},
+  "listclosedchannels": {"closedchannels":[{"peer_id":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","channel_id":"3333333333333333333333333333333333333333333333333333333333333333","funding_txid":"1f1e1d1c1b1a191817161514131211100f0e0d0c0b0a09080706050403020100","funding_outnum":0,"opener":"local","private":false,"total_msat":3000,"final_to_us_msat":2000,"min_to_us_msat":1000,"max_to_us_msat":3000,"total_local_commitments":1,"total_remote_commitments":1,"total_htlcs_sent":0,"leased":false,"close_cause":"user","last_commitment_txid":"4444444444444444444444444444444444444444444444444444444444444444"}]},
+  "listtransactions": {"transactions":[{"hash":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","rawtx":"RAW_TX_CANARY","blockheight":0,"txindex":0,"locktime":0,"version":2,"inputs":[],"outputs":[{"index":0,"amount_msat":2000,"scriptPubKey":"00140000000000000000000000000000000000000000"}]}]},
+  "feerates": {"perkb":{"floor":1012,"estimates":[{"blockcount":1,"feerate":2000,"smoothed_feerate":2000}]},"warning_missing_feerates":"Some estimates unavailable"},
+  "invoice": {"payment_hash":"f8261a56bbc8efc5675429c512d3b14de7f6a0866c1247fe4865d3968314a1cd","bolt11":"SYNTHETIC_BOLT11_REPLACED_IN_TEST","payment_secret":"PAYMENT_SECRET_CANARY","expires_at":1750003600,"created_index":99},
+  "xpay": {"payment_preimage":"4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d4d","failed_parts":0,"successful_parts":1,"amount_msat":1001,"amount_sent_msat":1003},
+  "connect": {"id":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","features":"","direction":"out","address":{"type":"ipv4","address":"192.0.2.1","port":9735}},
+  "disconnect": {},
+  "fundchannel": {"tx":"RAW_TX_CANARY","txid":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f","outnum":1,"channel_id":"2222222222222222222222222222222222222222222222222222222222222222"},
+  "close_mutual": {"type":"mutual","txs":["RAW_TX_CANARY"],"txids":["4444444444444444444444444444444444444444444444444444444444444444"]},
+  "close_unilateral": {"type":"unilateral","txs":["RAW_TX_CANARY"],"txids":["4444444444444444444444444444444444444444444444444444444444444444"]},
+  "close_unopened": {"type":"unopened"},
+  "newaddr": {"bech32":"SYNTHETIC_ADDRESS_REPLACED_IN_TEST"},
+  "withdraw": {"tx":"RAW_TX_CANARY","psbt":"PSBT_CANARY","txid":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"},
+  "requests": {
+    "invoice":{"amount_msat":1001,"label":"REPLACED_OPERATION_LABEL","description":"Synthetic invoice","expiry":3600},
+    "xpay":{"invstring":"REPLACED_SIGNED_INVOICE","maxfee":1000},
+    "connect":{"id":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","host":"peer.invalid","port":9735},
+    "disconnect":{"id":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"},
+    "fundchannel":{"id":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","amount":100000,"feerate":"1000perkb","announce":false},
+    "close":{"id":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f:1","unilateraltimeout":0},
+    "newaddr":{"addresstype":"bech32"},
+    "withdraw":{"destination":"REPLACED_ADDRESS","satoshi":10000,"feerate":"1000perkb"}
+  },
+  "errors": [
+    {"status":403,"body":{"code":1501,"message":"UPSTREAM_SENTENCE_CANARY"},"read_code":"NodeAuthError","rejected":true},
+    {"status":401,"body":{"code":1502,"message":"SYNTHETIC_RUNE_CANARY"},"read_code":"NodeAuthError","rejected":true},
+    {"status":401,"body":{"code":1503,"message":"/secret/cert https://secret.invalid"},"read_code":"NodeAuthError","rejected":true},
+    {"status":404,"body":{"code":-32601,"message":"PREIMAGE_CANARY"},"read_code":"Unsupported","rejected":true},
+    {"status":500,"body":{"code":null,"message":"RAW_TX_CANARY PSBT_CANARY"},"read_code":"NodeOffline","rejected":false},
+    {"status":500,"body":{"code":401,"message":"UPSTREAM_SENTENCE_CANARY"},"read_code":"NodeOffline","rejected":true},
+    {"status":500,"body":{"code":-32602,"message":"UPSTREAM_SENTENCE_CANARY"},"read_code":"UpstreamRejected","rejected":true}
+  ]
+}

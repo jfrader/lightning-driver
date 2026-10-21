@@ -1,6 +1,8 @@
 // Intentionally private and not installed in HTTP until transport and contract acceptance.
 #![allow(dead_code)]
 
+mod adapter;
+mod cln;
 mod evidence;
 mod intent;
 mod storage;
@@ -11,6 +13,7 @@ use crate::{
     auth::{AuthError, AuthManager, Context},
     journal::{Journal, JournalError, PendingSecretKey, Resource},
 };
+use adapter::{Collection, InfoObservation, ReadQuery, ReadResult};
 use chrono::{DateTime, Utc};
 use evidence::{Evidence, Knowledge};
 use intent::ReviewedIntent;
@@ -136,10 +139,19 @@ type NodeGate = Arc<Mutex<Option<PinnedNode>>>;
 
 // There is no arbitrary RPC, continuation, cleanup or retry entry point.
 trait Adapter: Send + Sync {
+    fn read(&self, _query: ReadQuery) -> ResponseFuture<'_, Result<ReadResult>> {
+        Box::pin(async { Err(failure(ErrorCode::Unsupported)) })
+    }
     fn prepare<'a>(
         &'a self,
         request: &'a OperationRequest,
     ) -> ResponseFuture<'a, Result<ReadFacts>>;
+    fn prepare_review<'a>(
+        &'a self,
+        operation: &'a Operation,
+    ) -> ResponseFuture<'a, Result<ReadFacts>> {
+        self.prepare(&operation.request)
+    }
     fn execute_once(&self, permit: ClaimPermit) -> ResponseFuture<'_, Evidence>;
     fn observe_exact(&self, query: ObservationQuery) -> ResponseFuture<'_, Evidence>;
 }
@@ -180,6 +192,8 @@ struct ObservationQuery {
     claim_id: Uuid,
     sequence: i64,
     reference: RecoveryReference,
+    close_type: Option<CloseType>,
+    close_txids: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -269,9 +283,15 @@ impl Engine {
             return Ok(operation);
         }
         let facts = pinned.adapter.prepare(&request).await?;
-        eligible(&pinned.config, &facts, &request, self.clock.now())?;
         let (intent, secret) =
             ReviewedIntent::build(request, &pinned.config, &facts, self.clock.now())?;
+        let facts = pinned.adapter.prepare_review(&intent.operation).await?;
+        eligible(
+            &pinned.config,
+            &facts,
+            &intent.operation.request,
+            self.clock.now(),
+        )?;
         let sealed = secret
             .as_ref()
             .map(|secret| self.key.encrypt(&intent.operation, secret))
@@ -380,7 +400,7 @@ impl Engine {
         }
         let pinned = self.pinned(&node)?;
         let operation = storage::load_local(self, id).await?;
-        let facts = match pinned.adapter.prepare(&operation.request).await {
+        let facts = match pinned.adapter.prepare_review(&operation).await {
             Ok(facts) => facts,
             Err(error) => {
                 return match storage::duplicate(self, &context, &node, id, &digest).await? {
