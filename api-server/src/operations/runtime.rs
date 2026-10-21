@@ -22,6 +22,26 @@ impl From<EngineError> for ApiError {
 }
 
 impl Engine {
+    pub(crate) async fn read_node(
+        &self,
+        id: &str,
+        query: ReadQuery,
+    ) -> std::result::Result<(ReadResult, String), ApiError> {
+        if let Some((_, code)) = self.unavailable.get(id) {
+            return Err(ApiError::new(*code));
+        }
+        let pinned = self.pinned(id)?;
+        let _permit = self
+            .tasks
+            .try_acquire()
+            .map_err(|_| ApiError::new(ErrorCode::RateLimited))?;
+        let result = pinned.adapter.read(query).await?;
+        let current = self.pinned(id)?;
+        if current.config.generation != pinned.config.generation {
+            return Err(ApiError::new(ErrorCode::IdentityChanged));
+        }
+        Ok((result, pinned.config.binding.identity_revision))
+    }
     pub(crate) async fn from_settings(
         settings: &Settings,
         registry: &Registry,

@@ -7,6 +7,9 @@ struct Journey {
     settings: Settings,
     state: ApplicationState,
 }
+
+#[path = "collection_tests.rs"]
+mod collections;
 impl Journey {
     async fn new(backend: Backend, read_only: bool) -> Self {
         let harness = Harness::start(backend, "127.0.0.1:0".parse().unwrap(), 45, Utc::now())

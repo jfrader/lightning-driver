@@ -1,6 +1,7 @@
 use lightning_client::model::*;
 
-pub(super) enum ReadQuery {
+#[derive(Clone, Copy)]
+pub(crate) enum ReadQuery {
     Info,
     Balances,
     Invoices,
@@ -10,19 +11,22 @@ pub(super) enum ReadQuery {
     Transactions,
     Fees,
 }
-pub(super) struct Collection<T> {
+#[derive(Clone)]
+pub(crate) struct Collection<T> {
     pub items: Vec<T>,
     pub truncated: bool,
 }
 // The adapter does not own registry policy, capability publication or journal counts.
-pub(super) struct InfoObservation {
+#[derive(Clone)]
+pub(crate) struct InfoObservation {
     pub identity_pubkey: String,
     pub network: Network,
     pub alias: Option<String>,
     pub version: Option<String>,
     pub status: NodeStatus,
 }
-pub(super) enum ReadResult {
+#[derive(Clone)]
+pub(crate) enum ReadResult {
     Info(InfoObservation),
     Balances(Balances),
     Invoices(Collection<Invoice>),

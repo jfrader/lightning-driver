@@ -2449,3 +2449,17 @@ async fn permission_denial_and_wrong_identity_stop_preparation_before_any_mutati
         }
     }
 }
+#[test]
+fn transaction_order_uses_observed_time_before_snapshot_truncation() {
+    let mut value = fixture()["transactions"].clone();
+    let mut older = value["transactions"][0].clone();
+    let mut newer = older.clone();
+    older["tx_hash"] = json!("00".repeat(32));
+    newer["tx_hash"] = json!("11".repeat(32));
+    older["time_stamp"] = json!("1750000000");
+    newer["time_stamp"] = json!("1750000001");
+    value["transactions"] = json!([older, newer]);
+    let observed = reads::transactions(&value, 1).unwrap();
+    assert!(observed.truncated);
+    assert_eq!(observed.items[0].txid, "11".repeat(32));
+}

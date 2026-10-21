@@ -9,6 +9,7 @@ pub struct ApplicationState {
     pub registry: Arc<crate::registry::Registry>,
     pub snapshots: crate::pagination::Snapshots,
     pub(crate) engine: Engine,
+    pub(crate) observation_bytes: Arc<std::sync::Mutex<usize>>,
 }
 
 impl ApplicationState {
@@ -36,6 +37,7 @@ impl ApplicationState {
             registry: Arc::new(registry),
             snapshots: crate::pagination::Snapshots::new(settings.api.limits.clone()),
             engine,
+            observation_bytes: Arc::new(std::sync::Mutex::new(0)),
         })
     }
 }

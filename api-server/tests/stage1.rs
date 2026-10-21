@@ -385,7 +385,7 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
 }
 
 #[actix_web::test]
-async fn legacy_routes_and_deferred_resources_cannot_grant_sessions_or_fake_success() {
+async fn legacy_routes_and_unauthenticated_collections_cannot_grant_sessions_or_fake_success() {
     let fixture = Fixture::new();
     let runtime = Runtime::prepare(&fixture.settings()).await.unwrap();
     let app = test::init_service(application(runtime.state.clone())).await;
@@ -407,13 +407,28 @@ async fn legacy_routes_and_deferred_resources_cannot_grant_sessions_or_fake_succ
         assert_eq!(body["error"]["code"], "not_found");
         assert!(!body.to_string().contains("SYNTHETIC_NOT_A_PASSWORD"));
     }
-    for path in [
-        "/api/info",
-        "/api/balance",
-        "/api/v1/nodes/lnd-lab/balances",
-    ] {
+    for path in ["/api/info", "/api/balance"] {
         let response = test::call_service(&app, get(path).to_request()).await;
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    for resource in [
+        "info",
+        "balances",
+        "invoices",
+        "payments",
+        "peers",
+        "channels",
+        "transactions",
+        "fee-estimates",
+    ] {
+        let response = test::call_service(
+            &app,
+            get(&format!("/api/v1/nodes/lnd-lab/{resource}")).to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "session_required");
     }
     let response = test::call_service(
         &app,

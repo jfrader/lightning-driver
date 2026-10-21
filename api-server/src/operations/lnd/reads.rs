@@ -480,6 +480,7 @@ pub(super) fn transactions(v: &Value, max: usize) -> Result<Collection<Transacti
     if items.windows(2).any(|p| p[0].txid == p[1].txid) {
         return Err(invalid());
     }
+    items.sort_by(|a, b| b.occurred_at.cmp(&a.occurred_at).then(a.txid.cmp(&b.txid)));
     items.truncate(max);
     Ok(Collection {
         items,

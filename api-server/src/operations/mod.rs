@@ -15,7 +15,7 @@ use crate::{
     auth::{AuthError, AuthManager, Context},
     journal::{Journal, JournalError, PendingSecretKey, Resource},
 };
-use adapter::{Collection, InfoObservation, ReadQuery, ReadResult};
+pub(crate) use adapter::{Collection, InfoObservation, ReadQuery, ReadResult};
 use chrono::{DateTime, Utc};
 use evidence::{Evidence, Knowledge};
 use intent::ReviewedIntent;

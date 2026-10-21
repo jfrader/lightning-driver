@@ -22,6 +22,10 @@ pub struct Entry {
     label: String,
     backend: lightning_client::model::Backend,
     unavailable: Option<ErrorCode>,
+    freshness_seconds: u32,
+    pub(crate) observation: std::sync::Mutex<Option<(crate::operations::InfoObservation, String)>>,
+    pub(crate) reads: tokio::sync::Mutex<crate::live::Cache>,
+    pub(crate) last_error: std::sync::Mutex<Option<(DateTime<Utc>, ErrorCode)>>,
 }
 
 fn fingerprint(value: &impl Serialize) -> Result<String, serde_json::Error> {
@@ -52,6 +56,10 @@ impl Registry {
                     label: node.label.clone(),
                     backend: node.backend,
                     unavailable: None,
+                    freshness_seconds: settings.api.limits.rpc_seconds,
+                    observation: std::sync::Mutex::new(None),
+                    reads: tokio::sync::Mutex::new(crate::live::Cache::default()),
+                    last_error: std::sync::Mutex::new(None),
                     policy: NodePolicy {
                         node_id: node.id.clone(),
                         revision,
@@ -100,7 +108,7 @@ fn binding(node: &NodeSettings) -> Result<String, serde_json::Error> {
 
 impl Entry {
     pub fn summary(&self, now: DateTime<Utc>, unresolved: Decimal) -> NodeSummary {
-        NodeSummary {
+        let mut summary = NodeSummary {
             id: self.policy.node_id.clone(),
             label: self.label.clone(),
             backend: self.backend,
@@ -110,7 +118,10 @@ impl Entry {
             read_only: self.policy.read_only,
             status: NodeStatus {
                 node_id: self.policy.node_id.clone(),
-                status: NodeConnection::Unsupported,
+                status: match self.unavailable {
+                    Some(ErrorCode::NotConfigured) => NodeConnection::ConfigError,
+                    _ => NodeConnection::Unsupported,
+                },
                 synced_to_chain: None,
                 synced_to_graph: None,
                 block_height: None,
@@ -122,12 +133,77 @@ impl Entry {
             capabilities: Capabilities::uniform(Some(if self.policy.read_only {
                 CapabilityReason::ReadOnly
             } else {
-                CapabilityReason::Unverified
+                self.unavailable
+                    .map(capability_reason)
+                    .unwrap_or(CapabilityReason::Unverified)
             })),
             unresolved_operation_count: unresolved,
+        };
+        if let Ok(observation) = self.observation.lock() {
+            if let Some((info, revision)) = observation.as_ref() {
+                summary.network = info.network;
+                summary.identity_pubkey = Some(info.identity_pubkey.clone());
+                summary.identity_revision = Some(revision.clone());
+                summary.status = info.status.clone();
+                summary.status.stale |= info.status.observed_at.is_none_or(|at| {
+                    now.signed_duration_since(at).num_seconds() >= i64::from(self.freshness_seconds)
+                });
+                let reason = if self.policy.read_only {
+                    Some(CapabilityReason::ReadOnly)
+                } else if let Some(code) = info.status.error_code {
+                    Some(capability_reason(code))
+                } else if summary.status.stale || info.status.status != NodeConnection::Online {
+                    Some(CapabilityReason::NodeOffline)
+                } else if info.status.synced_to_chain != Some(true)
+                    || info.status.synced_to_graph == Some(false)
+                {
+                    Some(CapabilityReason::Syncing)
+                } else {
+                    None
+                };
+                summary.capabilities = Capabilities::uniform(reason);
+            }
         }
+        if let Ok(error) = self.last_error.lock() {
+            if let Some((checked, code)) = *error {
+                summary.status.checked_at = checked;
+                summary.status.error_code = Some(code);
+                summary.status.stale = true;
+                summary.status.status = match code {
+                    ErrorCode::IdentityChanged | ErrorCode::NetworkMismatch => {
+                        NodeConnection::IdentityMismatch
+                    }
+                    ErrorCode::NodeAuthError => NodeConnection::AuthError,
+                    ErrorCode::NotConfigured => NodeConnection::ConfigError,
+                    ErrorCode::Unsupported => NodeConnection::Unsupported,
+                    _ => NodeConnection::Offline,
+                };
+                summary.capabilities = Capabilities::uniform(Some(if self.policy.read_only {
+                    CapabilityReason::ReadOnly
+                } else {
+                    capability_reason(code)
+                }));
+            }
+        }
+        summary
     }
     pub fn observed_network(&self) -> Network {
-        Network::Unknown
+        self.observation
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().map(|(info, _)| info.network))
+            .unwrap_or(Network::Unknown)
+    }
+}
+
+fn capability_reason(code: ErrorCode) -> CapabilityReason {
+    match code {
+        ErrorCode::IdentityChanged | ErrorCode::NetworkMismatch | ErrorCode::NodeUnverified => {
+            CapabilityReason::Unverified
+        }
+        ErrorCode::NotConfigured => CapabilityReason::NotConfigured,
+        ErrorCode::Unsupported => CapabilityReason::Unsupported,
+        ErrorCode::NodeAuthError => CapabilityReason::PermissionDenied,
+        _ => CapabilityReason::NodeOffline,
     }
 }
