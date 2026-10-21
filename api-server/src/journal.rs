@@ -12,7 +12,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use std::{
     fs::OpenOptions,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
     time::Duration,
@@ -553,6 +553,7 @@ fn expire_reviews(connection: &Connection, now: DateTime<Utc>) -> Result<(), Jou
 }
 
 fn ensure_protected(path: &Path) -> Result<(), JournalError> {
+    validate_state_directory(path)?;
     let file = OpenOptions::new()
         .read(true)
         .write(true)
@@ -563,7 +564,26 @@ fn ensure_protected(path: &Path) -> Result<(), JournalError> {
         .open(path)
         .map_err(|_| JournalError::Storage)?;
     let metadata = file.metadata().map_err(|_| JournalError::Storage)?;
-    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+    if !metadata.is_file()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+        || metadata.nlink() != 1
+    {
+        return Err(JournalError::Storage);
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_state_directory(database: &Path) -> Result<(), JournalError> {
+    let parent = database
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let metadata = std::fs::symlink_metadata(parent).map_err(|_| JournalError::Storage)?;
+    if !metadata.is_dir()
+        || metadata.permissions().mode() & 0o077 != 0
+        || metadata.uid() != rustix::process::geteuid().as_raw()
+    {
         return Err(JournalError::Storage);
     }
     Ok(())
@@ -593,7 +613,10 @@ mod tests {
     }
 
     async fn store() -> (tempfile::TempDir, Journal) {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let journal = Journal::open(directory.path().join("journal.sqlite"))
             .await
             .unwrap();

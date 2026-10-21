@@ -1,0 +1,22 @@
+# Auth/config checkpoint: no Lightning clients are started or contacted.
+nodes = []
+
+[api]
+bind = "127.0.0.1:8080"
+public_origin = "https://manager.example.invalid"
+rp_id = "manager.example.invalid"
+database = "manager.sqlite"
+# Reserved for the later operation engine; stage 1 does not read this file.
+invoice_key_file = "pending-invoice.key"
+allow_insecure_loopback = false
+
+[api.reauth]
+mode = "every_operation"
+
+[api.limits]
+session_absolute_seconds = 28800
+session_idle_seconds = 900
+# Also the lifetime of host-issued one-use enrollment tokens.
+preauth_seconds = 300
+challenge_seconds = 60
+authorization_seconds = 60

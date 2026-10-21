@@ -115,7 +115,8 @@ impl AuthHttp {
         let origin = request
             .headers()
             .get(header::ORIGIN)
-            .and_then(|value| value.to_str().ok());
+            .map(|value| value.to_str().map_err(|_| ApiError::new(ErrorCode::Origin)))
+            .transpose()?;
         let expected_origin = self.settings.public_origin.origin().ascii_serialization();
         if (mutation && origin.is_none()) || origin.is_some_and(|origin| origin != expected_origin)
         {
@@ -331,14 +332,18 @@ async fn public_policy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use actix_web::{http::StatusCode, test, App};
+    use actix_web::{http::StatusCode, test};
     use lightning_client::settings::Limits;
     use serde_json::{json, Value};
     use webauthn_authenticator_rs::{softpasskey::SoftPasskey, WebauthnAuthenticator};
     use webauthn_rs::prelude::CreationChallengeResponse;
 
     async fn state() -> (tempfile::TempDir, AuthHttp) {
-        let directory = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::Builder::new()
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir()
+            .unwrap();
         let settings = ApiSettings {
             bind: "127.0.0.1:8080".parse().unwrap(),
             public_origin: "https://manager.example.invalid".parse().unwrap(),
@@ -365,13 +370,7 @@ mod tests {
     #[actix_web::test]
     async fn http_bootstrap_enrollment_session_and_logout_use_real_passkey_and_safe_cookies() {
         let (_directory, state) = state().await;
-        let app = test::init_service(
-            App::new()
-                .wrap(AuthHttp::headers())
-                .app_data(web::Data::new(state.clone()))
-                .service(web::scope("/api/v1").configure(configure)),
-        )
-        .await;
+        let app = test::init_service(crate::app::application(state.clone())).await;
         let response = test::call_service(
             &app,
             test::TestRequest::get()
@@ -517,13 +516,7 @@ mod tests {
     #[actix_web::test]
     async fn request_boundaries_reject_spoofed_origin_host_cross_site_and_media_type() {
         let (_directory, state) = state().await;
-        let app = test::init_service(
-            App::new()
-                .wrap(AuthHttp::headers())
-                .app_data(web::Data::new(state.clone()))
-                .service(web::scope("/api/v1").configure(configure)),
-        )
-        .await;
+        let app = test::init_service(crate::app::application(state.clone())).await;
         for (host, origin, site) in [
             ("evil.example.invalid", None, None),
             (
