@@ -19,7 +19,7 @@ pub struct LndGrpcConfig {
 pub struct LndRestConfig {
     pub host: String,
     pub macaroon_hex: String,
-    pub cert_path: String,  // ← path, not hex
+    pub cert_path: String, // ← path, not hex
 }
 
 #[derive(Debug, Deserialize)]

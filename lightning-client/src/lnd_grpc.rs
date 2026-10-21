@@ -1,197 +1,206 @@
-// lightning-client/src/lnd_grpc.rs
 #[cfg(feature = "lnd-grpc")]
-use lnd_grpc_rust::lnrpc::{
-    AddInvoiceResponse, ChannelBalanceRequest, ChannelBalanceResponse, GetInfoRequest,
-    GetInfoResponse, Invoice as LndInvoice, ListInvoiceRequest, ListInvoiceResponse,
-    WalletBalanceRequest, WalletBalanceResponse,
-};
+mod enabled {
+    use crate::{Balance, DecodedInvoice, Invoice, LightningClient, NodeInfo, PaymentResult};
+    use anyhow::{anyhow, Result};
+    use async_trait::async_trait;
+    use lnd_grpc_rust::lnrpc::{self, lightning_client::LightningClient as RpcClient};
+    use tonic::{
+        metadata::{Ascii, MetadataValue},
+        transport::{Certificate, Channel, ClientTlsConfig, Endpoint},
+        Request,
+    };
 
-use super::*;
-use anyhow::{anyhow, Result};
-
-#[cfg(feature = "lnd-grpc")]
-pub struct LndGrpcWrapper {
-    client: lnd_grpc_rust::LndClient,
-}
-
-#[cfg(feature = "lnd-grpc")]
-impl LndGrpcWrapper {
-    pub async fn connect(cert_hex: &str, macaroon_hex: &str, addr: &str) -> Result<Self> {
-        let mac = hex::decode(macaroon_hex).map_err(|e| anyhow!("Invalid macaroon hex: {}", e))?;
-
-        let cert_arg = if cert_hex.trim().is_empty() {
-            "".to_string()
-        } else {
-            hex::decode(cert_hex)?
-                .iter()
-                .map(|b| format!("{:02x}", b))
-                .collect()
-        };
-
-        let client = lnd_grpc_rust::connect(cert_arg, hex::encode(mac), addr.to_string())
-            .await
-            .map_err(|e| anyhow!("LND gRPC connect failed: {}", e))?;
-
-        Ok(Self { client })
-    }
-}
-
-#[cfg_attr(feature = "lnd-grpc", async_trait)]
-#[cfg_attr(not(feature = "lnd-grpc"), async_trait(?Send))]
-impl LightningClient for LndGrpcWrapper {
-    async fn get_info(&mut self) -> Result<NodeInfo> {
-        #[cfg(feature = "lnd-grpc")]
-        {
-            let req = GetInfoRequest {};
-            let res: GetInfoResponse = self.client.lightning().get_info(req).await?.into_inner();
-            Ok(NodeInfo {
-                alias: res.alias,
-                identity_pubkey: res.identity_pubkey,
-            })
-        }
-        #[cfg(not(feature = "lnd-grpc"))]
-        {
-            Err(anyhow!("lnd-grpc feature not enabled"))
-        }
+    pub struct LndGrpcWrapper {
+        client: RpcClient<Channel>,
+        macaroon: MetadataValue<Ascii>,
     }
 
-    async fn create_invoice(
-        &mut self,
-        msat: u64,
-        _label: Option<&str>,
-        desc: Option<&str>,
-    ) -> Result<String> {
-        #[cfg(feature = "lnd-grpc")]
-        {
-            let req = LndInvoice {
-                value_msat: msat as i64,
-                memo: desc.unwrap_or("rust").to_string(),
-                ..Default::default()
-            };
-            let res: AddInvoiceResponse =
-                self.client.lightning().add_invoice(req).await?.into_inner();
-            Ok(res.payment_request)
-        }
-        #[cfg(not(feature = "lnd-grpc"))]
-        {
-            Err(anyhow!("lnd-grpc feature not enabled"))
-        }
-    }
-
-    async fn get_balance(&mut self) -> Result<Balance> {
-        #[cfg(feature = "lnd-grpc")]
-        {
-            let wallet_req = WalletBalanceRequest {
-                account: "".to_string(),
-                min_confs: 1,
-            };
-            let wallet_res: WalletBalanceResponse = self
-                .client
-                .lightning()
-                .wallet_balance(wallet_req)
-                .await?
-                .into_inner();
-            let onchain_sat = wallet_res.confirmed_balance as u64;
-
-            let chan_req = ChannelBalanceRequest {
-                ..Default::default()
-            };
-            let chan_res: ChannelBalanceResponse = self
-                .client
-                .lightning()
-                .channel_balance(chan_req)
-                .await?
-                .into_inner();
-            let channel_msat = if let Some(amount) = chan_res.local_balance {
-                if amount.msat > 0 {
-                    amount.msat as u64
-                } else {
-                    amount.sat as u64 * 1000
-                }
+    impl LndGrpcWrapper {
+        pub async fn connect(cert_hex: &str, macaroon_hex: &str, addr: &str) -> Result<Self> {
+            let certificate =
+                hex::decode(cert_hex).map_err(|_| anyhow!("Invalid TLS certificate encoding"))?;
+            if certificate.is_empty() {
+                return Err(anyhow!("TLS certificate is required"));
+            }
+            let macaroon = hex::encode(
+                hex::decode(macaroon_hex).map_err(|_| anyhow!("Invalid macaroon encoding"))?,
+            );
+            if macaroon.is_empty() {
+                return Err(anyhow!("Macaroon is required"));
+            }
+            let mut macaroon = macaroon
+                .parse::<MetadataValue<Ascii>>()
+                .map_err(|_| anyhow!("Invalid macaroon metadata"))?;
+            macaroon.set_sensitive(true);
+            let address = if addr.starts_with("https://") {
+                addr.to_owned()
             } else {
-                0u64
+                format!("https://{addr}")
             };
-
-            Ok(Balance {
-                onchain_sat,
-                channel_msat,
+            let url = url::Url::parse(&address).map_err(|_| anyhow!("Invalid gRPC endpoint"))?;
+            if url.scheme() != "https"
+                || !url.username().is_empty()
+                || url.password().is_some()
+                || url.query().is_some()
+                || url.fragment().is_some()
+                || url.path() != "/"
+            {
+                return Err(anyhow!("gRPC endpoint must be an HTTPS origin"));
+            }
+            let endpoint = Endpoint::from_shared(address)
+                .map_err(|_| anyhow!("Invalid gRPC endpoint"))?
+                .tls_config(
+                    ClientTlsConfig::new().ca_certificate(Certificate::from_pem(certificate)),
+                )
+                .map_err(|_| anyhow!("Invalid TLS trust configuration"))?
+                .timeout(std::time::Duration::from_secs(u64::from(
+                    crate::settings::Limits::default().rpc_seconds,
+                )));
+            Ok(Self {
+                client: RpcClient::new(endpoint.connect_lazy()),
+                macaroon,
             })
         }
-        #[cfg(not(feature = "lnd-grpc"))]
-        {
-            Err(anyhow!("lnd-grpc feature not enabled"))
+
+        fn request<T>(&self, value: T) -> Request<T> {
+            let mut request = Request::new(value);
+            request
+                .metadata_mut()
+                .insert("macaroon", self.macaroon.clone());
+            request
         }
     }
 
-    async fn list_invoices(&mut self, limit: Option<usize>) -> Result<Vec<Invoice>> {
-        #[cfg(feature = "lnd-grpc")]
-        {
-            let req = ListInvoiceRequest {
-                num_max_invoices: limit.unwrap_or(10) as u64,
+    #[async_trait]
+    impl LightningClient for LndGrpcWrapper {
+        async fn get_info(&self) -> Result<NodeInfo> {
+            let response = self
+                .client
+                .clone()
+                .get_info(self.request(lnrpc::GetInfoRequest {}))
+                .await
+                .map_err(|_| anyhow!("Node info unavailable"))?
+                .into_inner();
+            Ok(NodeInfo {
+                alias: response.alias,
+                identity_pubkey: response.identity_pubkey,
+            })
+        }
+
+        async fn create_invoice(
+            &self,
+            msat: u64,
+            _label: Option<&str>,
+            desc: Option<&str>,
+        ) -> Result<String> {
+            let request = lnrpc::Invoice {
+                value_msat: i64::try_from(msat).map_err(|_| anyhow!("Amount out of range"))?,
+                memo: desc.unwrap_or_default().into(),
                 ..Default::default()
             };
-            let res: ListInvoiceResponse = self
+            Ok(self
                 .client
-                .lightning()
-                .list_invoices(req)
-                .await?
+                .clone()
+                .add_invoice(self.request(request))
+                .await
+                .map_err(|_| anyhow!("Invoice outcome unavailable"))?
+                .into_inner()
+                .payment_request)
+        }
+
+        async fn get_balance(&self) -> Result<Balance> {
+            let wallet = self
+                .client
+                .clone()
+                .wallet_balance(self.request(lnrpc::WalletBalanceRequest {
+                    account: String::new(),
+                    min_confs: 1,
+                }))
+                .await
+                .map_err(|_| anyhow!("Wallet balance unavailable"))?
                 .into_inner();
-            let invoices = res
+            let channels = self
+                .client
+                .clone()
+                .channel_balance(self.request(lnrpc::ChannelBalanceRequest {}))
+                .await
+                .map_err(|_| anyhow!("Channel balance unavailable"))?
+                .into_inner();
+            let local = channels
+                .local_balance
+                .ok_or_else(|| anyhow!("Missing channel balance"))?;
+            Ok(Balance {
+                onchain_sat: u64::try_from(wallet.confirmed_balance)
+                    .map_err(|_| anyhow!("Invalid wallet balance"))?,
+                channel_msat: local.msat,
+            })
+        }
+
+        async fn list_invoices(&self, limit: Option<usize>) -> Result<Vec<Invoice>> {
+            let request = lnrpc::ListInvoiceRequest {
+                num_max_invoices: u64::try_from(limit.unwrap_or(10))
+                    .map_err(|_| anyhow!("Invalid list limit"))?,
+                ..Default::default()
+            };
+            let response = self
+                .client
+                .clone()
+                .list_invoices(self.request(request))
+                .await
+                .map_err(|_| anyhow!("Invoices unavailable"))?
+                .into_inner();
+            response
                 .invoices
                 .into_iter()
-                .map(|inv| Invoice {
-                    hash: hex::encode(inv.r_hash),
-                    amount_msat: std::cmp::max(inv.value_msat, 0) as u64,
-                    state: match inv.state {
-                        0 => "open".to_string(),
-                        1 => "settled".to_string(),
-                        2 => "canceled".to_string(),
-                        3 => "accepted".to_string(),
-                        _ => format!("unknown: {}", inv.state),
-                    },
-                    bolt11: if inv.payment_request.is_empty() {
-                        None
-                    } else {
-                        Some(inv.payment_request)
-                    },
-                    desc: if inv.memo.is_empty() {
-                        None
-                    } else {
-                        Some(inv.memo)
-                    },
+                .map(|invoice| {
+                    Ok(Invoice {
+                        hash: hex::encode(invoice.r_hash),
+                        amount_msat: u64::try_from(invoice.value_msat)
+                            .map_err(|_| anyhow!("Invalid invoice amount"))?,
+                        state: match invoice.state {
+                            0 => "open".into(),
+                            1 => "settled".into(),
+                            2 => "canceled".into(),
+                            3 => "accepted".into(),
+                            other => format!("unknown:{other}"),
+                        },
+                        bolt11: (!invoice.payment_request.is_empty())
+                            .then_some(invoice.payment_request),
+                        desc: (!invoice.memo.is_empty()).then_some(invoice.memo),
+                    })
                 })
-                .collect();
-            Ok(invoices)
+                .collect()
         }
-        #[cfg(not(feature = "lnd-grpc"))]
-        {
-            Err(anyhow!("lnd-grpc feature not enabled"))
-        }
-    }
 
-    async fn decode_invoice(&mut self, _bolt11: &str) -> Result<DecodedInvoice> {
-        #[cfg(feature = "lnd-grpc")]
-        {
-            Err(anyhow!(
-                "decode_invoice not implemented in this gRPC binding version"
-            ))
+        async fn decode_invoice(&self, bolt11: &str) -> Result<DecodedInvoice> {
+            let response = self
+                .client
+                .clone()
+                .decode_pay_req(self.request(lnrpc::PayReqString {
+                    pay_req: bolt11.into(),
+                }))
+                .await
+                .map_err(|_| anyhow!("Invoice decode failed"))?
+                .into_inner();
+            Ok(DecodedInvoice {
+                amount_msat: match response.num_msat {
+                    0 => None,
+                    amount => {
+                        Some(u64::try_from(amount).map_err(|_| anyhow!("Invalid invoice amount"))?)
+                    }
+                },
+                desc: Some(response.description),
+                payee: Some(response.destination),
+            })
         }
-        #[cfg(not(feature = "lnd-grpc"))]
-        {
-            Err(anyhow!("lnd-grpc feature not enabled"))
-        }
-    }
 
-    async fn pay_invoice(&mut self, _bolt11: &str) -> Result<PaymentResult> {
-        #[cfg(feature = "lnd-grpc")]
-        {
+        async fn pay_invoice(&self, _bolt11: &str) -> Result<PaymentResult> {
             Err(anyhow!(
-                "pay_invoice not implemented in this gRPC binding version"
+                "Payment requires the versioned reviewed-operation API"
             ))
-        }
-        #[cfg(not(feature = "lnd-grpc"))]
-        {
-            Err(anyhow!("lnd-grpc feature not enabled"))
         }
     }
 }
+
+#[cfg(feature = "lnd-grpc")]
+pub use enabled::LndGrpcWrapper;

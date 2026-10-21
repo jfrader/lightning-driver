@@ -19,7 +19,7 @@ impl ClnClient {
 
 #[async_trait]
 impl LightningClient for ClnClient {
-    async fn get_info(&mut self) -> Result<NodeInfo> {
+    async fn get_info(&self) -> Result<NodeInfo> {
         let res: Value = self
             .http
             .get(format!("{}/v1/getinfo", self.url))
@@ -34,7 +34,7 @@ impl LightningClient for ClnClient {
     }
 
     async fn create_invoice(
-        &mut self,
+        &self,
         msat: u64,
         _label: Option<&str>,
         desc: Option<&str>,
@@ -67,7 +67,7 @@ impl LightningClient for ClnClient {
         }
     }
 
-    async fn get_balance(&mut self) -> Result<Balance> {
+    async fn get_balance(&self) -> Result<Balance> {
         let res: Value = self
             .http
             .post(format!("{}/v1/listfunds", self.url))
@@ -103,7 +103,7 @@ impl LightningClient for ClnClient {
         })
     }
 
-    async fn list_invoices(&mut self, limit: Option<usize>) -> Result<Vec<Invoice>> {
+    async fn list_invoices(&self, limit: Option<usize>) -> Result<Vec<Invoice>> {
         #[cfg(feature = "cln")]
         {
             let payload = json!({ "count": limit.unwrap_or(10) });
@@ -143,7 +143,7 @@ impl LightningClient for ClnClient {
         }
     }
 
-    async fn decode_invoice(&mut self, bolt11: &str) -> Result<DecodedInvoice> {
+    async fn decode_invoice(&self, bolt11: &str) -> Result<DecodedInvoice> {
         #[cfg(feature = "cln")]
         {
             let payload = json!({ "bolt11": bolt11 });
@@ -172,7 +172,7 @@ impl LightningClient for ClnClient {
         }
     }
 
-    async fn pay_invoice(&mut self, bolt11: &str) -> Result<PaymentResult> {
+    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentResult> {
         #[cfg(feature = "cln")]
         {
             let payload = json!({ "bolt11": bolt11 });

@@ -19,13 +19,25 @@ serde_json  = { workspace = true }
 # -----------------------------------------------------------------
 # OPTIONAL deps – declared **locally**, not in workspace
 # -----------------------------------------------------------------
-chrono        = { version = "0.4", optional = true }
+chrono        = { workspace = true }
 lnd_grpc_rust = { version = "2.11", optional = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+url = { workspace = true }
+bitcoin = "0.32"
+lightning-invoice = "=0.34.1"
+libc = "0.2"
 
 # -----------------------------------------------------------------
 # Features
 # -----------------------------------------------------------------
 [features]
 default = []
-lnd-grpc = ["lnd_grpc_rust"]
-cln      = ["chrono"]
+lnd-grpc = ["lnd_grpc_rust", "dep:tonic"]
+cln      = []
+
+[dependencies.tonic]
+version = "0.7"
+features = ["tls", "tls-roots"]
+optional = true
