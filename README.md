@@ -115,6 +115,49 @@ Fingerprints are centralized SHA-256 digests of deterministic typed JSON tuples.
 
 ## Verification
 
+### Synthetic full-stack development
+
+Requires `openssl` on PATH. From the workspace root, start the disposable,
+loopback-only TLS node harness explicitly:
+
+```sh
+cargo run -p synthetic-node-harness --features synthetic-dev -- --acknowledge-synthetic-dev --public-port 5173
+```
+
+It prints exact `api-server serve` and `auth enrollment` commands using its
+generated private configuration directory under `/tmp/lightning-driver/`. Run those in
+separate terminals. Serve the UI on `http://localhost:5173`; its development proxy
+must forward `/api/v1` to `http://127.0.0.1:8080` with `changeOrigin: false`, keeping
+the browser's `Host: localhost:5173` and Origin. Enroll a passkey normally. Omit
+`--public-port` for API-only work directly on `http://localhost:8080`. There is no
+authentication bypass, injected adapter or production configuration change.
+Stop the API first, then Ctrl-C the harness: its synthetic journal, credentials
+and freshly generated TLS CA/keys are deleted. Do not use this directory for
+real state. The harness is not an API-server dependency, is excluded from the
+workspace default members, and its binary requires both the non-default feature
+and the acknowledgement flag. Every listener and peer must be loopback.
+
+The three independent nodes implement the adapter subset of CLN v25.02 REST and
+LND v0.18.5-beta REST/gRPC (Lightning, Router and WalletKit). These are tagged
+synthetic shapes, not daemon compatibility certification. Each node runs one
+seeded scenario: one retained invoice/payment and fixed transaction/channel
+references. Restart the harness for a new independent scenario. Payments settle
+on tracking, channels activate after observation, and closes are cooperative.
+The library can script rejection, permission loss, timeout before/after effect,
+malformed/oversized responses and late LND stream errors, without retrying.
+Existing API read-route coverage is unchanged; this harness does not add missing
+HTTP collection endpoints or serve frontend assets.
+
+Run wire-level journeys and validate their actual HTTP responses against the
+unchanged frozen schema (the Python environment must provide `jsonschema`):
+
+```sh
+EVIDENCE=$(mktemp -d /tmp/lightning-driver/lightning-journeys.XXXXXX)
+HTTP_EVIDENCE_DIR="$EVIDENCE" CARGO_BUILD_JOBS=2 cargo test -p api-server --lib journeys
+python3 tools/validate-journey-responses.py "$EVIDENCE"
+CARGO_BUILD_JOBS=2 cargo test -p synthetic-node-harness --features synthetic-dev
+```
+
 From the workspace root:
 
 ```sh

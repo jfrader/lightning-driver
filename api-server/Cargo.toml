@@ -34,6 +34,7 @@ tonic = { version = "0.7", features = ["tls"] }
 http-body = "0.4"
 
 [dev-dependencies]
+synthetic-node-harness = { path = "../synthetic-node-harness", features = ["synthetic-dev"] }
 hyper = { version = "0.14", features = ["server", "http1", "http2", "stream"] }
 tokio-rustls = "0.24"
 tempfile = "3"

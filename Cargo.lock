@@ -333,6 +333,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "subtle",
+ "synthetic-node-harness",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
@@ -2902,6 +2903,26 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.109",
+]
+
+[[package]]
+name = "synthetic-node-harness"
+version = "0.1.0"
+dependencies = [
+ "base64 0.21.7",
+ "bitcoin",
+ "chrono",
+ "clap",
+ "hex",
+ "hyper",
+ "lightning-client",
+ "lightning-invoice",
+ "lnd_grpc_rust",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-rustls 0.24.1",
 ]
 
 [[package]]
