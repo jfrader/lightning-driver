@@ -73,6 +73,76 @@ struct Binding {
     tags: Vec<Vec<String>>,
 }
 
+struct StoredChallenge {
+    owner: String,
+    generation: i64,
+    nonce_hash: Vec<u8>,
+    binding: Binding,
+    expires: i64,
+    attempts: i64,
+}
+
+impl StoredChallenge {
+    fn load(connection: &rusqlite::Connection, id: Uuid) -> Result<Option<Self>, JournalError> {
+        let record = connection.query_row(
+            "SELECT owner,generation,nonce_hash,binding,expires_at,attempts FROM nostr_challenges WHERE id=?1",
+            [id.to_string()],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, Vec<u8>>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?, row.get::<_, i64>(5)?)),
+        ).optional()?;
+        record
+            .map(
+                |(owner, generation, nonce_hash, binding, expires, attempts)| {
+                    Ok(Self {
+                        owner,
+                        generation,
+                        nonce_hash,
+                        binding: serde_json::from_str(&binding)?,
+                        expires,
+                        attempts,
+                    })
+                },
+            )
+            .transpose()
+    }
+
+    fn validate(
+        &self,
+        context: &Context,
+        generation: i64,
+        memory: &Memory,
+        now: DateTime<Utc>,
+    ) -> Result<(), AuthError> {
+        if self.owner != context.id.to_string()
+            || self.generation != context.generation
+            || generation != self.generation
+        {
+            return Err(AuthError::Challenge);
+        }
+        if self.attempts == CONSUMED_ATTEMPTS {
+            return Err(if self.binding.purpose == "enrollment" {
+                AuthError::Authentication
+            } else {
+                AuthError::Challenge
+            });
+        }
+        if !memory.contexts.get(&context.key).is_some_and(|live| {
+            live.id == context.id
+                && live.generation == generation
+                && live.expires_at > now
+                && live.idle_expires_at > now
+        }) {
+            return Err(AuthError::Challenge);
+        }
+        if self.expires <= now.timestamp() {
+            return Err(AuthError::Expired);
+        }
+        if self.attempts >= MAX_ATTEMPTS {
+            return Err(AuthError::Challenge);
+        }
+        Ok(())
+    }
+}
+
 impl Journal {
     pub async fn nostr_identities(&self) -> Result<Vec<NostrIdentity>, JournalError> {
         self.run(|connection| {
@@ -230,8 +300,7 @@ impl AuthManager {
                 if count <= 1 { return Ok(Err(AuthError::LastCredential)); }
             }
             tx.execute("DELETE FROM nostr_challenges WHERE expires_at<=?1 OR generation<>?2", params![now.timestamp(), generation])?;
-            let count: i64 = tx.query_row("SELECT count(*) FROM nostr_challenges", [], |row| row.get(0))?;
-            if count as usize + memory.ceremonies.len() + memory.verifying.values().sum::<usize>() >= manager.limits.max_challenges { return Ok(Err(AuthError::Limited)); }
+            if let Err(error) = memory.admit_challenge(&context, manager.limits.max_challenges) { return Ok(Err(error)); }
             tx.execute("INSERT INTO nostr_challenges(id,owner,generation,nonce_hash,binding,expires_at) VALUES(?1,?2,?3,?4,?5,?6)", params![id.to_string(),context.id.to_string(),generation,nonce_hash,serde_json::to_string(&binding)?,expires.timestamp()])?;
             tx.commit()?;
             memory.nostr_pending.insert(id, (context.id, expires));
@@ -273,6 +342,45 @@ impl AuthManager {
         operation: Option<&Operation>,
         now: DateTime<Utc>,
     ) -> Result<(String, String, Option<NewContext>), AuthError> {
+        self.preflight_nostr(context, finish.challenge_id, now)
+            .await?;
+        self.verify_nostr_transaction(context, finish, operation, now)
+            .await
+    }
+
+    pub(crate) async fn preflight_nostr(
+        &self,
+        context: &Context,
+        id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<(), AuthError> {
+        let context = context.clone();
+        let manager = self.clone();
+        self.journal
+            .run(move |connection| {
+                // Only WAL reads occur here. Hold the context lock while reading so a
+                // concurrent rotation cannot pair an old challenge with a revoked context.
+                let memory = manager.memory.lock().map_err(|_| JournalError::Storage)?;
+                let Some(challenge) = StoredChallenge::load(connection, id)? else {
+                    return Ok(Err(AuthError::Challenge));
+                };
+                let generation = connection.query_row(
+                    "SELECT generation FROM auth_meta WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                Ok(challenge.validate(&context, generation, &memory, now))
+            })
+            .await?
+    }
+
+    async fn verify_nostr_transaction(
+        &self,
+        context: &Context,
+        finish: NostrFinish,
+        operation: Option<&Operation>,
+        now: DateTime<Utc>,
+    ) -> Result<(String, String, Option<NewContext>), AuthError> {
         let context = context.clone();
         let operation = operation.cloned();
         let manager = self.clone();
@@ -285,21 +393,12 @@ impl AuthManager {
         self.journal.run(move |connection| {
             let _permit = permit;
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let stored: Option<(String, i64, Vec<u8>, String, i64, i64)> = tx.query_row("SELECT owner,generation,nonce_hash,binding,expires_at,attempts FROM nostr_challenges WHERE id=?1", [finish.challenge_id.to_string()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?))).optional()?;
-            let Some((owner,generation,nonce_hash,binding,expires,attempts)) = stored else { return Ok(Err(AuthError::Challenge)); };
-            let binding: Binding = serde_json::from_str(&binding)?;
-            if attempts == CONSUMED_ATTEMPTS && owner == context.id.to_string() {
-                return Ok(Err(if binding.purpose == "enrollment" { AuthError::Authentication } else { AuthError::Challenge }));
-            }
+            let Some(challenge) = StoredChallenge::load(&tx, finish.challenge_id)? else { return Ok(Err(AuthError::Challenge)); };
             let mut memory = manager.memory.lock().map_err(|_| JournalError::Storage)?;
             memory.prune(now);
             let current: i64 = tx.query_row("SELECT generation FROM auth_meta WHERE singleton=1", [], |row| row.get(0))?;
-            let live = memory.contexts.get(&context.key);
-            if owner != context.id.to_string() || generation != context.generation || current != generation
-                || !live.is_some_and(|live| live.id == context.id && live.expires_at > now && live.idle_expires_at > now)
-            { return Ok(Err(AuthError::Challenge)); }
-            if expires <= now.timestamp() { return Ok(Err(AuthError::Expired)); }
-            if attempts >= MAX_ATTEMPTS { return Ok(Err(AuthError::Challenge)); }
+            if let Err(error) = challenge.validate(&context, current, &memory, now) { return Ok(Err(error)); }
+            let StoredChallenge { generation, nonce_hash, binding, .. } = challenge;
             memory.nostr_failures.retain(|_, queue| {
                 while queue.front().is_some_and(|time| *time + Duration::seconds(RATE_WINDOW_SECONDS) <= now) { queue.pop_front(); }
                 !queue.is_empty()

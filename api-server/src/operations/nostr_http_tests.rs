@@ -227,3 +227,136 @@ async fn zero_passkey_nostr_enrollment_login_stepup_confirm_and_unlink() {
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+#[actix_web::test]
+async fn nostr_finish_routes_share_client_admission_with_starts() {
+    let f = HttpFixture::new().await;
+    let browser = nostr_login(&f.state, true).await;
+    let budget = f.settings.api.limits.login_attempts_per_minute;
+    let peer = "192.0.2.50:1000".parse().unwrap();
+    let (status, challenge, _) = call(
+        &f.state,
+        authenticated(post("/api/v1/auth/nostr/start"), &browser)
+            .peer_addr(peer)
+            .set_json(json!({"purpose":"link"})),
+        "NostrChallenge",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status,_,_) = call(&f.state,authenticated(post("/api/v1/auth/nostr/finish"),&browser).peer_addr(peer).set_json(json!({"challenge_id":challenge["challenge_id"],"event":signed(&challenge["event"],2)})),"NostrIdentityResponse").await;
+    assert_eq!(status, StatusCode::OK);
+    let invalid =
+        json!({"kind":0,"created_at":0,"tags":[],"content":"invalid","pubkey":"","id":"","sig":""});
+    for _ in 2..budget {
+        let (status, error, _) = call(
+            &f.state,
+            authenticated(post("/api/v1/auth/nostr/finish"), &browser)
+                .peer_addr(peer)
+                .set_json(json!({"challenge_id":Uuid::new_v4(),"event":invalid})),
+            "Session",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error["error"]["code"], "challenge_invalid");
+    }
+    let (status, error, _) = call(
+        &f.state,
+        authenticated(post("/api/v1/auth/nostr/finish"), &browser)
+            .peer_addr(peer)
+            .set_json(json!({"challenge_id":Uuid::new_v4(),"event":invalid})),
+        "Session",
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error["error"]["code"], "rate_limited");
+
+    let operation = create(&f, &browser, OperationKind::SendOnchain, Uuid::new_v4()).await;
+    let digest = &operation["review"]["digest"];
+    let peer = "192.0.2.51:1000".parse().unwrap();
+    let (status, start, _) = call(
+        &f.state,
+        authenticated(post(&path(&operation, "/authorize/nostr")), &browser)
+            .peer_addr(peer)
+            .set_json(json!({"review_digest":digest})),
+        "NostrAuthorizationStart",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let challenge = &start["challenge"];
+    let (status,_,_) = call(&f.state,authenticated(post(&path(&operation,"/authorize/nostr/finish")),&browser).peer_addr(peer).set_json(json!({"review_digest":digest,"challenge_id":challenge["challenge_id"],"event":signed(&challenge["event"],1)})),"OperationAuthorization").await;
+    assert_eq!(status, StatusCode::OK);
+    for _ in 2..budget {
+        let (status, error, _) = call(
+            &f.state,
+            authenticated(post(&path(&operation, "/authorize/nostr/finish")), &browser)
+                .peer_addr(peer)
+                .set_json(
+                    json!({"review_digest":digest,"challenge_id":Uuid::new_v4(),"event":invalid}),
+                ),
+            "OperationAuthorization",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error["error"]["code"], "challenge_invalid");
+    }
+    let (status, error, _) = call(
+        &f.state,
+        authenticated(post(&path(&operation, "/authorize/nostr/finish")), &browser)
+            .peer_addr(peer)
+            .set_json(
+                json!({"review_digest":digest,"challenge_id":Uuid::new_v4(),"event":invalid}),
+            ),
+        "OperationAuthorization",
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(error["error"]["code"], "rate_limited");
+}
+
+#[actix_web::test]
+async fn nostr_http_invalid_challenges_do_not_wait_for_a_database_writer() {
+    let f = HttpFixture::new().await;
+    let browser = nostr_login(&f.state, true).await;
+    let operation = create(&f, &browser, OperationKind::SendOnchain, Uuid::new_v4()).await;
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let database = f.settings.api.database.clone();
+    let writer = tokio::task::spawn_blocking(move || {
+        let mut connection = rusqlite::Connection::open(database).unwrap();
+        let tx = connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        ready_tx.send(()).unwrap();
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        tx.rollback().unwrap();
+    });
+    ready_rx.await.unwrap();
+    let invalid =
+        json!({"kind":0,"created_at":0,"tags":[],"content":"invalid","pubkey":"","id":"","sig":""});
+    for (route, body) in [
+        (
+            "/api/v1/auth/nostr/finish".to_string(),
+            json!({"challenge_id":Uuid::new_v4(),"event":invalid}),
+        ),
+        (
+            path(&operation, "/authorize/nostr/finish"),
+            json!({"review_digest":operation["review"]["digest"],"challenge_id":Uuid::new_v4(),"event":invalid}),
+        ),
+    ] {
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            call(
+                &f.state,
+                authenticated(post(&route), &browser).set_json(body),
+                "OperationAuthorization",
+            ),
+        )
+        .await;
+        let (status, error, _) =
+            response.expect("invalid challenge must not wait for the database writer");
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(error["error"]["code"], "challenge_invalid");
+    }
+    release_tx.send(()).unwrap();
+    writer.await.unwrap();
+}

@@ -169,8 +169,15 @@ async fn finish_nostr(
     state: web::Data<ApplicationState>,
     body: web::Json<NostrAuthorizationFinish>,
 ) -> std::result::Result<HttpResponse, ApiError> {
+    state.auth.admit_start(&request)?;
     let context = state.auth.context(&request, true, true).await?;
     let (node, id) = target(&request, &body.review_digest)?;
+    // Reject invalid challenges before the engine's write-transaction review gate too.
+    state
+        .auth
+        .manager
+        .preflight_nostr(&context, body.challenge_id, state.engine.clock.now())
+        .await?;
     let operation = state
         .engine
         .reviewable(&context, &node, id, &body.review_digest)

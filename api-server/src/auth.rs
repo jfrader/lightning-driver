@@ -29,6 +29,7 @@ const MAX_RATE_BUCKETS: usize = 256;
 const VERIFICATION_WORKERS: usize = 2;
 const RATE_WINDOW_SECONDS: i64 = 60;
 const ANONYMOUS_IDENTITY_SHARES: usize = 4;
+const AUTHENTICATED_CHALLENGE_RESERVE_DIVISOR: usize = 4;
 
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub enum ClientIdentity {
@@ -869,13 +870,7 @@ impl AuthManager {
             ceremony.owner != context.id
                 || std::mem::discriminant(&ceremony.purpose) != std::mem::discriminant(&purpose)
         });
-        if memory.ceremonies.len()
-            + memory.nostr_pending.len()
-            + memory.verifying.values().sum::<usize>()
-            >= self.limits.max_challenges
-        {
-            return Err(AuthError::Limited);
-        }
+        memory.admit_challenge(context, self.limits.max_challenges)?;
         let id = Uuid::new_v4();
         memory.ceremonies.insert(
             id,
@@ -1052,6 +1047,22 @@ impl AuthManager {
 }
 
 impl Memory {
+    fn admit_challenge(&self, context: &Context, maximum: usize) -> Result<(), AuthError> {
+        let capacity = if context.last_authenticated_at.is_none() {
+            maximum - maximum / AUTHENTICATED_CHALLENGE_RESERVE_DIVISOR
+        } else {
+            maximum
+        };
+        let allocated = self.ceremonies.len()
+            + self.nostr_pending.len()
+            + self.verifying.values().sum::<usize>();
+        if allocated >= capacity {
+            Err(AuthError::Limited)
+        } else {
+            Ok(())
+        }
+    }
+
     fn make_anonymous_room(
         &mut self,
         identity: ClientIdentity,
@@ -1116,11 +1127,12 @@ impl Memory {
         }
     }
     fn prune(&mut self, now: DateTime<Utc>) {
-        self.nostr_pending.retain(|_, (_, expires)| *expires > now);
         self.contexts
             .retain(|_, context| context.expires_at > now && context.idle_expires_at > now);
         let owners: std::collections::HashSet<_> =
             self.contexts.values().map(|context| context.id).collect();
+        self.nostr_pending
+            .retain(|_, (owner, expires)| *expires > now && owners.contains(owner));
         self.ceremonies
             .retain(|_, ceremony| ceremony.expires > now && owners.contains(&ceremony.owner));
         self.grants

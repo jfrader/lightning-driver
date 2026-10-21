@@ -346,6 +346,7 @@ async fn finish_nostr(
     body: web::Json<NostrFinish>,
 ) -> Result<HttpResponse, ApiError> {
     let state = &application.auth;
+    state.admit_start(&request)?;
     // Pick the bound context from the cookie that matches the CSRF token. A stale
     // preauth cookie must not hide the operator's authenticated context.
     let context = match state.context(&request, true, true).await {

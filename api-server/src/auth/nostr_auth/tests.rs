@@ -1,6 +1,248 @@
 use super::*;
 use secp256k1::{Keypair, Message, Secp256k1, SecretKey};
 
+fn invalid_event() -> Event {
+    Event {
+        pubkey: String::new(),
+        id: String::new(),
+        sig: String::new(),
+        kind: 0,
+        created_at: 0,
+        tags: vec![],
+        content: "invalid".into(),
+    }
+}
+
+#[tokio::test]
+async fn invalid_challenge_preflight_never_requires_the_sqlite_write_lock() {
+    let (dir, manager, now) = setup().await;
+    enroll(&manager, now, 1).await;
+    let owner = guest(&manager, now).await;
+    let foreign = guest(&manager, now).await;
+    let active = start(&manager, &owner.context, "login", None, None, now).await;
+    let consumed = start(&manager, &owner.context, "login", None, None, now).await;
+    let consumed_id = consumed.challenge_id.to_string();
+    manager
+        .journal
+        .run(move |c| {
+            c.execute(
+                "UPDATE nostr_challenges SET attempts=?2 WHERE id=?1",
+                params![consumed_id, CONSUMED_ATTEMPTS],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let path = dir.path().join("auth.sqlite");
+    let writer = tokio::task::spawn_blocking(move || {
+        let mut connection = rusqlite::Connection::open(path).unwrap();
+        let tx = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        ready_tx.send(()).unwrap();
+        // Bound cleanup even if an assertion fails while this independent writer is held.
+        let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        tx.rollback().unwrap();
+    });
+    ready_rx.await.unwrap();
+    let mut wrong_generation = owner.context.clone();
+    wrong_generation.generation += 1;
+    let mut dead_context = owner.context.clone();
+    dead_context.key = [0; 32];
+    for (context, id, time, expected) in [
+        (&owner.context, Uuid::new_v4(), now, AuthError::Challenge),
+        (
+            &foreign.context,
+            active.challenge_id,
+            now,
+            AuthError::Challenge,
+        ),
+        (
+            &owner.context,
+            active.challenge_id,
+            now + Duration::seconds(TTL_SECONDS),
+            AuthError::Expired,
+        ),
+        (
+            &owner.context,
+            consumed.challenge_id,
+            now,
+            AuthError::Challenge,
+        ),
+        (
+            &wrong_generation,
+            active.challenge_id,
+            now,
+            AuthError::Challenge,
+        ),
+        (
+            &dead_context,
+            active.challenge_id,
+            now,
+            AuthError::Challenge,
+        ),
+    ] {
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            manager.finish_nostr(
+                context,
+                NostrFinish {
+                    challenge_id: id,
+                    event: invalid_event(),
+                },
+                time,
+            ),
+        )
+        .await;
+        let error = match result {
+            Ok(Err(error)) => error,
+            _ => panic!("invalid challenge must fail without waiting for the held write lock"),
+        };
+        assert_eq!(
+            std::mem::discriminant(&error),
+            std::mem::discriminant(&expected)
+        );
+    }
+    release_tx.send(()).unwrap();
+    writer.await.unwrap();
+    assert!(manager
+        .finish_nostr(
+            &owner.context,
+            NostrFinish {
+                challenge_id: active.challenge_id,
+                event: sign(&active, 1)
+            },
+            now
+        )
+        .await
+        .is_ok());
+}
+
+#[tokio::test]
+async fn consumption_racing_a_successful_preflight_is_rechecked_in_the_transaction() {
+    let (_dir, manager, now) = setup().await;
+    let session = enroll(&manager, now, 1).await;
+    let challenge = start(&manager, &session.context, "link", None, None, now).await;
+    manager
+        .preflight_nostr(&session.context, challenge.challenge_id, now)
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager
+            .finish_nostr(
+                &session.context,
+                NostrFinish {
+                    challenge_id: challenge.challenge_id,
+                    event: sign(&challenge, 2)
+                },
+                now
+            )
+            .await,
+        Ok(NostrOutcome::Identity(_))
+    ));
+    assert!(matches!(
+        manager
+            .verify_nostr_transaction(
+                &session.context,
+                NostrFinish {
+                    challenge_id: challenge.challenge_id,
+                    event: sign(&challenge, 3)
+                },
+                None,
+                now
+            )
+            .await,
+        Err(AuthError::Challenge)
+    ));
+    assert_eq!(manager.journal.credential_counts().await.unwrap(), (0, 2));
+}
+
+fn registration_state(manager: &AuthManager) -> PasskeyRegistration {
+    manager
+        .webauthn
+        .start_passkey_registration(Uuid::new_v4(), "operator", "Operator", None)
+        .unwrap()
+        .1
+}
+
+#[tokio::test]
+async fn mixed_anonymous_challenges_preserve_authenticated_capacity_and_prune() {
+    let (_dir, mut manager, now) = setup().await;
+    manager.limits.max_challenges = 8;
+    let session = enroll(&manager, now, 1).await;
+    let anonymous = guest(&manager, now).await;
+    let passkey_anonymous = guest(&manager, now).await;
+    let rejected_passkey = guest(&manager, now).await;
+    for _ in 0..5 {
+        start(&manager, &anonymous.context, "login", None, None, now).await;
+    }
+    manager
+        .insert_ceremony(
+            &passkey_anonymous.context,
+            Purpose::Enrollment(registration_state(&manager)),
+            now,
+        )
+        .unwrap();
+    assert!(matches!(
+        manager
+            .start_nostr(
+                &anonymous.context,
+                NostrStart {
+                    purpose: "login".into(),
+                    token: None,
+                    pubkey: None
+                },
+                now
+            )
+            .await,
+        Err(AuthError::Limited)
+    ));
+    assert!(matches!(
+        manager.insert_ceremony(
+            &rejected_passkey.context,
+            Purpose::Enrollment(registration_state(&manager)),
+            now
+        ),
+        Err(AuthError::Limited)
+    ));
+    start(&manager, &session.context, "link", None, None, now).await;
+    manager
+        .insert_ceremony(
+            &session.context,
+            Purpose::Enrollment(registration_state(&manager)),
+            now,
+        )
+        .unwrap();
+    assert!(matches!(
+        manager
+            .start_nostr(
+                &session.context,
+                NostrStart {
+                    purpose: "link".into(),
+                    token: None,
+                    pubkey: None
+                },
+                now
+            )
+            .await,
+        Err(AuthError::Limited)
+    ));
+    let later = now + Duration::seconds(TTL_SECONDS + 1);
+    start(&manager, &anonymous.context, "login", None, None, later).await;
+    manager
+        .insert_ceremony(
+            &rejected_passkey.context,
+            Purpose::Enrollment(registration_state(&manager)),
+            later,
+        )
+        .unwrap();
+    let memory = manager.memory.lock().unwrap();
+    assert_eq!(memory.nostr_pending.len(), 1);
+    assert_eq!(memory.ceremonies.len(), 1);
+}
+
 fn key(seed: u8) -> Keypair {
     Keypair::from_secret_key(
         &Secp256k1::new(),
