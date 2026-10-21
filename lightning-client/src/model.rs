@@ -20,6 +20,29 @@ wire_enum!(Network {
     Regtest,
     Unknown
 });
+wire_enum!(VerifiedNetwork {
+    Mainnet,
+    Testnet,
+    Signet,
+    Regtest
+});
+
+#[derive(Debug, thiserror::Error)]
+#[error("Node network has not been verified")]
+pub struct UnverifiedNetwork;
+
+impl TryFrom<Network> for VerifiedNetwork {
+    type Error = UnverifiedNetwork;
+    fn try_from(network: Network) -> Result<Self, Self::Error> {
+        match network {
+            Network::Mainnet => Ok(Self::Mainnet),
+            Network::Testnet => Ok(Self::Testnet),
+            Network::Signet => Ok(Self::Signet),
+            Network::Regtest => Ok(Self::Regtest),
+            Network::Unknown => Err(UnverifiedNetwork),
+        }
+    }
+}
 wire_enum!(Backend {
     LndGrpc,
     LndRest,
@@ -258,7 +281,7 @@ pub struct NodeSummary {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct NodeBinding {
     pub node_id: String,
-    pub network: Network,
+    pub network: VerifiedNetwork,
     pub identity_pubkey: String,
     pub identity_revision: String,
 }
@@ -587,6 +610,16 @@ pub struct Operation {
     pub last_reconciled_at: Option<Timestamp>,
 }
 
+impl Operation {
+    pub fn binding_is_valid(&self) -> bool {
+        self.id == self.review.operation_id
+            && self.node_id == self.review.node.node_id
+            && self.request.sensitive() == self.review.sensitive
+            && !self.review.policy_revision.is_empty()
+            && !self.review.node.identity_revision.is_empty()
+    }
+}
+
 impl OperationState {
     pub fn terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Expired)
@@ -663,6 +696,8 @@ mod tests {
             serde_json::to_string(&Direction::SelfTransfer).unwrap(),
             "\"self\""
         );
+        assert!(serde_json::from_str::<VerifiedNetwork>("\"unknown\"").is_err());
+        assert!(VerifiedNetwork::try_from(Network::Unknown).is_err());
     }
 
     #[test]
