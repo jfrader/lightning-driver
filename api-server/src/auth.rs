@@ -110,7 +110,7 @@ pub struct AuthManager {
 #[derive(Default)]
 struct Memory {
     nostr_pending: HashMap<Uuid, (Uuid, DateTime<Utc>)>,
-    nostr_failures: HashMap<String, VecDeque<DateTime<Utc>>>,
+    nostr_failures: HashMap<Uuid, VecDeque<DateTime<Utc>>>,
     contexts: HashMap<[u8; 32], Context>,
     ceremonies: HashMap<Uuid, Ceremony>,
     grants: HashMap<Uuid, Grant>,

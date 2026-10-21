@@ -300,16 +300,15 @@ impl AuthManager {
             { return Ok(Err(AuthError::Challenge)); }
             if expires <= now.timestamp() { return Ok(Err(AuthError::Expired)); }
             if attempts >= MAX_ATTEMPTS { return Ok(Err(AuthError::Challenge)); }
-            let identity_key = normalize_pubkey(&finish.event.pubkey).unwrap_or_else(|_| "invalid".into());
             memory.nostr_failures.retain(|_, queue| {
                 while queue.front().is_some_and(|time| *time + Duration::seconds(RATE_WINDOW_SECONDS) <= now) { queue.pop_front(); }
                 !queue.is_empty()
             });
-            if memory.nostr_failures.get(&identity_key).is_some_and(|queue| queue.len() >= manager.admission.starts_per_minute)
+            if memory.nostr_failures.get(&context.id).is_some_and(|queue| queue.len() >= manager.admission.starts_per_minute)
             { return Ok(Err(AuthError::Limited)); }
-            if !memory.nostr_failures.contains_key(&identity_key) && memory.nostr_failures.len() >= MAX_RATE_BUCKETS {
-                // A flood of unrelated keys must not lock an enrolled key out globally.
-                if let Some(oldest) = memory.nostr_failures.iter().min_by_key(|(_, queue)| queue.back().copied()).map(|(key, _)| key.clone()) {
+            if !memory.nostr_failures.contains_key(&context.id) && memory.nostr_failures.len() >= MAX_RATE_BUCKETS {
+                // A flood of unrelated contexts must not lock another context out globally.
+                if let Some(oldest) = memory.nostr_failures.iter().min_by_key(|(_, queue)| queue.back().copied()).map(|(key, _)| *key) {
                     memory.nostr_failures.remove(&oldest);
                 }
             }
@@ -333,7 +332,7 @@ impl AuthManager {
             let key = match verified {
                 Ok(key) => key,
                 Err(error) => {
-                    memory.nostr_failures.entry(identity_key).or_default().push_back(now);
+                    memory.nostr_failures.entry(context.id).or_default().push_back(now);
                     tx.execute("UPDATE nostr_challenges SET attempts=attempts+1 WHERE id=?1", [finish.challenge_id.to_string()])?;
                     tx.commit()?;
                     return Ok(Err(error));

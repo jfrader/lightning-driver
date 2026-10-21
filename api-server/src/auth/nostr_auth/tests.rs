@@ -427,17 +427,15 @@ async fn unlink_requires_target_signature_and_preserves_last_credential() {
 }
 
 #[tokio::test]
-async fn unknown_key_and_per_identity_failure_budget_fail_closed() {
+async fn unknown_key_and_per_context_failure_budget_fail_closed() {
     let (_dir, mut manager, now) = setup().await;
     enroll(&manager, now, 1).await;
     manager.admission.starts_per_minute = 2;
     for n in 0..MAX_RATE_BUCKETS {
-        manager
-            .memory
-            .lock()
-            .unwrap()
-            .nostr_failures
-            .insert(format!("unknown-key-{n}"), VecDeque::from([now]));
+        manager.memory.lock().unwrap().nostr_failures.insert(
+            Uuid::from_u128(n as u128 + 1),
+            VecDeque::from([now - Duration::milliseconds(n as i64 + 1)]),
+        );
     }
     let guest = guest(&manager, now).await;
     let challenge = start(&manager, &guest.context, "login", None, None, now).await;
@@ -469,18 +467,109 @@ async fn unknown_key_and_per_identity_failure_budget_fail_closed() {
             .await,
         Err(AuthError::Limited)
     ));
+    assert!(matches!(
+        manager
+            .finish_nostr(
+                &guest.context,
+                NostrFinish {
+                    challenge_id: challenge.challenge_id,
+                    event: sign(&challenge, 1)
+                },
+                now
+            )
+            .await,
+        Err(AuthError::Limited)
+    ));
+    {
+        let memory = manager.memory.lock().unwrap();
+        assert_eq!(memory.nostr_failures.len(), MAX_RATE_BUCKETS);
+        assert_eq!(
+            memory.nostr_failures.get(&guest.context.id).unwrap().len(),
+            2
+        );
+        assert!(!memory
+            .nostr_failures
+            .contains_key(&Uuid::from_u128(MAX_RATE_BUCKETS as u128)));
+    }
+    let fresh = self::guest(&manager, now).await;
+    let fresh_challenge = start(&manager, &fresh.context, "login", None, None, now).await;
     assert!(manager
         .finish_nostr(
-            &guest.context,
+            &fresh.context,
             NostrFinish {
-                challenge_id: challenge.challenge_id,
-                event: sign(&challenge, 1)
+                challenge_id: fresh_challenge.challenge_id,
+                event: sign(&fresh_challenge, 1)
             },
             now
         )
         .await
         .is_ok());
-    assert!(manager.memory.lock().unwrap().nostr_failures.len() <= MAX_RATE_BUCKETS);
+    let memory = manager.memory.lock().unwrap();
+    assert!(memory.nostr_failures.len() <= MAX_RATE_BUCKETS);
+    assert_eq!(
+        memory.nostr_failures.get(&guest.context.id).unwrap().len(),
+        2
+    );
+    assert!(!memory
+        .nostr_failures
+        .contains_key(&Uuid::from_u128(MAX_RATE_BUCKETS as u128)));
+}
+
+#[tokio::test]
+async fn forged_victim_pubkey_only_exhausts_attacker_context_budget() {
+    let (_dir, mut manager, now) = setup().await;
+    enroll(&manager, now, 1).await;
+    manager.admission.starts_per_minute = 2;
+    let attacker = guest(&manager, now).await;
+    let victim = guest(&manager, now).await;
+    let attacker_challenge = start(&manager, &attacker.context, "login", None, None, now).await;
+    let victim_challenge = start(&manager, &victim.context, "login", None, None, now).await;
+    let mut forged = sign(&attacker_challenge, 1);
+    // The attacker claims the enrolled key but cannot produce its signature.
+    forged.sig = "00".repeat(64);
+    for _ in 0..manager.admission.starts_per_minute {
+        assert!(matches!(
+            manager
+                .finish_nostr(
+                    &attacker.context,
+                    NostrFinish {
+                        challenge_id: attacker_challenge.challenge_id,
+                        event: forged.clone()
+                    },
+                    now
+                )
+                .await,
+            Err(AuthError::Authentication)
+        ));
+    }
+    assert!(matches!(
+        manager
+            .finish_nostr(
+                &attacker.context,
+                NostrFinish {
+                    challenge_id: attacker_challenge.challenge_id,
+                    event: forged
+                },
+                now
+            )
+            .await,
+        Err(AuthError::Limited)
+    ));
+    let valid = sign(&victim_challenge, 1);
+    assert_eq!(valid.pubkey, key(1).x_only_public_key().0.to_string());
+    assert!(matches!(
+        manager
+            .finish_nostr(
+                &victim.context,
+                NostrFinish {
+                    challenge_id: victim_challenge.challenge_id,
+                    event: valid
+                },
+                now
+            )
+            .await,
+        Ok(NostrOutcome::Session(_))
+    ));
 }
 
 #[tokio::test]
