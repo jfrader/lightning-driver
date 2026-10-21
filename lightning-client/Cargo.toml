@@ -41,3 +41,6 @@ cln      = []
 version = "0.7"
 features = ["tls", "tls-roots"]
 optional = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -47,8 +47,12 @@ pub enum AuthError {
 }
 
 impl From<JournalError> for AuthError {
-    fn from(_: JournalError) -> Self {
-        Self::Storage
+    fn from(error: JournalError) -> Self {
+        if matches!(error, JournalError::Revoked) {
+            Self::Session
+        } else {
+            Self::Storage
+        }
     }
 }
 
@@ -282,10 +286,18 @@ impl AuthManager {
         if cookie.len() != 64 {
             return Err(AuthError::Session);
         }
+        let key = token_hash(cookie.as_bytes());
+        {
+            let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
+            memory.prune(now);
+            let context = memory.contexts.get(&key).ok_or(AuthError::Session)?;
+            if context.last_authenticated_at.is_some() != authenticated {
+                return Err(AuthError::Session);
+            }
+        }
         let generation = self.journal.authentication().await?.1;
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
         memory.prune(now);
-        let key = token_hash(cookie.as_bytes());
         let context = memory.contexts.get_mut(&key).ok_or(AuthError::Session)?;
         if context.generation != generation
             || context.last_authenticated_at.is_some() != authenticated
@@ -582,9 +594,10 @@ impl AuthManager {
         let id = Uuid::new_v4();
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
         memory.prune(now);
-        if !memory.contexts.contains_key(&context.key)
-            || memory.grants.len() >= self.limits.max_challenges
-        {
+        if !memory.contexts.contains_key(&context.key) {
+            return Err(AuthError::Session);
+        }
+        if memory.grants.len() >= self.limits.max_challenges {
             return Err(AuthError::Limited);
         }
         memory.grants.insert(
@@ -616,9 +629,10 @@ impl AuthManager {
             .min(context.idle_expires_at);
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
         memory.prune(now);
-        if !memory.contexts.contains_key(&context.key)
-            || memory.ceremonies.len() >= self.limits.max_challenges
-        {
+        if !memory.contexts.contains_key(&context.key) {
+            return Err(AuthError::Session);
+        }
+        if memory.ceremonies.len() >= self.limits.max_challenges {
             return Err(AuthError::Limited);
         }
         let id = Uuid::new_v4();

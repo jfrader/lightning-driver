@@ -14,6 +14,7 @@ use std::{
 use url::Url;
 
 const MAX_SECRET_BYTES: u64 = 65536;
+pub const MAX_JSON_REQUEST_BYTES: usize = 128 * 1024;
 
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
@@ -214,9 +215,15 @@ impl Settings {
                 return Err(SettingsError("Invalid node label"));
             }
             validate_endpoint(&node.endpoint)?;
-            node.expected_pubkey
+            let identity = node
+                .expected_pubkey
                 .parse::<bitcoin::secp256k1::PublicKey>()
                 .map_err(|_| SettingsError("Invalid expected node identity"))?;
+            if identity.to_string() != node.expected_pubkey {
+                return Err(SettingsError(
+                    "Expected node identity must be canonical compressed hex",
+                ));
+            }
             if node.network == Network::Unknown {
                 return Err(SettingsError("Expected node network is required"));
             }
@@ -236,11 +243,14 @@ impl ApiSettings {
     pub fn insecure_development(&self) -> bool {
         self.allow_insecure_loopback && self.public_origin.scheme() == "http"
     }
-    fn validate(&self) -> Result<(), SettingsError> {
+    pub fn validate(&self) -> Result<(), SettingsError> {
         let origin = &self.public_origin;
-        let origin_loopback = origin.host_str().is_some_and(|h| {
-            h == "localhost" || h.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
-        });
+        let origin_loopback = match origin.host() {
+            Some(url::Host::Domain("localhost")) => true,
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+            _ => false,
+        };
         if origin.path() != "/"
             || origin.query().is_some()
             || origin.fragment().is_some()
@@ -436,5 +446,82 @@ mod tests {
         ] {
             assert!(validate_peer_host(host).is_err(), "{host}");
         }
+    }
+
+    #[test]
+    fn credential_reads_are_bounded_permission_checked_and_do_not_follow_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("synthetic-secret");
+        std::fs::write(&path, b"SYNTHETIC_ONLY").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(read_protected(&path, true).unwrap(), b"SYNTHETIC_ONLY");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
+        assert!(read_protected(&path, true).is_err());
+        assert!(read_protected(&path, false).is_ok());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o622)).unwrap();
+        assert!(read_protected(&path, false).is_err());
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let alias = directory.path().join("symlink");
+        std::os::unix::fs::symlink(&path, &alias).unwrap();
+        assert!(read_protected(&alias, true).is_err());
+        std::fs::write(
+            &path,
+            vec![0u8; usize::try_from(MAX_SECRET_BYTES + 1).unwrap()],
+        )
+        .unwrap();
+        assert!(read_protected(&path, true).is_err());
+        assert!(read_protected(&directory.path().join("missing"), true).is_err());
+    }
+
+    #[test]
+    fn duplicate_identity_network_and_policy_errors_fail_closed() {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../api-server/tests/fixtures/api-examples.json"
+        ))
+        .unwrap();
+        let policy: NodePolicy =
+            serde_json::from_value(fixtures["fixtures"]["node_policy"]["value"].clone()).unwrap();
+        let key = bitcoin::secp256k1::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let identity = bitcoin::secp256k1::PublicKey::from_secret_key(
+            &bitcoin::secp256k1::Secp256k1::new(),
+            &key,
+        )
+        .to_string();
+        let node = NodeSettings {
+            id: "synthetic".into(),
+            label: "Synthetic".into(),
+            backend: Backend::LndGrpc,
+            endpoint: "https://node.example.invalid".parse().unwrap(),
+            certificate_file: PathBuf::from("UNUSED_CERT"),
+            credential_file: PathBuf::from("UNUSED_CREDENTIAL"),
+            expected_pubkey: identity,
+            network: Network::Regtest,
+            read_only: false,
+            policy: policy.limits,
+            peer_policy: PeerPolicy::default(),
+        };
+        let mut settings = Settings {
+            api: api("https://manager.example.invalid", false),
+            nodes: vec![node.clone()],
+        };
+        assert!(settings.validate().is_ok());
+        settings.nodes.push(node.clone());
+        assert!(settings.validate().is_err());
+        settings.nodes.pop();
+        settings.nodes[0].network = Network::Unknown;
+        assert!(settings.validate().is_err());
+        settings.nodes[0] = node.clone();
+        settings.nodes[0].expected_pubkey = "not-a-key".into();
+        assert!(settings.validate().is_err());
+        settings.nodes[0] = node.clone();
+        settings.nodes[0].endpoint = "http://node.example.invalid".parse().unwrap();
+        assert!(settings.validate().is_err());
+        settings.nodes[0] = node.clone();
+        settings.nodes[0].policy.default_max_routing_fee_msat =
+            Msat("9223372036854775807".parse().unwrap());
+        assert!(settings.validate().is_err());
+        settings.nodes[0] = node;
+        settings.nodes[0].policy.send_onchain_sat.min = Decimal::ZERO;
+        assert!(settings.validate().is_err());
     }
 }
