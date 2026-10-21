@@ -27,23 +27,27 @@ impl Journal {
             expire_reviews(&tx, Utc::now())?;
             let counts = {
                 let mut statement = tx.prepare(
-                    "SELECT node_id,COUNT(*) FROM operations
+                    "SELECT node_id,COUNT(*)
+                     FROM operations
                      WHERE json_extract(body,'$.state') IN
-                       ('awaiting_confirmation','dispatching','pending','unknown') GROUP BY node_id",
+                       ('awaiting_confirmation','dispatching','pending','unknown')
+                     GROUP BY node_id",
                 )?;
                 let mut rows = statement.query([])?;
                 let mut counts = BTreeMap::new();
                 while let Some(row) = rows.next()? {
                     let count: i64 = row.get(1)?;
-                    let count = Decimal::new(u64::try_from(count).map_err(|_| JournalError::Storage)?)
-                        .map_err(|_| JournalError::Storage)?;
+                    let count =
+                        Decimal::new(u64::try_from(count).map_err(|_| JournalError::Storage)?)
+                            .map_err(|_| JournalError::Storage)?;
                     counts.insert(row.get(0)?, count);
                 }
                 counts
             };
             tx.commit()?;
             Ok(counts)
-        }).await
+        })
+        .await
     }
 
     pub async fn history_scope(&self, node: String) -> Result<HistoryScope, JournalError> {
