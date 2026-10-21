@@ -12,7 +12,6 @@ use std::{
     collections::{HashMap, VecDeque},
     net::IpAddr,
     sync::{Arc, Mutex},
-    time::Instant,
 };
 use subtle::ConstantTimeEq;
 use tokio::sync::Semaphore;
@@ -23,6 +22,33 @@ use zeroize::Zeroizing;
 const MAX_AUTHENTICATORS: usize = 16;
 const MAX_RATE_BUCKETS: usize = 256;
 const VERIFICATION_WORKERS: usize = 2;
+const RATE_WINDOW_SECONDS: i64 = 60;
+const ANONYMOUS_IDENTITY_SHARES: usize = 4;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum ClientIdentity {
+    Socket(IpAddr),
+    Forwarded(IpAddr),
+}
+
+#[derive(Clone)]
+struct AdmissionLimits {
+    anonymous: usize,
+    anonymous_per_identity: usize,
+    starts_per_minute: usize,
+    rate_buckets: usize,
+}
+
+impl From<&Limits> for AdmissionLimits {
+    fn from(limits: &Limits) -> Self {
+        Self {
+            anonymous: limits.max_sessions,
+            anonymous_per_identity: (limits.max_sessions / ANONYMOUS_IDENTITY_SHARES).max(1),
+            starts_per_minute: limits.login_attempts_per_minute,
+            rate_buckets: MAX_RATE_BUCKETS,
+        }
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
@@ -38,6 +64,8 @@ pub enum AuthError {
     Expired,
     #[error("Authentication capacity exceeded")]
     Limited,
+    #[error("Authentication capacity exceeded")]
+    AllocationLimited(u64),
     #[error("Operation authorization invalid")]
     Authorization,
     #[error("Operation does not require reauthentication")]
@@ -61,6 +89,7 @@ pub struct AuthManager {
     webauthn: Arc<Webauthn>,
     journal: Journal,
     limits: Limits,
+    admission: AdmissionLimits,
     policy: ReauthPolicy,
     memory: Arc<Mutex<Memory>>,
     workers: Arc<Semaphore>,
@@ -71,7 +100,26 @@ struct Memory {
     contexts: HashMap<[u8; 32], Context>,
     ceremonies: HashMap<Uuid, Ceremony>,
     grants: HashMap<Uuid, Grant>,
-    rates: HashMap<IpAddr, VecDeque<Instant>>,
+    rates: HashMap<ClientIdentity, VecDeque<DateTime<Utc>>>,
+    verifying: HashMap<Uuid, usize>,
+}
+
+struct VerificationGuard {
+    memory: Arc<Mutex<Memory>>,
+    owner: Uuid,
+}
+
+impl Drop for VerificationGuard {
+    fn drop(&mut self) {
+        if let Ok(mut memory) = self.memory.lock() {
+            if let Some(count) = memory.verifying.get_mut(&self.owner) {
+                *count -= 1;
+                if *count == 0 {
+                    memory.verifying.remove(&self.owner);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -80,6 +128,8 @@ pub struct Context {
     id: Uuid,
     csrf: Zeroizing<String>,
     generation: i64,
+    identity: ClientIdentity,
+    created_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub idle_expires_at: DateTime<Utc>,
     pub last_authenticated_at: Option<DateTime<Utc>>,
@@ -205,38 +255,48 @@ impl AuthManager {
             webauthn: Arc::new(webauthn),
             journal,
             limits: settings.limits.clone(),
+            admission: AdmissionLimits::from(&settings.limits),
             policy: settings.reauth.clone(),
             memory: Arc::new(Mutex::new(Memory::default())),
             workers: Arc::new(Semaphore::new(VERIFICATION_WORKERS)),
         })
     }
 
-    pub fn admit(&self, address: IpAddr) -> Result<(), AuthError> {
-        let now = Instant::now();
+    pub fn admit_start(
+        &self,
+        identity: ClientIdentity,
+        now: DateTime<Utc>,
+    ) -> Result<(), AuthError> {
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
         memory.rates.retain(|_, queue| {
             while queue
                 .front()
-                .is_some_and(|time| now.duration_since(*time).as_secs() >= 60)
+                .is_some_and(|time| *time + Duration::seconds(RATE_WINDOW_SECONDS) <= now)
             {
                 queue.pop_front();
             }
             !queue.is_empty()
         });
-        if !memory.rates.contains_key(&address) && memory.rates.len() >= MAX_RATE_BUCKETS {
+        if !memory.rates.contains_key(&identity)
+            && memory.rates.len() >= self.admission.rate_buckets
+        {
             return Err(AuthError::Limited);
         }
-        let queue = memory.rates.entry(address).or_default();
-        if queue.len() >= self.limits.login_attempts_per_minute {
+        let queue = memory.rates.entry(identity).or_default();
+        if queue.len() >= self.admission.starts_per_minute {
             return Err(AuthError::Limited);
         }
         queue.push_back(now);
         Ok(())
     }
 
-    pub async fn anonymous(&self, now: DateTime<Utc>) -> Result<NewContext, AuthError> {
+    pub async fn anonymous(
+        &self,
+        identity: ClientIdentity,
+        now: DateTime<Utc>,
+    ) -> Result<NewContext, AuthError> {
         let generation = self.journal.authentication().await?.1;
-        self.create_context(now, generation, false)
+        self.create_context(now, generation, false, identity)
     }
 
     fn create_context(
@@ -244,6 +304,7 @@ impl AuthManager {
         now: DateTime<Utc>,
         generation: i64,
         authenticated: bool,
+        identity: ClientIdentity,
     ) -> Result<NewContext, AuthError> {
         let cookie = random_token();
         let csrf = random_token();
@@ -259,6 +320,8 @@ impl AuthManager {
             id: Uuid::new_v4(),
             csrf,
             generation,
+            identity,
+            created_at: now,
             expires_at,
             idle_expires_at: if authenticated {
                 (now + Duration::seconds(i64::from(self.limits.session_idle_seconds)))
@@ -280,14 +343,18 @@ impl AuthManager {
             .contexts
             .retain(|_, context| context.generation >= generation);
         memory.prune(now);
-        if memory
-            .contexts
-            .values()
-            .filter(|context| context.last_authenticated_at.is_some() == authenticated)
-            .count()
-            >= self.limits.max_sessions
-        {
-            return Err(AuthError::Limited);
+        if authenticated {
+            if memory
+                .contexts
+                .values()
+                .filter(|context| context.last_authenticated_at.is_some())
+                .count()
+                >= self.limits.max_sessions
+            {
+                return Err(AuthError::Limited);
+            }
+        } else {
+            memory.make_anonymous_room(identity, &self.admission, now)?;
         }
         memory.contexts.insert(key, context.clone());
         Ok(NewContext { context, cookie })
@@ -396,14 +463,14 @@ impl AuthManager {
         finish: AuthenticationFinish,
         now: DateTime<Utc>,
     ) -> Result<NewContext, AuthError> {
-        let ceremony = self.take_ceremony(context, finish.challenge_id, now)?;
+        let (ceremony, _verification) = self.take_ceremony(context, finish.challenge_id, now)?;
         let Purpose::Login(state) = ceremony.purpose else {
             return Err(AuthError::Challenge);
         };
         self.verify_authentication(finish.credential, state, ceremony.generation)
             .await?;
         self.revoke(context)?;
-        self.create_context(now, ceremony.generation, true)
+        self.create_context(now, ceremony.generation, true, context.identity)
     }
 
     pub async fn start_enrollment(
@@ -454,28 +521,28 @@ impl AuthManager {
         finish: RegistrationFinish,
         now: DateTime<Utc>,
     ) -> Result<NewContext, AuthError> {
-        let ceremony = self.take_ceremony(context, finish.challenge_id, now)?;
+        let (ceremony, _verification) = self.take_ceremony(context, finish.challenge_id, now)?;
         let Purpose::Enrollment(state) = ceremony.purpose else {
             return Err(AuthError::Challenge);
         };
         let permit = self
             .workers
             .clone()
-            .try_acquire_owned()
-            .map_err(|_| AuthError::Limited)?;
+            .acquire_owned()
+            .await
+            .map_err(|_| AuthError::Storage)?;
         let webauthn = self.webauthn.clone();
-        let passkey = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            webauthn
+        let (passkey, _permit) = tokio::task::spawn_blocking(move || {
+            let result = webauthn
                 .finish_passkey_registration(&finish.credential, &state)
-                .map_err(|_| AuthError::Authentication)
+                .map_err(|_| AuthError::Authentication);
+            result.map(|passkey| (passkey, permit))
         })
         .await
         .map_err(|_| AuthError::Authentication)??;
-        self.persist_passkeys(vec![passkey], ceremony.generation)
-            .await?;
+        self.register_passkey(passkey, ceremony.generation).await?;
         self.revoke(context)?;
-        self.create_context(now, ceremony.generation, true)
+        self.create_context(now, ceremony.generation, true, context.identity)
     }
 
     pub async fn start_authorization(
@@ -534,7 +601,7 @@ impl AuthManager {
         finish: AuthenticationFinish,
         now: DateTime<Utc>,
     ) -> Result<OperationAuthorization, AuthError> {
-        let ceremony = self.take_ceremony(context, finish.challenge_id, now)?;
+        let (ceremony, _verification) = self.take_ceremony(context, finish.challenge_id, now)?;
         let Purpose::Operation { state, binding } = ceremony.purpose else {
             return Err(AuthError::Challenge);
         };
@@ -658,7 +725,16 @@ impl AuthManager {
         if !memory.contexts.contains_key(&context.key) {
             return Err(AuthError::Session);
         }
-        if memory.ceremonies.len() >= self.limits.max_challenges {
+        if memory.verifying.contains_key(&context.id) {
+            return Err(AuthError::Limited);
+        }
+        memory.ceremonies.retain(|_, ceremony| {
+            ceremony.owner != context.id
+                || std::mem::discriminant(&ceremony.purpose) != std::mem::discriminant(&purpose)
+        });
+        if memory.ceremonies.len() + memory.verifying.values().sum::<usize>()
+            >= self.limits.max_challenges
+        {
             return Err(AuthError::Limited);
         }
         let id = Uuid::new_v4();
@@ -679,7 +755,7 @@ impl AuthManager {
         context: &Context,
         id: Uuid,
         now: DateTime<Utc>,
-    ) -> Result<Ceremony, AuthError> {
+    ) -> Result<(Ceremony, VerificationGuard), AuthError> {
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
         let ceremony = memory.ceremonies.remove(&id).ok_or(AuthError::Challenge)?;
         let current = memory
@@ -695,7 +771,14 @@ impl AuthManager {
         if ceremony.expires <= now || current.expires_at <= now || current.idle_expires_at <= now {
             return Err(AuthError::Expired);
         }
-        Ok(ceremony)
+        *memory.verifying.entry(context.id).or_default() += 1;
+        Ok((
+            ceremony,
+            VerificationGuard {
+                memory: self.memory.clone(),
+                owner: context.id,
+            },
+        ))
     }
 
     async fn passkeys(&self) -> Result<Vec<Passkey>, AuthError> {
@@ -720,24 +803,88 @@ impl AuthManager {
             .map_err(Into::into)
     }
 
-    async fn persist_passkeys(
+    async fn register_passkey(&self, passkey: Passkey, generation: i64) -> Result<(), AuthError> {
+        self.journal
+            .run(move |connection| {
+                let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let current: i64 = tx.query_row(
+                    "SELECT generation FROM auth_meta WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if current != generation {
+                    return Err(JournalError::Revoked);
+                }
+                let id = hex::encode(passkey.cred_id());
+                let existing: Option<String> = tx
+                    .query_row(
+                        "SELECT credential_id FROM credentials WHERE credential_id=?1",
+                        [&id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if existing.is_some() {
+                    return Ok(Err(AuthError::Authentication));
+                }
+                let count: i64 =
+                    tx.query_row("SELECT COUNT(*) FROM credentials", [], |row| row.get(0))?;
+                if count >= i64::try_from(MAX_AUTHENTICATORS).map_err(|_| JournalError::Storage)? {
+                    return Ok(Err(AuthError::Limited));
+                }
+                tx.execute(
+                    "INSERT INTO credentials(credential_id,passkey) VALUES(?1,?2)",
+                    params![id, serde_json::to_string(&passkey)?],
+                )?;
+                tx.commit()?;
+                Ok(Ok(()))
+            })
+            .await
+            .map_err(AuthError::from)?
+    }
+
+    async fn update_passkey(
         &self,
-        passkeys: Vec<Passkey>,
+        result: AuthenticationResult,
         generation: i64,
     ) -> Result<(), AuthError> {
-        self.journal.run(move |connection| {
-            let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let current:i64=tx.query_row("SELECT generation FROM auth_meta WHERE singleton=1",[],|row|row.get(0))?;
-            if current!=generation {return Err(JournalError::Revoked);}
-            for passkey in passkeys {
-                let id=hex::encode(passkey.cred_id());
-                let existing:Option<String>=tx.query_row("SELECT credential_id FROM credentials WHERE credential_id=?1",[&id],|row|row.get(0)).optional()?;
-                let count:i64=tx.query_row("SELECT COUNT(*) FROM credentials",[],|row|row.get(0))?;
-                if existing.is_none() && count>=i64::try_from(MAX_AUTHENTICATORS).map_err(|_|JournalError::Storage)? {return Err(JournalError::Storage);}
-                tx.execute("INSERT INTO credentials(credential_id,passkey) VALUES(?1,?2) ON CONFLICT(credential_id) DO UPDATE SET passkey=excluded.passkey",params![id,serde_json::to_string(&passkey)?])?;
-            }
-            tx.commit()?;Ok(())
-        }).await.map_err(Into::into)
+        self.journal
+            .run(move |connection| {
+                let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+                let current: i64 = tx.query_row(
+                    "SELECT generation FROM auth_meta WHERE singleton=1",
+                    [],
+                    |row| row.get(0),
+                )?;
+                if current != generation {
+                    return Err(JournalError::Revoked);
+                }
+                let id = hex::encode(result.cred_id());
+                let stored: Option<String> = tx
+                    .query_row(
+                        "SELECT passkey FROM credentials WHERE credential_id=?1",
+                        [&id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(stored) = stored else {
+                    return Ok(Err(AuthError::Authentication));
+                };
+                let mut passkey: Passkey = serde_json::from_str(&stored)?;
+                match passkey.update_credential(&result) {
+                    Some(true) => {
+                        tx.execute(
+                            "UPDATE credentials SET passkey=?2 WHERE credential_id=?1",
+                            params![id, serde_json::to_string(&passkey)?],
+                        )?;
+                    }
+                    Some(false) => {}
+                    None => return Ok(Err(AuthError::Authentication)),
+                }
+                tx.commit()?;
+                Ok(Ok(()))
+            })
+            .await
+            .map_err(AuthError::from)?
     }
 
     async fn verify_authentication(
@@ -749,31 +896,82 @@ impl AuthManager {
         let permit = self
             .workers
             .clone()
-            .try_acquire_owned()
-            .map_err(|_| AuthError::Limited)?;
+            .acquire_owned()
+            .await
+            .map_err(|_| AuthError::Storage)?;
         let webauthn = self.webauthn.clone();
-        let result = tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            webauthn
+        let (result, _permit) = tokio::task::spawn_blocking(move || {
+            let result = webauthn
                 .finish_passkey_authentication(&credential, &state)
-                .map_err(|_| AuthError::Authentication)
+                .map_err(|_| AuthError::Authentication);
+            result.map(|result| (result, permit))
         })
         .await
         .map_err(|_| AuthError::Authentication)??;
-        let mut passkeys = self.passkeys().await?;
-        let passkey = passkeys
-            .iter_mut()
-            .find(|key| key.cred_id() == result.cred_id())
-            .ok_or(AuthError::Authentication)?;
-        passkey
-            .update_credential(&result)
-            .ok_or(AuthError::Authentication)?;
-        self.persist_passkeys(vec![passkey.clone()], generation)
-            .await
+        self.update_passkey(result, generation).await
     }
 }
 
 impl Memory {
+    fn make_anonymous_room(
+        &mut self,
+        identity: ClientIdentity,
+        limits: &AdmissionLimits,
+        now: DateTime<Utc>,
+    ) -> Result<(), AuthError> {
+        loop {
+            let anonymous: Vec<_> = self
+                .contexts
+                .values()
+                .filter(|context| context.last_authenticated_at.is_none())
+                .collect();
+            let identity_full = anonymous
+                .iter()
+                .filter(|context| context.identity == identity)
+                .count()
+                >= limits.anonymous_per_identity;
+            if !identity_full && anonymous.len() < limits.anonymous {
+                return Ok(());
+            }
+            let victim = anonymous
+                .into_iter()
+                .filter(|context| {
+                    (!identity_full || context.identity == identity)
+                        && !self
+                            .ceremonies
+                            .values()
+                            .any(|ceremony| ceremony.owner == context.id)
+                        && !self.verifying.contains_key(&context.id)
+                })
+                .min_by_key(|context| (context.created_at, context.id))
+                .map(|context| context.key);
+            let Some(victim) = victim else {
+                let horizon = self
+                    .contexts
+                    .values()
+                    .filter(|context| {
+                        context.last_authenticated_at.is_none()
+                            && (!identity_full || context.identity == identity)
+                    })
+                    .map(|context| {
+                        self.ceremonies
+                            .values()
+                            .filter(|ceremony| ceremony.owner == context.id)
+                            .map(|ceremony| ceremony.expires)
+                            .max()
+                            .unwrap_or(context.expires_at)
+                            .min(context.expires_at)
+                    })
+                    .min()
+                    .unwrap_or(now + Duration::seconds(RATE_WINDOW_SECONDS));
+                let seconds = ((horizon - now).num_milliseconds().max(1) + 999) / 1000;
+                return Err(AuthError::AllocationLimited(
+                    u64::try_from(seconds).unwrap_or(1),
+                ));
+            };
+            self.contexts.remove(&victim);
+        }
+    }
     fn prune(&mut self, now: DateTime<Utc>) {
         self.contexts
             .retain(|_, context| context.expires_at > now && context.idle_expires_at > now);
@@ -801,6 +999,364 @@ mod tests {
     use lightning_client::settings::Limits;
     use webauthn_authenticator_rs::{softpasskey::SoftPasskey, WebauthnAuthenticator};
 
+    fn identity() -> ClientIdentity {
+        ClientIdentity::Socket("192.0.2.1".parse().unwrap())
+    }
+
+    fn fixed_now() -> DateTime<Utc> {
+        "2026-10-21T12:00:00Z".parse().unwrap()
+    }
+
+    async fn verified_assertion(
+        manager: &AuthManager,
+        settings: &ApiSettings,
+        authenticator: &mut WebauthnAuthenticator<SoftPasskey>,
+        now: DateTime<Utc>,
+    ) -> (AuthenticationResult, i64) {
+        let anonymous = manager.anonymous(identity(), now).await.unwrap();
+        let challenge = manager.start_login(&anonymous.context, now).await.unwrap();
+        let credential = authenticator
+            .do_authentication(settings.public_origin.clone(), challenge.options)
+            .unwrap();
+        let (ceremony, _guard) = manager
+            .take_ceremony(&anonymous.context, challenge.challenge_id, now)
+            .unwrap();
+        let Purpose::Login(state) = ceremony.purpose else {
+            panic!("login state required")
+        };
+        let result = manager
+            .webauthn
+            .finish_passkey_authentication(&credential, &state)
+            .unwrap();
+        manager.revoke(&anonymous.context).unwrap();
+        (result, ceremony.generation)
+    }
+
+    #[tokio::test]
+    async fn admitted_finish_survives_start_exhaustion_and_waits_for_verification_capacity() {
+        use std::{future::Future, task::Poll};
+        let (_directory, manager, settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        enroll(&manager, &settings, &mut authenticator, now).await;
+        let anonymous = manager.anonymous(identity(), now).await.unwrap();
+        manager.admit_start(identity(), now).unwrap();
+        let old = manager.start_login(&anonymous.context, now).await.unwrap();
+        let challenge = manager.start_login(&anonymous.context, now).await.unwrap();
+        assert!(!manager
+            .memory
+            .lock()
+            .unwrap()
+            .ceremonies
+            .contains_key(&old.challenge_id));
+        assert_eq!(manager.memory.lock().unwrap().ceremonies.len(), 1);
+        for _ in 1..manager.admission.starts_per_minute {
+            manager.admit_start(identity(), now).unwrap();
+        }
+        assert!(matches!(
+            manager.admit_start(identity(), now),
+            Err(AuthError::Limited)
+        ));
+        let credential = authenticator
+            .do_authentication(settings.public_origin.clone(), challenge.options)
+            .unwrap();
+        let workers = manager
+            .workers
+            .clone()
+            .acquire_many_owned(VERIFICATION_WORKERS as u32)
+            .await
+            .unwrap();
+        let mut finish = std::pin::pin!(manager.finish_login(
+            &anonymous.context,
+            AuthenticationFinish {
+                challenge_id: challenge.challenge_id,
+                credential
+            },
+            now
+        ));
+        std::future::poll_fn(|cx| {
+            assert!(matches!(finish.as_mut().poll(cx), Poll::Pending));
+            Poll::Ready(())
+        })
+        .await;
+        assert!(manager
+            .memory
+            .lock()
+            .unwrap()
+            .verifying
+            .contains_key(&anonymous.context.id));
+        // Even allocation pressure while verification waits cannot evict admitted work.
+        for _ in 0..manager.admission.anonymous * 2 {
+            manager.anonymous(identity(), now).await.unwrap();
+        }
+        assert!(manager.context(&anonymous.cookie, false, now).await.is_ok());
+        drop(workers);
+        let session = finish.await.unwrap();
+        assert!(manager.context(&session.cookie, true, now).await.is_ok());
+        assert!(manager.memory.lock().unwrap().verifying.is_empty());
+        assert!(manager
+            .admit_start(identity(), now + Duration::seconds(60))
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn anonymous_eviction_is_oldest_abandoned_first_and_never_live_work() {
+        let (_directory, manager, settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let session = enroll(&manager, &settings, &mut authenticator, now).await;
+        let pinned = manager.anonymous(identity(), now).await.unwrap();
+        let challenge = manager.start_login(&pinned.context, now).await.unwrap();
+        let mut abandoned = Vec::new();
+        for index in 1..manager.admission.anonymous {
+            let source =
+                ClientIdentity::Socket(IpAddr::from([198, 51, 100, u8::try_from(index).unwrap()]));
+            abandoned.push(
+                manager
+                    .anonymous(
+                        source,
+                        now + Duration::milliseconds(i64::try_from(index).unwrap()),
+                    )
+                    .await
+                    .unwrap(),
+            );
+        }
+        let newest = manager
+            .anonymous(
+                ClientIdentity::Socket("203.0.113.1".parse().unwrap()),
+                now + Duration::seconds(1),
+            )
+            .await
+            .unwrap();
+        assert!(manager
+            .context(&abandoned[0].cookie, false, now + Duration::seconds(1))
+            .await
+            .is_err());
+        assert!(manager
+            .context(&abandoned[1].cookie, false, now + Duration::seconds(1))
+            .await
+            .is_ok());
+        assert!(manager
+            .context(&pinned.cookie, false, now + Duration::seconds(1))
+            .await
+            .is_ok());
+        assert!(manager
+            .context(&session.cookie, true, now + Duration::seconds(1))
+            .await
+            .is_ok());
+        assert!(manager
+            .context(&newest.cookie, false, now + Duration::seconds(1))
+            .await
+            .is_ok());
+        assert!(manager
+            .memory
+            .lock()
+            .unwrap()
+            .ceremonies
+            .contains_key(&challenge.challenge_id));
+        // Fill one identity's share with live ceremonies; unrelated sources still allocate.
+        for _ in 1..manager.admission.anonymous_per_identity {
+            let context = manager
+                .anonymous(identity(), now + Duration::seconds(2))
+                .await
+                .unwrap();
+            manager
+                .start_login(&context.context, now + Duration::seconds(2))
+                .await
+                .unwrap();
+        }
+        assert!(matches!(
+            manager
+                .anonymous(identity(), now + Duration::seconds(2))
+                .await,
+            Err(AuthError::AllocationLimited(58))
+        ));
+        assert!(manager
+            .anonymous(
+                ClientIdentity::Socket("203.0.113.2".parse().unwrap()),
+                now + Duration::seconds(2)
+            )
+            .await
+            .is_ok());
+        assert!(manager
+            .anonymous(identity(), now + Duration::seconds(63))
+            .await
+            .is_ok());
+        {
+            let memory = manager.memory.lock().unwrap();
+            assert!(memory.ceremonies.is_empty());
+            assert!(memory.contexts.contains_key(&session.context.key));
+            assert!(
+                memory
+                    .contexts
+                    .values()
+                    .filter(|context| context.last_authenticated_at.is_none())
+                    .count()
+                    <= manager.admission.anonymous
+            );
+        }
+        manager
+            .anonymous(identity(), now + Duration::seconds(364))
+            .await
+            .unwrap();
+        let memory = manager.memory.lock().unwrap();
+        assert_eq!(
+            memory
+                .contexts
+                .values()
+                .filter(|context| context.last_authenticated_at.is_none())
+                .count(),
+            1
+        );
+        assert!(memory.contexts.contains_key(&session.context.key));
+    }
+
+    #[tokio::test]
+    async fn overlapping_assertions_merge_against_current_storage_and_recovery_rejects_stale_results(
+    ) {
+        let (_directory, manager, settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        enroll(&manager, &settings, &mut authenticator, now).await;
+        let (low, generation) =
+            verified_assertion(&manager, &settings, &mut authenticator, now).await;
+        let (high, _) = verified_assertion(&manager, &settings, &mut authenticator, now).await;
+        assert!(high.counter() > low.counter());
+        let unchanged = low.clone();
+        let mut expected = manager.passkeys().await.unwrap().remove(0);
+        expected.update_credential(&high).unwrap();
+        expected.update_credential(&low).unwrap();
+        let (persisted, wait) = tokio::sync::oneshot::channel();
+        let high_manager = manager.clone();
+        let high_task = tokio::spawn(async move {
+            high_manager.update_passkey(high, generation).await.unwrap();
+            persisted.send(()).unwrap();
+        });
+        let low_manager = manager.clone();
+        let low_task = tokio::spawn(async move {
+            wait.await.unwrap();
+            low_manager.update_passkey(low, generation).await.unwrap();
+        });
+        high_task.await.unwrap();
+        low_task.await.unwrap();
+        let current = manager.passkeys().await.unwrap().remove(0);
+        assert_eq!(
+            serde_json::to_value(&current).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        manager.journal.run(|connection| {
+            connection.execute_batch("CREATE TRIGGER reject_credential_update BEFORE UPDATE ON credentials BEGIN SELECT RAISE(ABORT, 'unexpected credential write'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        manager.update_passkey(unchanged, generation).await.unwrap();
+        manager
+            .journal
+            .run(|connection| {
+                connection.execute_batch("DROP TRIGGER reject_credential_update;")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // Exercise the library's independent backup flags, without pretending this is a signed software-authenticator claim.
+        let (result, _) = verified_assertion(&manager, &settings, &mut authenticator, now).await;
+        let mut flags = serde_json::to_value(&result).unwrap();
+        flags["backup_eligible"] = serde_json::json!(true);
+        flags["backup_state"] = serde_json::json!(true);
+        let eligible: AuthenticationResult = serde_json::from_value(flags).unwrap();
+        expected.update_credential(&eligible).unwrap();
+        expected.update_credential(&result).unwrap();
+        manager.update_passkey(eligible, generation).await.unwrap();
+        manager
+            .update_passkey(result.clone(), generation)
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&manager.passkeys().await.unwrap()[0]).unwrap(),
+            serde_json::to_value(&expected).unwrap()
+        );
+        let (recovered, wait) = tokio::sync::oneshot::channel();
+        let absent = result.clone();
+        let stale_manager = manager.clone();
+        let stale = tokio::spawn(async move {
+            wait.await.unwrap();
+            stale_manager.update_passkey(result, generation).await
+        });
+        manager
+            .journal
+            .issue_enrollment(now, std::time::Duration::from_secs(60), true)
+            .await
+            .unwrap();
+        let mut replacement = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        enroll(&manager, &settings, &mut replacement, now).await;
+        let before = serde_json::to_value(manager.passkeys().await.unwrap()).unwrap();
+        recovered.send(()).unwrap();
+        assert!(matches!(stale.await.unwrap(), Err(AuthError::Session)));
+        let current_generation = manager.journal.authentication().await.unwrap().1;
+        assert!(matches!(
+            manager.update_passkey(absent, current_generation).await,
+            Err(AuthError::Authentication)
+        ));
+        assert_eq!(
+            before,
+            serde_json::to_value(manager.passkeys().await.unwrap()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_is_insert_only_and_capacity_is_checked_in_transaction() {
+        let (_directory, manager, settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let session = enroll(&manager, &settings, &mut authenticator, now).await;
+        let existing = manager.passkeys().await.unwrap().remove(0);
+        assert!(matches!(
+            manager
+                .register_passkey(existing.clone(), session.context.generation)
+                .await,
+            Err(AuthError::Authentication)
+        ));
+        assert_eq!(manager.passkeys().await.unwrap().len(), 1);
+        assert_eq!(
+            serde_json::to_value(&manager.passkeys().await.unwrap()[0]).unwrap(),
+            serde_json::to_value(&existing).unwrap()
+        );
+        for _ in 1..MAX_AUTHENTICATORS {
+            let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+            enroll(&manager, &settings, &mut authenticator, now).await;
+        }
+        // Verify an independently registered credential, then exercise the persistence cap directly.
+        let operator = manager.journal.authentication().await.unwrap().0;
+        let (options, state) = manager
+            .webauthn
+            .start_passkey_registration(operator, "operator", "Operator", None)
+            .unwrap();
+        let mut extra = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let response = extra
+            .do_registration(settings.public_origin.clone(), options)
+            .unwrap();
+        let passkey = manager
+            .webauthn
+            .finish_passkey_registration(&response, &state)
+            .unwrap();
+        let before = serde_json::to_value(manager.passkeys().await.unwrap()).unwrap();
+        assert!(matches!(
+            manager
+                .register_passkey(passkey, session.context.generation)
+                .await,
+            Err(AuthError::Limited)
+        ));
+        assert_eq!(
+            before,
+            serde_json::to_value(manager.passkeys().await.unwrap()).unwrap()
+        );
+        assert!(matches!(
+            manager
+                .register_passkey(existing, session.context.generation)
+                .await,
+            Err(AuthError::Authentication)
+        ));
+    }
+
     async fn manager(mode: ReauthMode) -> (tempfile::TempDir, AuthManager, ApiSettings) {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::Builder::new()
@@ -814,6 +1370,7 @@ mod tests {
             database: directory.path().join("auth.sqlite"),
             invoice_key_file: directory.path().join("unused.key"),
             allow_insecure_loopback: false,
+            client_identity: Default::default(),
             reauth: ReauthPolicy {
                 mode,
                 recent_auth_seconds: if mode == ReauthMode::Recent {
@@ -835,7 +1392,7 @@ mod tests {
         authenticator: &mut WebauthnAuthenticator<SoftPasskey>,
         now: DateTime<Utc>,
     ) -> NewContext {
-        let anonymous = manager.anonymous(now).await.unwrap();
+        let anonymous = manager.anonymous(identity(), now).await.unwrap();
         let token = manager
             .journal
             .issue_enrollment(now, std::time::Duration::from_secs(60), false)
@@ -892,7 +1449,7 @@ mod tests {
             AuthManager::verify_csrf(&enrolled.context, AuthManager::csrf(&enrolled.context))
                 .is_ok()
         );
-        let anonymous = manager.anonymous(now).await.unwrap();
+        let anonymous = manager.anonymous(identity(), now).await.unwrap();
         let challenge = manager.start_login(&anonymous.context, now).await.unwrap();
         let credential = authenticator
             .do_authentication(settings.public_origin.clone(), challenge.options)
@@ -1054,7 +1611,7 @@ mod tests {
         else {
             panic!("recent policy not applied")
         };
-        let stranger = manager.anonymous(now).await.unwrap();
+        let stranger = manager.anonymous(identity(), now).await.unwrap();
         assert!(manager
             .consume_grant(
                 &stranger.context,
@@ -1077,7 +1634,7 @@ mod tests {
             .unwrap();
         assert!(manager.context(&session.cookie, true, now).await.is_err());
         assert!(!manager.login_available().await.unwrap());
-        let fresh = manager.anonymous(now).await.unwrap();
+        let fresh = manager.anonymous(identity(), now).await.unwrap();
         assert!(manager
             .memory
             .lock()
@@ -1092,7 +1649,7 @@ mod tests {
         let (_directory, manager, settings) = manager(ReauthMode::EveryOperation).await;
         let now = Utc::now();
         let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(false));
-        let anonymous = manager.anonymous(now).await.unwrap();
+        let anonymous = manager.anonymous(identity(), now).await.unwrap();
         let token = manager
             .journal
             .issue_enrollment(now, std::time::Duration::from_secs(60), false)
