@@ -54,11 +54,14 @@ fn no_query(request: &HttpRequest) -> Result<(), ApiError> {
 fn enum_value<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, ApiError> {
     serde_json::from_value(serde_json::Value::String(text.into())).map_err(|_| invalid())
 }
-fn response(page: Paged) -> HttpResponse {
-    match page {
-        Paged::Nodes(page) => HttpResponse::Ok().json(page),
-        Paged::Operations(page) => HttpResponse::Ok().json(page),
-    }
+fn response(page: Paged, max_bytes: usize) -> Result<HttpResponse, ApiError> {
+    let bytes = match page {
+        Paged::Nodes(page) => crate::pagination::bounded_json(&page, max_bytes)?,
+        Paged::Operations(page) => crate::pagination::bounded_json(&page, max_bytes)?,
+    };
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(bytes))
 }
 
 async fn nodes(request: HttpRequest, auth: web::Data<AuthHttp>) -> Result<HttpResponse, ApiError> {
@@ -83,9 +86,10 @@ async fn nodes(request: HttpRequest, auth: web::Data<AuthHttp>) -> Result<HttpRe
     };
     let now = Utc::now();
     if let Some(cursor) = query.cursor {
-        return Ok(response(
+        return response(
             auth.snapshots.next(&context, &selector, &cursor, now)?,
-        ));
+            auth.limits().max_response_bytes,
+        );
     }
     let counts = auth.journal.unresolved_counts().await?;
     let mut rows: Vec<_> = auth
@@ -97,14 +101,11 @@ async fn nodes(request: HttpRequest, auth: web::Data<AuthHttp>) -> Result<HttpRe
         .collect();
     let truncated = rows.len() > auth.limits().pagination.snapshot_max_items;
     rows.truncate(auth.limits().pagination.snapshot_max_items);
-    Ok(response(auth.snapshots.begin(
-        &context,
-        selector,
-        Rows::Nodes(rows),
-        None,
-        truncated,
-        now,
-    )?))
+    response(
+        auth.snapshots
+            .begin(&context, selector, Rows::Nodes(rows), None, truncated, now)?,
+        auth.limits().max_response_bytes,
+    )
 }
 async fn summary(
     request: &HttpRequest,
@@ -173,11 +174,12 @@ async fn operations(
     } else {
         let observation = auth
             .journal
-            .history_observation(
+            .history_observation_bounded(
                 id.clone(),
                 state,
                 kind,
                 auth.limits().pagination.snapshot_max_items,
+                auth.limits().max_response_bytes,
             )
             .await?;
         (
@@ -206,19 +208,23 @@ async fn operations(
     };
     let now = Utc::now();
     if let Some(cursor) = query.cursor {
-        return Ok(response(
+        return response(
             auth.snapshots.next(&context, &selector, &cursor, now)?,
-        ));
+            auth.limits().max_response_bytes,
+        );
     }
     let rows = rows.ok_or_else(|| ApiError::new(ErrorCode::InternalError))?;
-    Ok(response(auth.snapshots.begin(
-        &context,
-        selector,
-        Rows::Operations(rows),
-        Some(scope.network),
-        truncated,
-        now,
-    )?))
+    response(
+        auth.snapshots.begin(
+            &context,
+            selector,
+            Rows::Operations(rows),
+            Some(scope.network),
+            truncated,
+            now,
+        )?,
+        auth.limits().max_response_bytes,
+    )
 }
 async fn operation(
     request: HttpRequest,

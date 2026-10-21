@@ -829,6 +829,149 @@ async fn history_sort_is_exact_to_nanoseconds_filters_before_bound_and_unknown_r
     assert!(matches!(result,Err(api_server::journal::JournalError::ResourceBusy(id)) if id==a.id));
 }
 
+#[actix_web::test]
+async fn stored_scope_matches_legacy_hash_and_concurrent_reads_do_not_mutate() {
+    use sha2::{Digest, Sha256};
+    let (_directory, settings, auth) = setup().await;
+    let now = Utc::now();
+    let original = seed(&auth.journal, "alpha", false, now, 701).await;
+    let first = auth.journal.history_scope("alpha".into()).await.unwrap();
+    assert_eq!(
+        first.revision,
+        hex::encode(Sha256::digest(
+            serde_json::to_vec(&original.review.node).unwrap()
+        ))
+    );
+    seed(&auth.journal, "alpha", true, now, 702).await;
+    assert_eq!(
+        auth.journal
+            .history_scope("alpha".into())
+            .await
+            .unwrap()
+            .revision,
+        first.revision
+    );
+    let mut changed = original.clone();
+    changed.id = Uuid::from_u128(703);
+    changed.review.operation_id = changed.id;
+    changed
+        .review
+        .node
+        .identity_revision
+        .push_str("-new-binding");
+    auth.journal
+        .create(changed, Uuid::new_v4(), vec![], None)
+        .await
+        .unwrap();
+    let scope = auth.journal.history_scope("alpha".into()).await.unwrap();
+    assert_ne!(scope.revision, first.revision);
+    assert_eq!(scope.network, lightning_client::model::Network::Unknown);
+    let observer = rusqlite::Connection::open(&settings.api.database).unwrap();
+    let mut hash = Sha256::new();
+    for binding in observer.prepare("SELECT DISTINCT json_extract(body,'$.review.node') FROM operations WHERE node_id='alpha' ORDER BY json_extract(body,'$.review.node')").unwrap().query_map([], |row| row.get::<_, String>(0)).unwrap() {
+        let binding: lightning_client::model::NodeBinding = serde_json::from_str(&binding.unwrap()).unwrap();
+        hash.update(serde_json::to_vec(&binding).unwrap());
+    }
+    assert_eq!(scope.revision, hex::encode(hash.finalize()));
+    let version: i64 = observer
+        .pragma_query_value(None, "data_version", |row| row.get(0))
+        .unwrap();
+    let (a, b, c, d) = tokio::join!(
+        auth.journal.history_scope("alpha".into()),
+        auth.journal.history_scope("alpha".into()),
+        auth.journal.history("alpha".into(), None, None, 3),
+        auth.journal
+            .history("alpha".into(), Some("nonterminal".into()), None, 3),
+    );
+    assert_eq!(a.unwrap().revision, scope.revision);
+    assert_eq!(b.unwrap().revision, scope.revision);
+    assert_eq!(c.unwrap().0.len(), 3);
+    assert_eq!(d.unwrap().0.len(), 3);
+    assert_eq!(
+        observer
+            .pragma_query_value(None, "data_version", |row| row.get::<_, i64>(0))
+            .unwrap(),
+        version
+    );
+}
+
+#[actix_web::test]
+async fn oversized_record_and_multi_record_page_return_static_internal_error_without_items() {
+    use api_server::{journal::JournalError, pagination::Snapshots};
+    let (_directory, mut settings, mut auth) = setup().await;
+    let now = Utc::now();
+    let operation = seed(&auth.journal, "alpha", false, now, 801).await;
+    seed(&auth.journal, "alpha", false, now, 802).await;
+    let record_bytes = serde_json::to_vec(&operation).unwrap().len();
+    assert!(matches!(
+        auth.journal
+            .history_observation_bounded("alpha".into(), None, None, 3, record_bytes - 1)
+            .await,
+        Err(JournalError::ResponseTooLarge)
+    ));
+    settings.api.limits.max_response_bytes = record_bytes + 512;
+    auth = AuthHttp::new(settings.api.clone(), auth.journal.clone()).unwrap();
+    auth.registry = Arc::new(Registry::new(&settings).unwrap());
+    auth.snapshots = Snapshots::new(settings.api.limits.clone());
+    let (cookie, _) = login(&auth).await;
+    let app = test::init_service(application(auth.clone())).await;
+    let response = test::call_service(
+        &app,
+        get("/api/v1/nodes/alpha/operations?limit=1")
+            .cookie(cookie.clone())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let response_bytes = test::read_body(response).await;
+    assert!(response_bytes.len() <= settings.api.limits.max_response_bytes);
+    let first: Value = serde_json::from_slice(&response_bytes).unwrap();
+    let token = first["next_cursor"].as_str().unwrap();
+    let response = test::call_service(
+        &app,
+        get(&format!(
+            "/api/v1/nodes/alpha/operations?limit=1&cursor={token}"
+        ))
+        .cookie(cookie.clone())
+        .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let last: Value = test::read_body_json(response).await;
+    assert_eq!(last["items"][0]["id"], Uuid::from_u128(802).to_string());
+    let response = test::call_service(
+        &app,
+        get("/api/v1/nodes/alpha/operations?limit=2")
+            .cookie(cookie.clone())
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let error: Value = test::read_body_json(response).await;
+    assert_eq!(error["error"]["code"], "internal_error");
+    assert!(error.get("items").is_none());
+    let mut huge = operation;
+    huge.id = Uuid::from_u128(803);
+    huge.review.operation_id = huge.id;
+    huge.review.destination = Some("SYNTHETIC_OVERSIZED_CANARY".repeat(record_bytes));
+    auth.journal
+        .create(huge, Uuid::new_v4(), vec![], None)
+        .await
+        .unwrap();
+    let response = test::call_service(
+        &app,
+        get("/api/v1/nodes/alpha/operations?limit=3")
+            .cookie(cookie)
+            .to_request(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    let oversized: Value = test::read_body_json(response).await;
+    assert_eq!(oversized["error"]["message"], error["error"]["message"]);
+    assert!(!oversized.to_string().contains("SYNTHETIC_OVERSIZED_CANARY"));
+    assert!(oversized.get("items").is_none());
+}
+
 fn signed_invoice() -> String {
     use bitcoin::{
         hashes::{sha256, Hash},
