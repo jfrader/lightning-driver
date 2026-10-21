@@ -294,7 +294,7 @@ pub(super) async fn create(
     key: Uuid,
     secret: Option<SealedInvoiceSecret>,
     facts: ReadFacts,
-) -> Result<Operation> {
+) -> Result<(Operation, bool)> {
     let e = engine.clone();
     let context = context.clone();
     job(engine,move |connection| {
@@ -306,7 +306,7 @@ pub(super) async fn create(
             let now=e.clock.now();let config=&pinned.as_ref().ok_or_else(||failure(ErrorCode::NotFound))?.config;
                 writable(config)?;
             if let Some(mut existing)=replay_in(&tx,&intent.operation.node_id,key,&intent.input_digest)? {
-                session.project(&mut existing);tx.commit()?;return Ok(existing);
+                session.project(&mut existing);tx.commit()?;return Ok((existing, false));
             }
             check(&intent,&intent.operation,config,Some(&facts),now)?;
             paid(&tx,&intent)?;
@@ -321,7 +321,7 @@ pub(super) async fn create(
             for resource in intent.resources() {tx.execute("INSERT INTO resource_claims VALUES(?1,?2,?3)",params![operation.node_id,resource.key(),operation.id.to_string()])?;}
             if let Some(secret)=secret {tx.execute("INSERT INTO pending_invoice_secrets VALUES(?1,?2)",params![operation.id.to_string(),secret.0])?;}
             e.faults.hit(FaultPoint::BeforeCreateCommit)?;
-            tx.commit()?;Ok(operation.clone())
+            tx.commit()?;Ok((operation.clone(), true))
         })
     }).await
 }
@@ -349,6 +349,12 @@ pub(super) async fn duplicate(
             .with_claim_session(&context, generation, e.clock.now(), |_| {
                 let operation = load(&tx, id)?;
                 binding(&operation, &node, &digest)?;
+                if e.unavailable
+                    .get(&node)
+                    .is_some_and(|(read_only, _)| *read_only)
+                {
+                    return Err(failure(ErrorCode::ReadOnly));
+                }
                 if let Some(Some(pinned)) = pinned.as_deref() {
                     writable(&pinned.config)?;
                 }

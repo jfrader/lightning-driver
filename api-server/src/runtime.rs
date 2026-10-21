@@ -1,8 +1,7 @@
 use crate::{
-    auth_http::AuthHttp,
     journal::{validate_state_directory, Journal},
+    state::ApplicationState,
 };
-use chrono::Utc;
 use lightning_client::settings::Settings;
 use std::{
     fs::{File, OpenOptions},
@@ -29,7 +28,7 @@ pub enum StartupError {
 }
 
 pub struct Runtime {
-    pub auth: AuthHttp,
+    pub state: ApplicationState,
     _instance: File,
 }
 
@@ -39,31 +38,38 @@ impl Runtime {
             .validate()
             .map_err(|_| StartupError::Configuration)?;
         let instance = instance_lock(&settings.api.database)?;
-        let auth = open_auth(settings).await?;
-        auth.journal
-            .recover(Utc::now())
+        let state = open_application(settings).await?;
+        state
+            .engine
+            .recover()
             .await
             .map_err(|_| StartupError::Storage)?;
         Ok(Self {
-            auth,
+            state,
             _instance: instance,
         })
     }
 }
 
-pub async fn open_auth(settings: &Settings) -> Result<AuthHttp, StartupError> {
+pub async fn open_auth_store(settings: &Settings) -> Result<Journal, StartupError> {
+    settings
+        .validate()
+        .map_err(|_| StartupError::Configuration)?;
+    Journal::open(settings.api.database.clone())
+        .await
+        .map_err(|_| StartupError::Storage)
+}
+
+pub async fn open_application(settings: &Settings) -> Result<ApplicationState, StartupError> {
     settings
         .validate()
         .map_err(|_| StartupError::Configuration)?;
     let journal = Journal::open(settings.api.database.clone())
         .await
         .map_err(|_| StartupError::Storage)?;
-    let mut auth =
-        AuthHttp::new(settings.api.clone(), journal).map_err(|_| StartupError::Configuration)?;
-    auth.registry = std::sync::Arc::new(
-        crate::registry::Registry::new(settings).map_err(|_| StartupError::Configuration)?,
-    );
-    Ok(auth)
+    ApplicationState::new(settings, journal)
+        .await
+        .map_err(|_| StartupError::Storage)
 }
 
 fn instance_lock(database: &Path) -> Result<File, StartupError> {

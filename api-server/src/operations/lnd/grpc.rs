@@ -111,9 +111,7 @@ impl Grpc {
             .timeout(c.deadline)
             .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(c.certificate)))
             .map_err(|_| failure(ErrorCode::NotConfigured))?
-            .connect()
-            .await
-            .map_err(|_| failure(ErrorCode::NodeOffline))?;
+            .connect_lazy();
         Ok(Self {
             channel,
             macaroon: c.macaroon,

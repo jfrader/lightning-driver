@@ -1,4 +1,6 @@
 use super::*;
+#[path = "http_tests.rs"]
+mod operations_http;
 use bitcoin::{
     hashes::{sha256, Hash},
     secp256k1::{Secp256k1, SecretKey},
@@ -517,6 +519,7 @@ impl Fixture {
             journal,
             auth,
             nodes: Arc::new(nodes),
+            unavailable: Arc::new(BTreeMap::new()),
             clock: clock.clone(),
             key: Arc::new(PendingSecretKey::new([91; 32])),
             tasks: Arc::new(tokio::sync::Semaphore::new(64)),

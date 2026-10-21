@@ -34,10 +34,7 @@ const MAX_IDENTITY_HEADER_BYTES: usize = 45;
 #[derive(Clone)]
 pub struct AuthHttp {
     pub manager: AuthManager,
-    pub journal: Journal,
     settings: Arc<ApiSettings>,
-    pub registry: Arc<crate::registry::Registry>,
-    pub snapshots: crate::pagination::Snapshots,
 }
 
 #[derive(Serialize)]
@@ -76,10 +73,7 @@ impl AuthHttp {
             .validate()
             .map_err(|_| ApiError::new(ErrorCode::NotConfigured))?;
         Ok(Self {
-            registry: Arc::new(crate::registry::Registry::default()),
-            snapshots: crate::pagination::Snapshots::new(settings.limits.clone()),
             manager: AuthManager::new(&settings, journal.clone())?,
-            journal,
             settings: Arc::new(settings),
         })
     }
@@ -276,8 +270,9 @@ pub fn configure(config: &mut web::ServiceConfig) {
 
 async fn bootstrap(
     request: HttpRequest,
-    state: web::Data<AuthHttp>,
+    application: web::Data<crate::state::ApplicationState>,
 ) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
     state.validate_request(&request, false)?;
     if let Some(cookie) = request.cookie(state.cookie_name(false)) {
         if let Ok(old) = state
@@ -296,7 +291,7 @@ async fn bootstrap(
         csrf_token: AuthManager::csrf(&context.context).into(),
         expires_at: context.context.expires_at,
         login_available: state.manager.login_available().await?,
-        enrollment_available: state.journal.enrollment_available(Utc::now()).await?,
+        enrollment_available: application.journal.enrollment_available(Utc::now()).await?,
         public_origin: state.settings.public_origin.origin().ascii_serialization(),
         rp_id: state.settings.rp_id.clone(),
     };
@@ -311,18 +306,20 @@ async fn bootstrap(
 
 async fn start_login(
     request: HttpRequest,
-    state: web::Data<AuthHttp>,
+    application: web::Data<crate::state::ApplicationState>,
     _body: web::Json<Empty>,
 ) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
     let context = state.context(&request, false, true).await?;
     state.admit_start(&request)?;
     Ok(HttpResponse::Ok().json(state.manager.start_login(&context, Utc::now()).await?))
 }
 async fn finish_login(
     request: HttpRequest,
-    state: web::Data<AuthHttp>,
+    application: web::Data<crate::state::ApplicationState>,
     body: web::Json<AuthenticationFinish>,
 ) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
     let context = state.context(&request, false, true).await?;
     state.completed(
         state
@@ -333,9 +330,10 @@ async fn finish_login(
 }
 async fn start_enrollment(
     request: HttpRequest,
-    state: web::Data<AuthHttp>,
+    application: web::Data<crate::state::ApplicationState>,
     body: web::Json<EnrollmentStart>,
 ) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
     let context = state.context(&request, false, true).await?;
     state.admit_start(&request)?;
     Ok(HttpResponse::Ok().json(
@@ -351,9 +349,10 @@ async fn start_enrollment(
 }
 async fn finish_enrollment(
     request: HttpRequest,
-    state: web::Data<AuthHttp>,
+    application: web::Data<crate::state::ApplicationState>,
     body: web::Json<RegistrationFinish>,
 ) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
     let context = state.context(&request, false, true).await?;
     state.completed(
         state
@@ -364,15 +363,17 @@ async fn finish_enrollment(
 }
 async fn session(
     request: HttpRequest,
-    state: web::Data<AuthHttp>,
+    application: web::Data<crate::state::ApplicationState>,
 ) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
     let context = state.context(&request, true, false).await?;
     Ok(HttpResponse::Ok().json(state.manager.session(&context)?))
 }
 async fn logout(
     request: HttpRequest,
-    state: web::Data<AuthHttp>,
+    application: web::Data<crate::state::ApplicationState>,
 ) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
     let context = state.context(&request, true, true).await?;
     state.manager.revoke(&context)?;
     Ok(HttpResponse::NoContent()
@@ -381,8 +382,9 @@ async fn logout(
 }
 async fn public_policy(
     request: HttpRequest,
-    state: web::Data<AuthHttp>,
+    application: web::Data<crate::state::ApplicationState>,
 ) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
     state.context(&request, true, false).await?;
     let limits = &state.settings.limits;
     Ok(HttpResponse::Ok().json(PublicPolicy {
@@ -404,7 +406,7 @@ mod tests {
     use webauthn_authenticator_rs::{softpasskey::SoftPasskey, WebauthnAuthenticator};
     use webauthn_rs::prelude::CreationChallengeResponse;
 
-    async fn state() -> (tempfile::TempDir, AuthHttp) {
+    async fn state() -> (tempfile::TempDir, crate::state::ApplicationState) {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
@@ -422,7 +424,18 @@ mod tests {
             limits: Limits::default(),
         };
         let journal = Journal::open(settings.database.clone()).await.unwrap();
-        (directory, AuthHttp::new(settings, journal).unwrap())
+        (
+            directory,
+            crate::state::ApplicationState::new(
+                &lightning_client::settings::Settings {
+                    api: settings,
+                    nodes: vec![],
+                },
+                journal,
+            )
+            .await
+            .unwrap(),
+        )
     }
 
     fn browser_json<T: Serialize>(credential: T) -> Value {
@@ -445,10 +458,10 @@ mod tests {
             .append_header(("X-Real-IP", "198.51.100.1"))
             .to_http_request();
         assert_eq!(
-            state.identity(&request).unwrap(),
+            state.auth.identity(&request).unwrap(),
             ClientIdentity::Socket(peer.ip())
         );
-        let mut settings = (*state.settings).clone();
+        let mut settings = (*state.auth.settings).clone();
         settings.client_identity = ClientIdentitySettings {
             mode: ClientIdentityMode::TrustedSingleProxy,
             trusted_proxy_cidrs: vec![
@@ -457,22 +470,38 @@ mod tests {
             ],
             header: Some(ClientIdentityHeader::XRealIp),
         };
-        let trusted = AuthHttp::new(settings, state.journal.clone()).unwrap();
-        let mut mapped_settings = (*trusted.settings).clone();
+        let trusted = crate::state::ApplicationState::new(
+            &lightning_client::settings::Settings {
+                api: settings,
+                nodes: vec![],
+            },
+            state.journal.clone(),
+        )
+        .await
+        .unwrap();
+        let mut mapped_settings = (*trusted.auth.settings).clone();
         mapped_settings.client_identity.trusted_proxy_cidrs =
             vec!["::ffff:192.0.2.10/128".parse().unwrap()];
-        let mapped = AuthHttp::new(mapped_settings, state.journal.clone()).unwrap();
+        let mapped = crate::state::ApplicationState::new(
+            &lightning_client::settings::Settings {
+                api: mapped_settings,
+                nodes: vec![],
+            },
+            state.journal.clone(),
+        )
+        .await
+        .unwrap();
         let mapped_request = test::TestRequest::get()
             .peer_addr(peer)
             .insert_header(("X-Real-IP", "198.51.100.1"))
             .to_http_request();
         assert_eq!(
-            mapped.identity(&mapped_request).unwrap(),
+            mapped.auth.identity(&mapped_request).unwrap(),
             ClientIdentity::Forwarded("198.51.100.1".parse().unwrap())
         );
         // Resolution is stable even if another consumer asks for it again.
         assert_eq!(
-            trusted.identity(&request).unwrap(),
+            trusted.auth.identity(&request).unwrap(),
             ClientIdentity::Socket(peer.ip())
         );
         for (peer, value, expected) in [
@@ -489,7 +518,7 @@ mod tests {
                 .insert_header(("x-ReAl-Ip", value))
                 .to_http_request();
             assert_eq!(
-                trusted.identity(&request).unwrap(),
+                trusted.auth.identity(&request).unwrap(),
                 ClientIdentity::Forwarded(expected.parse().unwrap())
             );
         }
@@ -528,23 +557,24 @@ mod tests {
                 header::HeaderValue::from_bytes(&[0xff]).unwrap(),
             ))
             .to_http_request();
-        assert!(trusted.identity(&request).is_err());
+        assert!(trusted.auth.identity(&request).is_err());
         let untrusted = test::TestRequest::get()
             .peer_addr("192.0.2.11:1234".parse().unwrap())
             .append_header(("X-Real-IP", "bad"))
             .append_header(("X-Real-IP", "198.51.100.1"))
             .to_http_request();
         assert_eq!(
-            trusted.identity(&untrusted).unwrap(),
+            trusted.auth.identity(&untrusted).unwrap(),
             ClientIdentity::Socket("192.0.2.11".parse().unwrap())
         );
         let now = Utc::now();
         let first = ClientIdentity::Forwarded("198.51.100.1".parse().unwrap());
         for _ in 0..trusted.limits().login_attempts_per_minute {
-            trusted.manager.admit_start(first, now).unwrap();
+            trusted.auth.manager.admit_start(first, now).unwrap();
         }
-        assert!(trusted.manager.admit_start(first, now).is_err());
+        assert!(trusted.auth.manager.admit_start(first, now).is_err());
         assert!(trusted
+            .auth
             .manager
             .admit_start(
                 ClientIdentity::Forwarded("198.51.100.2".parse().unwrap()),
@@ -631,13 +661,13 @@ mod tests {
             serde_json::from_value(challenge["options"].clone()).unwrap();
         let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
         let credential = authenticator
-            .do_registration(state.settings.public_origin.clone(), options)
+            .do_registration(state.auth.settings.public_origin.clone(), options)
             .unwrap();
         let source = ClientIdentity::Socket(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         for _ in 0..state.limits().login_attempts_per_minute {
-            let _ = state.manager.admit_start(source, Utc::now());
+            let _ = state.auth.manager.admit_start(source, Utc::now());
         }
-        assert!(state.manager.admit_start(source, Utc::now()).is_err());
+        assert!(state.auth.manager.admit_start(source, Utc::now()).is_err());
         let response=test::call_service(&app,test::TestRequest::post().uri("/api/v1/auth/enrollment/finish").insert_header((header::HOST,"manager.example.invalid")).insert_header((header::ORIGIN,"https://manager.example.invalid")).insert_header(("X-CSRF-Token",csrf)).cookie(guest).set_json(json!({"challenge_id":challenge["challenge_id"],"credential":browser_json(credential)})).to_request()).await;
         assert_eq!(response.status(), StatusCode::OK);
         let session_cookie = response
@@ -793,7 +823,7 @@ mod tests {
     #[actix_web::test]
     async fn development_cookie_exception_is_explicit_and_loopback_only() {
         let (_directory, state) = state().await;
-        let mut settings = (*state.settings).clone();
+        let mut settings = (*state.auth.settings).clone();
         settings.public_origin = "http://localhost:5173".parse().unwrap();
         settings.rp_id = "localhost".into();
         assert!(AuthHttp::new(settings.clone(), state.journal.clone()).is_err());

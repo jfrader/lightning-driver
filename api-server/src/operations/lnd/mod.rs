@@ -89,7 +89,6 @@ impl<T: Wire> LndAdapter<T> {
             config,
             max_items,
         };
-        adapter.read(ReadQuery::Info).await?;
         Ok(adapter)
     }
     async fn call(&self, rpc: Rpc, p: Value, budget: &mut usize) -> Result<Value> {

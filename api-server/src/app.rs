@@ -1,6 +1,7 @@
 use crate::{
     auth_http::{self, AuthHttp},
     error::ApiError,
+    state::ApplicationState,
 };
 use actix_web::{
     dev::{ServiceFactory, ServiceRequest, ServiceResponse},
@@ -9,7 +10,7 @@ use actix_web::{
 use lightning_client::model::ErrorCode;
 
 pub fn application(
-    auth: AuthHttp,
+    state: ApplicationState,
 ) -> App<
     impl ServiceFactory<
         ServiceRequest,
@@ -20,21 +21,24 @@ pub fn application(
     >,
 > {
     App::new()
-        .app_data(web::Data::new(auth))
+        .app_data(web::Data::new(state))
         .wrap(AuthHttp::headers())
         .service(
             web::scope("/api/v1")
                 .configure(auth_http::configure)
                 .configure(crate::reads::configure)
+                .configure(crate::operations::http::configure)
                 .default_service(web::to(not_found)),
         )
         .default_service(web::to(not_found))
 }
 
-async fn not_found(
+pub(crate) async fn not_found(
     request: HttpRequest,
-    auth: web::Data<AuthHttp>,
+    state: web::Data<ApplicationState>,
 ) -> Result<HttpResponse, ApiError> {
-    auth.validate_request(&request, !request.method().is_safe())?;
+    state
+        .auth
+        .validate_request(&request, !request.method().is_safe())?;
     Err(ApiError::new(ErrorCode::NotFound))
 }

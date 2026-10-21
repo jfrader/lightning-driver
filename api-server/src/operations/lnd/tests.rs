@@ -694,9 +694,15 @@ async fn verified_tls_and_binary_file_credentials_on_both_transports() {
         if grpc {
             LndGrpcAdapter::connect(&s, &Limits::default(), config(backend))
                 .await
+                .unwrap()
+                .read(ReadQuery::Info)
+                .await
                 .unwrap();
         } else {
             LndRestAdapter::connect(&s, &Limits::default(), config(backend))
+                .await
+                .unwrap()
+                .read(ReadQuery::Info)
                 .await
                 .unwrap();
         }
@@ -719,10 +725,16 @@ async fn verified_tls_and_binary_file_credentials_on_both_transports() {
         let error = if grpc {
             LndGrpcAdapter::connect(&s, &Limits::default(), config(backend))
                 .await
+                .unwrap()
+                .read(ReadQuery::Info)
+                .await
                 .err()
                 .unwrap()
         } else {
             LndRestAdapter::connect(&s, &Limits::default(), config(backend))
+                .await
+                .unwrap()
+                .read(ReadQuery::Info)
                 .await
                 .err()
                 .unwrap()
@@ -761,6 +773,9 @@ async fn configuration_and_identity_fail_closed_without_mutation() {
     let s = settings(dir.path(), server.endpoint.clone(), Backend::LndRest);
     assert_eq!(
         LndRestAdapter::connect(&s, &Limits::default(), config(Backend::LndRest))
+            .await
+            .unwrap()
+            .read(ReadQuery::Info)
             .await
             .err()
             .unwrap()

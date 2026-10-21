@@ -34,7 +34,6 @@ impl ClnAdapter {
             config,
             max_items: limits.pagination.snapshot_max_items,
         };
-        adapter.info().await?;
         Ok(adapter)
     }
 

@@ -21,6 +21,7 @@ pub struct Entry {
     pub binding_revision: String,
     label: String,
     backend: lightning_client::model::Backend,
+    unavailable: Option<ErrorCode>,
 }
 
 fn fingerprint(value: &impl Serialize) -> Result<String, serde_json::Error> {
@@ -50,6 +51,7 @@ impl Registry {
                     binding_revision,
                     label: node.label.clone(),
                     backend: node.backend,
+                    unavailable: None,
                     policy: NodePolicy {
                         node_id: node.id.clone(),
                         revision,
@@ -63,6 +65,11 @@ impl Registry {
     }
     pub fn get(&self, id: &str) -> Option<&Entry> {
         self.nodes.get(id)
+    }
+    pub(crate) fn mark_unavailable(&mut self, id: &str, code: ErrorCode) {
+        if let Some(entry) = self.nodes.get_mut(id) {
+            entry.unavailable = Some(code);
+        }
     }
     pub fn entries(&self) -> impl Iterator<Item = (&String, &Entry)> {
         self.nodes.iter()
@@ -110,7 +117,7 @@ impl Entry {
                 observed_at: None,
                 checked_at: now,
                 stale: true,
-                error_code: Some(ErrorCode::NodeUnverified),
+                error_code: Some(self.unavailable.unwrap_or(ErrorCode::NodeUnverified)),
             },
             capabilities: Capabilities::uniform(Some(if self.policy.read_only {
                 CapabilityReason::ReadOnly

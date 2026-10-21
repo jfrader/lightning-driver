@@ -1,11 +1,12 @@
-// Intentionally private and not installed in HTTP until transport and contract acceptance.
 #![allow(dead_code)]
 
 mod adapter;
 mod cln;
 mod evidence;
+pub(crate) mod http;
 mod intent;
 mod lnd;
+mod runtime;
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -35,7 +36,7 @@ type Result<T> = std::result::Result<T, EngineError>;
 type ResponseFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 #[derive(Debug)]
-struct EngineError {
+pub(crate) struct EngineError {
     code: ErrorCode,
     operation_id: Option<Uuid>,
     outcome: ErrorOutcome,
@@ -226,10 +227,11 @@ impl Faults {
 }
 
 #[derive(Clone)]
-struct Engine {
+pub(crate) struct Engine {
     journal: Journal,
     auth: AuthManager,
     nodes: Arc<BTreeMap<String, NodeGate>>,
+    unavailable: Arc<BTreeMap<String, (bool, ErrorCode)>>,
     clock: Arc<dyn Clock>,
     key: Arc<PendingSecretKey>,
     tasks: Arc<tokio::sync::Semaphore>,
@@ -237,7 +239,7 @@ struct Engine {
 }
 
 impl Engine {
-    async fn recover(&self) -> Result<()> {
+    pub(crate) async fn recover(&self) -> Result<()> {
         let key = self.key.clone();
         self.journal.run(move |connection| {
             let mut statement=connection.prepare("SELECT o.body,s.ciphertext FROM pending_invoice_secrets s JOIN operations o ON o.id=s.operation_id")?;
@@ -252,6 +254,13 @@ impl Engine {
         Ok(())
     }
     fn node(&self, id: &str) -> Result<NodeGate> {
+        if let Some((read_only, code)) = self.unavailable.get(id) {
+            return Err(failure(if *read_only {
+                ErrorCode::ReadOnly
+            } else {
+                *code
+            }));
+        }
         self.nodes
             .get(id)
             .cloned()
@@ -265,6 +274,7 @@ impl Engine {
             .ok_or_else(|| failure(ErrorCode::NotFound))
     }
 
+    #[cfg(test)]
     async fn create_review(
         &self,
         context: &Context,
@@ -272,6 +282,18 @@ impl Engine {
         key: Uuid,
         request: OperationRequest,
     ) -> Result<Operation> {
+        self.create_review_outcome(context, node, key, request)
+            .await
+            .map(|(operation, _)| operation)
+    }
+
+    async fn create_review_outcome(
+        &self,
+        context: &Context,
+        node: &str,
+        key: Uuid,
+        request: OperationRequest,
+    ) -> Result<(Operation, bool)> {
         self.live(context).await?;
         let pinned = self.pinned(node)?;
         writable(&pinned.config)?;
@@ -282,7 +304,7 @@ impl Engine {
         let input = intent::hash(&intent::input(node, &request))?;
         // Replay precedes live daemon prerequisites and all random invoice material.
         if let Some(operation) = storage::replay(self, context, node, key, &input).await? {
-            return Ok(operation);
+            return Ok((operation, false));
         }
         let facts = pinned.adapter.prepare(&request).await?;
         let (intent, secret) =
@@ -366,6 +388,19 @@ impl Engine {
         digest: &str,
         authorization: Option<Uuid>,
     ) -> Result<Operation> {
+        self.confirm_once_outcome(context, node, id, digest, authorization)
+            .await
+            .map(|(operation, _)| operation)
+    }
+
+    async fn confirm_once_outcome(
+        &self,
+        context: &Context,
+        node: &str,
+        id: Uuid,
+        digest: &str,
+        authorization: Option<Uuid>,
+    ) -> Result<(Operation, bool)> {
         let slot = self
             .tasks
             .clone()
@@ -395,10 +430,10 @@ impl Engine {
         digest: String,
         authorization: Option<Uuid>,
         cancelled: Arc<Mutex<bool>>,
-    ) -> Result<Operation> {
+    ) -> Result<(Operation, bool)> {
         // First gate handles duplicates/removal without a probe or a reusable permit.
         if let Some(existing) = storage::duplicate(self, &context, &node, id, &digest).await? {
-            return Ok(existing);
+            return Ok((existing, false));
         }
         let pinned = self.pinned(&node)?;
         let operation = storage::load_local(self, id).await?;
@@ -406,7 +441,7 @@ impl Engine {
             Ok(facts) => facts,
             Err(error) => {
                 return match storage::duplicate(self, &context, &node, id, &digest).await? {
-                    Some(operation) => Ok(operation),
+                    Some(operation) => Ok((operation, false)),
                     None => Err(error),
                 }
             }
@@ -430,12 +465,13 @@ impl Engine {
             Err(error) if error.outcome == ErrorOutcome::Unknown => {
                 return storage::uncertain(self, id, ErrorCode::OutcomeUnknown)
                     .await
+                    .map(|operation| (operation, true))
                     .map_err(|e| e.claimed(id))
             }
             Err(error) => return Err(error),
         };
         let permit = match claim {
-            Claim::Existing(operation) => return Ok(*operation),
+            Claim::Existing(operation) => return Ok((*operation, false)),
             Claim::New(permit) => *permit,
         };
         self.faults
@@ -446,22 +482,29 @@ impl Engine {
             .hit(FaultPoint::BeforeResult)
             .map_err(|e| e.claimed(id))?;
         match storage::apply(self, id, evidence, false).await {
-            Ok(operation) => Ok(operation),
+            Ok(operation) => Ok((operation, true)),
             Err(error) if error.code == ErrorCode::StorageUnavailable => {
                 storage::uncertain(self, id, ErrorCode::OutcomeUnknown)
                     .await
+                    .map(|operation| (operation, true))
                     .map_err(|e| e.claimed(id))
             }
             Err(error) if error.code == ErrorCode::UpstreamInvalidResponse => {
                 storage::uncertain(self, id, ErrorCode::UpstreamInvalidResponse)
                     .await
+                    .map(|operation| (operation, true))
                     .map_err(|e| e.claimed(id))
             }
             Err(error) => Err(error.claimed(id)),
         }
     }
 
-    async fn observe(&self, context: &Context, node: &str, id: Uuid) -> Result<Operation> {
+    pub(crate) async fn observe(
+        &self,
+        context: &Context,
+        node: &str,
+        id: Uuid,
+    ) -> Result<Operation> {
         let operation = storage::status(self, context, node, id).await?;
         let Ok(pinned) = self.pinned(node) else {
             return Ok(operation);

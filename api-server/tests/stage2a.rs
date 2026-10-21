@@ -5,10 +5,10 @@ use actix_web::{
 };
 use api_server::{
     app::application,
-    auth_http::AuthHttp,
     journal::{Journal, Resource},
     registry::Registry,
-    runtime::open_auth,
+    runtime::open_application,
+    state::ApplicationState,
 };
 use chrono::{Duration, Utc};
 use lightning_client::{
@@ -37,7 +37,7 @@ fn configured(id: &str, readonly: bool) -> NodeSettings {
         "expected_pubkey":public.to_string(),"network":"regtest","read_only":readonly,"policy":policy.limits})).unwrap()
 }
 
-async fn setup() -> (tempfile::TempDir, Settings, AuthHttp) {
+async fn setup() -> (tempfile::TempDir, Settings, ApplicationState) {
     let directory = tempfile::Builder::new()
         .permissions(std::fs::Permissions::from_mode(0o700))
         .tempdir()
@@ -66,7 +66,7 @@ async fn setup() -> (tempfile::TempDir, Settings, AuthHttp) {
             configured("delta", false),
         ],
     };
-    let auth = open_auth(&settings).await.unwrap();
+    let auth = open_application(&settings).await.unwrap();
     (directory, settings, auth)
 }
 
@@ -82,7 +82,7 @@ fn post(path: &str) -> test::TestRequest {
         .insert_header((header::ORIGIN, ORIGIN))
 }
 
-async fn login(auth: &AuthHttp) -> (Cookie<'static>, String) {
+async fn login(auth: &ApplicationState) -> (Cookie<'static>, String) {
     let app = test::init_service(application(auth.clone())).await;
     let response = test::call_service(&app, get("/api/v1/auth/bootstrap").to_request()).await;
     let cookie = response.response().cookies().next().unwrap().into_owned();
@@ -552,12 +552,14 @@ async fn cursors_bind_sessions_expire_restart_and_reclaim_bounded_allocations() 
     let (_directory, settings, auth) = setup().await;
     let (cookie, csrf) = login(&auth).await;
     let context = auth
+        .auth
         .manager
         .context(cookie.value(), true, Utc::now())
         .await
         .unwrap();
     let (other_cookie, _) = login(&auth).await;
     let other = auth
+        .auth
         .manager
         .context(other_cookie.value(), true, Utc::now())
         .await
@@ -897,7 +899,7 @@ async fn stored_scope_matches_legacy_hash_and_concurrent_reads_do_not_mutate() {
 
 #[actix_web::test]
 async fn oversized_record_and_multi_record_page_return_static_internal_error_without_items() {
-    use api_server::{journal::JournalError, pagination::Snapshots};
+    use api_server::journal::JournalError;
     let (_directory, mut settings, mut auth) = setup().await;
     let now = Utc::now();
     let operation = seed(&auth.journal, "alpha", false, now, 801).await;
@@ -910,9 +912,9 @@ async fn oversized_record_and_multi_record_page_return_static_internal_error_wit
         Err(JournalError::ResponseTooLarge)
     ));
     settings.api.limits.max_response_bytes = record_bytes + 512;
-    auth = AuthHttp::new(settings.api.clone(), auth.journal.clone()).unwrap();
-    auth.registry = Arc::new(Registry::new(&settings).unwrap());
-    auth.snapshots = Snapshots::new(settings.api.limits.clone());
+    auth = ApplicationState::new(&settings, auth.journal.clone())
+        .await
+        .unwrap();
     let (cookie, _) = login(&auth).await;
     let app = test::init_service(application(auth.clone())).await;
     let response = test::call_service(

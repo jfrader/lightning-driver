@@ -743,6 +743,7 @@ async fn configured_tls_root_hostname_and_file_credentials_fail_closed() {
     let adapter = ClnAdapter::connect(&settings, &Limits::default(), config())
         .await
         .unwrap();
+    adapter.read(ReadQuery::Info).await.unwrap();
     let captured = task.await.unwrap().unwrap();
     assert!(captured["headers"]
         .as_str()
@@ -753,6 +754,9 @@ async fn configured_tls_root_hostname_and_file_credentials_fail_closed() {
     let mut wrong_host = settings.clone();
     wrong_host.endpoint = endpoint;
     let error = ClnAdapter::connect(&wrong_host, &Limits::default(), config())
+        .await
+        .unwrap()
+        .read(ReadQuery::Info)
         .await
         .err()
         .unwrap();
