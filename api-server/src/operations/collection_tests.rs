@@ -22,6 +22,51 @@ async fn expire(f: &Journey) {
 }
 
 #[actix_web::test]
+async fn live_info_requires_graph_sync_only_for_routing_payments() {
+    for backend in [Backend::LndGrpc, Backend::LndRest, Backend::ClnRest] {
+        for read_only in [false, true] {
+            let f = Journey::new(backend, read_only).await;
+            f.harness.scenario.lock().unwrap().expect_mutations(&[]);
+            let browser = login(&f.state, None).await;
+            let (status, info) = read(&f, &browser, "info", "NodeInfo").await;
+            assert_eq!(status, StatusCode::OK, "{backend:?}: {info}");
+            let node = &info["node"];
+            assert_eq!(node["status"]["synced_to_chain"], true);
+            assert_eq!(
+                node["status"]["synced_to_graph"],
+                if backend == Backend::ClnRest {
+                    Value::Null
+                } else {
+                    json!(false)
+                }
+            );
+            let capabilities = node["capabilities"].as_object().unwrap();
+            assert_eq!(capabilities.len(), 8);
+            for (kind, capability) in capabilities {
+                let reason = if read_only {
+                    json!("read_only")
+                } else if kind == "pay_invoice" && backend != Backend::ClnRest {
+                    json!("syncing")
+                } else {
+                    Value::Null
+                };
+                assert_eq!(
+                    *capability,
+                    json!({"enabled": reason.is_null(), "reason": reason}),
+                    "{backend:?}/{kind}"
+                );
+            }
+            f.harness
+                .scenario
+                .lock()
+                .unwrap()
+                .assert_no_unexpected_calls();
+            f.harness.stop().await;
+        }
+    }
+}
+
+#[actix_web::test]
 async fn seeded_collections_use_production_factory_on_all_transports() {
     for backend in [Backend::LndGrpc, Backend::LndRest, Backend::ClnRest] {
         let f = Journey::new(backend, false).await;
