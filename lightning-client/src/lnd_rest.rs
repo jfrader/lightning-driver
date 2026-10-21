@@ -33,7 +33,9 @@ impl LndRestClient {
         // --- Build client ---
         let client = ClientBuilder::new()
             .add_root_certificate(cert)
-            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_secs(u64::from(
+                crate::settings::Limits::default().rpc_seconds,
+            )))
             .build()
             .map_err(|e| anyhow!("Failed to build TLS client: {}", e))?;
 
@@ -48,7 +50,7 @@ impl LndRestClient {
 // --- API calls (unchanged) ---
 #[async_trait]
 impl LightningClient for LndRestClient {
-    async fn get_info(&mut self) -> Result<NodeInfo> {
+    async fn get_info(&self) -> Result<NodeInfo> {
         let res: serde_json::Value = self
             .client
             .get(format!("{}/v1/getinfo", self.url))
@@ -68,7 +70,7 @@ impl LightningClient for LndRestClient {
     }
 
     async fn create_invoice(
-        &mut self,
+        &self,
         msat: u64,
         _label: Option<&str>,
         desc: Option<&str>,
@@ -94,7 +96,7 @@ impl LightningClient for LndRestClient {
             .to_string())
     }
 
-    async fn get_balance(&mut self) -> Result<Balance> {
+    async fn get_balance(&self) -> Result<Balance> {
         let wallet_url = format!("{}/v1/balance/wallet", self.url);
         let wallet_res: Value = self
             .client
@@ -123,7 +125,7 @@ impl LightningClient for LndRestClient {
         })
     }
 
-    async fn list_invoices(&mut self, limit: Option<usize>) -> Result<Vec<Invoice>> {
+    async fn list_invoices(&self, limit: Option<usize>) -> Result<Vec<Invoice>> {
         let url = format!(
             "{}/v1/invoices?num_max_invoices={}",
             self.url,
@@ -150,14 +152,20 @@ impl LightningClient for LndRestClient {
                         "unpaid".to_string()
                     },
                     bolt11: inv["payment_request"].as_str().map(ToString::to_string),
-                    desc: inv["memo"].as_str().and_then(|s| if s.is_empty() { None } else { Some(s.to_string()) }),
+                    desc: inv["memo"].as_str().and_then(|s| {
+                        if s.is_empty() {
+                            None
+                        } else {
+                            Some(s.to_string())
+                        }
+                    }),
                 });
             }
         }
         Ok(invoices)
     }
 
-    async fn decode_invoice(&mut self, bolt11: &str) -> Result<DecodedInvoice> {
+    async fn decode_invoice(&self, bolt11: &str) -> Result<DecodedInvoice> {
         let payload = json!({ "pay_req": bolt11 });
         let res: Value = self
             .client
@@ -170,7 +178,11 @@ impl LightningClient for LndRestClient {
             .await?;
 
         let num_sat = res["num_satoshis"].as_u64().unwrap_or(0);
-        let amount_msat = if num_sat == 0 { None } else { Some(num_sat * 1000) };
+        let amount_msat = if num_sat == 0 {
+            None
+        } else {
+            Some(num_sat * 1000)
+        };
         let desc = res["description"].as_str().map(ToString::to_string);
         let payee = res["destination"].as_str().map(ToString::to_string);
 
@@ -181,7 +193,7 @@ impl LightningClient for LndRestClient {
         })
     }
 
-    async fn pay_invoice(&mut self, bolt11: &str) -> Result<PaymentResult> {
+    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentResult> {
         let payload = json!({ "payment_request": bolt11 });
         let res: Value = self
             .client
@@ -197,8 +209,13 @@ impl LightningClient for LndRestClient {
             return Err(anyhow!("Payment failed: {}", err));
         }
 
-        let hash = res["payment_hash"].as_str().ok_or_else(|| anyhow!("no payment_hash"))?.to_string();
-        let amount_msat = res["amount_msat"].as_u64().ok_or_else(|| anyhow!("no amount_msat"))?;
+        let hash = res["payment_hash"]
+            .as_str()
+            .ok_or_else(|| anyhow!("no payment_hash"))?
+            .to_string();
+        let amount_msat = res["amount_msat"]
+            .as_u64()
+            .ok_or_else(|| anyhow!("no amount_msat"))?;
         let fee_msat = res["fee_msat"].as_u64();
 
         Ok(PaymentResult {

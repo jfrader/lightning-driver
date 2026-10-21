@@ -17,3 +17,19 @@ actix-web-lab = "0.20"
 argon2 = { workspace = true }
 
 lightning-client = { path = "../lightning-client", features = ["lnd-grpc", "cln"] }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
+chrono = { workspace = true }
+uuid = { workspace = true }
+sha2 = { workspace = true }
+thiserror = { workspace = true }
+rand = "0.8"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+hex = { workspace = true }
+libc = "0.2"
+webauthn-rs = "=0.5.5"
+
+[dev-dependencies]
+tempfile = "3"
+webauthn-authenticator-rs = { version = "=0.5.5", features = ["softpasskey"] }

@@ -8,7 +8,7 @@ pub async fn connect_from_config() -> Result<LightningClientDyn> {
         .build()?
         .try_deserialize::<Settings>()?;
 
-    let driver: Box<dyn LightningClient + Send + Sync> = match settings.node.node_type.as_str() {
+    let driver: Box<dyn LightningClient> = match settings.node.node_type.as_str() {
         "lnd-grpc" => {
             #[cfg(feature = "lnd-grpc")]
             {
@@ -36,13 +36,20 @@ pub async fn connect_from_config() -> Result<LightningClientDyn> {
             )?)
         }
         "cln" => {
-            let cln = settings
-                .cln
-                .ok_or_else(|| anyhow::anyhow!("CLN config missing"))?;
-            Box::new(cln::ClnClient::new(&cln.host))
+            #[cfg(feature = "cln")]
+            {
+                let cln = settings
+                    .cln
+                    .ok_or_else(|| anyhow::anyhow!("CLN config missing"))?;
+                Box::new(cln::ClnClient::new(&cln.host))
+            }
+            #[cfg(not(feature = "cln"))]
+            {
+                return Err(anyhow::anyhow!("cln feature not enabled"));
+            }
         }
         _ => return Err(anyhow::anyhow!("Unsupported node type")),
     };
 
-    Ok(Arc::new(Mutex::new(driver)))
+    Ok(Arc::from(driver))
 }

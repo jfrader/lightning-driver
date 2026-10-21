@@ -1,14 +1,19 @@
 // lightning-client/src/lib.rs
+#[cfg(feature = "cln")]
 pub mod cln;
 pub mod config;
 pub mod factory;
 pub mod lnd_grpc;
 pub mod lnd_rest;
+pub mod model;
+pub mod money;
+pub mod settings;
+pub mod validation;
 
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct NodeInfo {
@@ -46,21 +51,21 @@ pub struct PaymentResult {
 }
 
 #[async_trait]
-pub trait LightningClient {
-    async fn get_info(&mut self) -> Result<NodeInfo>;
+pub trait LightningClient: Send + Sync {
+    async fn get_info(&self) -> Result<NodeInfo>;
     async fn create_invoice(
-        &mut self,
+        &self,
         msat: u64,
         label: Option<&str>,
         desc: Option<&str>,
     ) -> Result<String>;
-    async fn get_balance(&mut self) -> Result<Balance>;
-    async fn list_invoices(&mut self, limit: Option<usize>) -> Result<Vec<Invoice>>;
-    async fn decode_invoice(&mut self, bolt11: &str) -> Result<DecodedInvoice>;
-    async fn pay_invoice(&mut self, bolt11: &str) -> Result<PaymentResult>;
+    async fn get_balance(&self) -> Result<Balance>;
+    async fn list_invoices(&self, limit: Option<usize>) -> Result<Vec<Invoice>>;
+    async fn decode_invoice(&self, bolt11: &str) -> Result<DecodedInvoice>;
+    async fn pay_invoice(&self, bolt11: &str) -> Result<PaymentResult>;
 }
 
-pub type LightningClientDyn = Arc<Mutex<Box<dyn LightningClient + Send + Sync>>>;
+pub type LightningClientDyn = Arc<dyn LightningClient>;
 
 pub use config::Settings;
 pub use factory::connect_from_config;

@@ -157,8 +157,7 @@ async fn get_info(driver: Data<LightningClientDyn>, mut session: Session) -> imp
         return HttpResponse::Unauthorized().json(json!({ "error": "login required" }));
     }
 
-    let mut guard = driver.lock().unwrap();
-    match guard.get_info().await {
+    match driver.get_info().await {
         Ok(info) => HttpResponse::Ok().json(info),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
     }
@@ -174,9 +173,8 @@ async fn create_invoice(
         return HttpResponse::Unauthorized().json(json!({ "error": "login required" }));
     }
 
-    let mut guard = driver.lock().unwrap();
     let desc = payload.desc.as_deref();
-    match guard.create_invoice(payload.msat, None, desc).await {
+    match driver.create_invoice(payload.msat, None, desc).await {
         Ok(bolt11) => HttpResponse::Ok().json(InvoiceResp { bolt11 }),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
     }
@@ -188,8 +186,7 @@ async fn get_balance(driver: Data<LightningClientDyn>, mut session: Session) -> 
         return HttpResponse::Unauthorized().json(json!({ "error": "login required" }));
     }
 
-    let mut guard = driver.lock().unwrap();
-    match guard.get_balance().await {
+    match driver.get_balance().await {
         Ok(balance) => HttpResponse::Ok().json(balance),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
     }
@@ -206,8 +203,7 @@ async fn list_invoices(
     }
 
     let limit = query.limit.unwrap_or(10);
-    let mut guard = driver.lock().unwrap();
-    match guard.list_invoices(Some(limit)).await {
+    match driver.list_invoices(Some(limit)).await {
         Ok(invoices) => HttpResponse::Ok().json(ListInvoicesResp { invoices }),
         Err(e) => HttpResponse::InternalServerError().body(e.to_string()),
     }
@@ -223,8 +219,7 @@ async fn decode_invoice(
         return HttpResponse::Unauthorized().json(json!({ "error": "login required" }));
     }
 
-    let mut guard = driver.lock().unwrap();
-    match guard.decode_invoice(&payload.bolt11).await {
+    match driver.decode_invoice(&payload.bolt11).await {
         Ok(decoded) => HttpResponse::Ok().json(DecodeResp {
             amount_msat: decoded.amount_msat,
             desc: decoded.desc,
@@ -244,8 +239,7 @@ async fn pay_invoice(
         return HttpResponse::Unauthorized().json(json!({ "error": "login required" }));
     }
 
-    let mut guard = driver.lock().unwrap();
-    match guard.pay_invoice(&payload.bolt11).await {
+    match driver.pay_invoice(&payload.bolt11).await {
         Ok(payment) => HttpResponse::Ok().json(PayResp {
             hash: payment.hash,
             amount_msat: payment.amount_msat,
