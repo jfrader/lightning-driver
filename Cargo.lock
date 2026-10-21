@@ -1741,24 +1741,16 @@ dependencies = [
 name = "lightning-client"
 version = "0.1.0"
 dependencies = [
- "anyhow",
- "async-trait",
- "base64 0.21.7",
  "bitcoin",
  "chrono",
  "config",
- "hex",
  "ipnet",
  "libc",
  "lightning-invoice",
- "lnd_grpc_rust",
- "reqwest",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
  "thiserror 2.0.21",
- "tonic",
  "url",
  "uuid",
 ]

@@ -3,26 +3,11 @@ name = "lightning-client"
 version = "0.1.0"
 edition = "2021"
 
-# -----------------------------------------------------------------
-# Workspace deps (non-optional)
-# -----------------------------------------------------------------
 [dependencies]
-anyhow      = { workspace = true }
-async-trait = { workspace = true }
-base64      = { workspace = true }
 config      = { workspace = true }
-hex         = { workspace = true }
-reqwest     = { workspace = true }
 serde       = { workspace = true }
-serde_json  = { workspace = true }
-
-# -----------------------------------------------------------------
-# OPTIONAL deps – declared **locally**, not in workspace
-# -----------------------------------------------------------------
 chrono        = { workspace = true }
-lnd_grpc_rust = { version = "2.11", optional = true }
 uuid = { workspace = true }
-sha2 = { workspace = true }
 thiserror = { workspace = true }
 url = { workspace = true }
 bitcoin = "0.32"
@@ -30,18 +15,6 @@ lightning-invoice = "=0.34.1"
 libc = "0.2"
 ipnet = { version = "2", features = ["serde"] }
 
-# -----------------------------------------------------------------
-# Features
-# -----------------------------------------------------------------
-[features]
-default = []
-lnd-grpc = ["lnd_grpc_rust", "dep:tonic"]
-cln      = []
-
-[dependencies.tonic]
-version = "0.7"
-features = ["tls"]
-optional = true
-
 [dev-dependencies]
+serde_json = { workspace = true }
 tempfile = "3"
