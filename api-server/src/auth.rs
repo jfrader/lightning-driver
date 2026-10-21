@@ -85,6 +85,12 @@ pub struct Context {
     pub last_authenticated_at: Option<DateTime<Utc>>,
 }
 
+impl Context {
+    pub(crate) fn snapshot_owner(&self) -> Uuid {
+        self.id
+    }
+}
+
 pub struct NewContext {
     pub context: Context,
     pub cookie: Zeroizing<String>,

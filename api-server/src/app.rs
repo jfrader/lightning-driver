@@ -25,6 +25,7 @@ pub fn application(
         .service(
             web::scope("/api/v1")
                 .configure(auth_http::configure)
+                .configure(crate::reads::configure)
                 .default_service(web::to(not_found)),
         )
         .default_service(web::to(not_found))

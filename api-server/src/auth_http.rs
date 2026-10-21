@@ -31,6 +31,8 @@ pub struct AuthHttp {
     pub manager: AuthManager,
     pub journal: Journal,
     settings: Arc<ApiSettings>,
+    pub registry: Arc<crate::registry::Registry>,
+    pub snapshots: crate::pagination::Snapshots,
 }
 
 #[derive(Serialize)]
@@ -69,10 +71,16 @@ impl AuthHttp {
             .validate()
             .map_err(|_| ApiError::new(ErrorCode::NotConfigured))?;
         Ok(Self {
+            registry: Arc::new(crate::registry::Registry::default()),
+            snapshots: crate::pagination::Snapshots::new(settings.limits.clone()),
             manager: AuthManager::new(&settings, journal.clone())?,
             journal,
             settings: Arc::new(settings),
         })
+    }
+
+    pub(crate) fn limits(&self) -> &lightning_client::settings::Limits {
+        &self.settings.limits
     }
 
     pub fn headers() -> DefaultHeaders {
