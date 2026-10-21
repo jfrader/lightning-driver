@@ -129,8 +129,8 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
         Runtime::prepare(&settings).await,
         Err(StartupError::Instance)
     ));
-    let identity = runtime.auth.journal.authentication().await.unwrap();
-    let app = test::init_service(application(runtime.auth.clone())).await;
+    let identity = runtime.state.journal.authentication().await.unwrap();
+    let app = test::init_service(application(runtime.state.clone())).await;
     let issued = cli(&fixture.config, "enrollment", false).await;
     let enrollment = token(&issued);
     let connection = Connection::open(fixture.database()).unwrap();
@@ -187,7 +187,7 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
     assert_eq!(session["authenticated"], true);
     assert!(matches!(
         runtime
-            .auth
+            .state
             .journal
             .claim_enrollment(enrollment, Utc::now())
             .await,
@@ -223,7 +223,7 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
     operation.review.operation_id = operation.id;
     operation.review.expires_at = Utc::now() + chrono::Duration::minutes(5);
     runtime
-        .auth
+        .state
         .journal
         .create(
             operation.clone(),
@@ -235,7 +235,7 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
         .unwrap();
     assert!(matches!(
         runtime
-            .auth
+            .state
             .journal
             .claim(
                 operation.id,
@@ -254,24 +254,24 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
         Err(StartupError::Instance)
     ));
     assert_eq!(
-        runtime.auth.journal.get(operation.id).await.unwrap().state,
+        runtime.state.journal.get(operation.id).await.unwrap().state,
         OperationState::Dispatching
     );
-    assert!(runtime.auth.manager.login_available().await.unwrap());
+    assert!(runtime.state.auth.manager.login_available().await.unwrap());
     drop(app);
     drop(runtime);
 
     let runtime = Runtime::prepare(&fixture.settings()).await.unwrap();
     assert_eq!(
-        runtime.auth.journal.authentication().await.unwrap(),
+        runtime.state.journal.authentication().await.unwrap(),
         identity
     );
-    assert!(runtime.auth.manager.login_available().await.unwrap());
+    assert!(runtime.state.auth.manager.login_available().await.unwrap());
     assert_eq!(
-        runtime.auth.journal.get(operation.id).await.unwrap().state,
+        runtime.state.journal.get(operation.id).await.unwrap().state,
         OperationState::Unknown
     );
-    let app = test::init_service(application(runtime.auth.clone())).await;
+    let app = test::init_service(application(runtime.state.clone())).await;
     let response =
         test::call_service(&app, get("/api/v1/session").cookie(old_cookie).to_request()).await;
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
@@ -342,16 +342,16 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
     assert!(refused.stdout.is_empty());
     assert!(String::from_utf8_lossy(&refused.stderr).contains("--confirm-reset-authentication"));
     assert_eq!(
-        runtime.auth.journal.authentication().await.unwrap(),
+        runtime.state.journal.authentication().await.unwrap(),
         identity
     );
-    assert!(runtime.auth.manager.login_available().await.unwrap());
+    assert!(runtime.state.auth.manager.login_available().await.unwrap());
     let recovered = cli(&fixture.config, "recovery", true).await;
     let recovery_token = token(&recovered);
-    let current = runtime.auth.journal.authentication().await.unwrap();
+    let current = runtime.state.journal.authentication().await.unwrap();
     assert_eq!(current.0, identity.0);
     assert_eq!(current.1, identity.1 + 1);
-    assert!(!runtime.auth.manager.login_available().await.unwrap());
+    assert!(!runtime.state.auth.manager.login_available().await.unwrap());
     let response = test::call_service(
         &app,
         get("/api/v1/session").cookie(live_cookie).to_request(),
@@ -363,7 +363,7 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
     assert!(response.response().cookies().next().is_none());
     assert_eq!(
         runtime
-            .auth
+            .state
             .journal
             .claim_enrollment(recovery_token.clone(), Utc::now())
             .await
@@ -372,14 +372,14 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
     );
     assert!(matches!(
         runtime
-            .auth
+            .state
             .journal
             .claim_enrollment(recovery_token, Utc::now())
             .await,
         Err(JournalError::Revoked)
     ));
     assert_eq!(
-        runtime.auth.journal.get(operation.id).await.unwrap().state,
+        runtime.state.journal.get(operation.id).await.unwrap().state,
         OperationState::Unknown
     );
 }
@@ -388,14 +388,8 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
 async fn legacy_routes_and_deferred_resources_cannot_grant_sessions_or_fake_success() {
     let fixture = Fixture::new();
     let runtime = Runtime::prepare(&fixture.settings()).await.unwrap();
-    let app = test::init_service(application(runtime.auth.clone())).await;
-    for path in [
-        "/login",
-        "/api/pay",
-        "/api/invoice",
-        "/api/v1/session",
-        "/api/v1/nodes/lnd-lab/operations",
-    ] {
+    let app = test::init_service(application(runtime.state.clone())).await;
+    for path in ["/login", "/api/pay", "/api/invoice", "/api/v1/session"] {
         let response = test::call_service(
             &app,
             post(path)

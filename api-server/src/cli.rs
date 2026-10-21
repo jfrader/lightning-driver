@@ -1,6 +1,6 @@
 use crate::{
     app::application,
-    runtime::{open_auth, Runtime, StartupError},
+    runtime::{open_auth_store, Runtime, StartupError},
 };
 use actix_web::HttpServer;
 use chrono::Utc;
@@ -72,9 +72,8 @@ pub async fn execute(cli: Cli) -> Result<(), StartupError> {
                 }
             };
             let settings = load(config)?;
-            let auth = open_auth(&settings).await?;
-            let token = auth
-                .journal
+            let journal = open_auth_store(&settings).await?;
+            let token = journal
                 .issue_enrollment(
                     Utc::now(),
                     Duration::from_secs(u64::from(settings.api.limits.preauth_seconds)),
@@ -95,8 +94,8 @@ fn load(config: Config) -> Result<Settings, StartupError> {
 
 async fn serve(settings: Settings) -> Result<(), StartupError> {
     let runtime = Runtime::prepare(&settings).await?;
-    let auth = runtime.auth.clone();
-    let server = HttpServer::new(move || application(auth.clone()))
+    let state = runtime.state.clone();
+    let server = HttpServer::new(move || application(state.clone()))
         .workers(HTTP_WORKERS)
         .bind(settings.api.bind)
         .map_err(|_| StartupError::Listener)?;

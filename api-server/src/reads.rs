@@ -1,7 +1,7 @@
 use crate::{
-    auth_http::AuthHttp,
     error::ApiError,
     pagination::{Paged, Query, Rows, Selector},
+    state::ApplicationState,
 };
 use actix_web::{web, HttpRequest, HttpResponse};
 use chrono::Utc;
@@ -21,14 +21,19 @@ pub fn configure(config: &mut web::ServiceConfig) {
         .route("/nodes/{node_id}/status", web::get().to(status))
         .route("/nodes/{node_id}/policy", web::get().to(policy))
         .route("/nodes/{node_id}/decode", web::post().to(decode))
-        .route("/nodes/{node_id}/operations", web::get().to(operations))
+        .service(
+            web::resource("/nodes/{node_id}/operations")
+                .route(web::get().to(operations))
+                .route(web::post().to(crate::operations::http::create))
+                .default_service(web::to(crate::app::not_found)),
+        )
         .route(
             "/nodes/{node_id}/operations/{operation_id}",
             web::get().to(operation),
         );
 }
 
-fn node_id(request: &HttpRequest) -> Result<String, ApiError> {
+pub(crate) fn node_id(request: &HttpRequest) -> Result<String, ApiError> {
     let id = request.match_info().get("node_id").ok_or_else(invalid)?;
     if id.is_empty()
         || id.len() > 64
@@ -44,7 +49,7 @@ fn node_id(request: &HttpRequest) -> Result<String, ApiError> {
 fn invalid() -> ApiError {
     ApiError::new(ErrorCode::InvalidRequest)
 }
-fn no_query(request: &HttpRequest) -> Result<(), ApiError> {
+pub(crate) fn no_query(request: &HttpRequest) -> Result<(), ApiError> {
     if request.query_string().is_empty() {
         Ok(())
     } else {
@@ -64,8 +69,11 @@ fn response(page: Paged, max_bytes: usize) -> Result<HttpResponse, ApiError> {
         .body(bytes))
 }
 
-async fn nodes(request: HttpRequest, auth: web::Data<AuthHttp>) -> Result<HttpResponse, ApiError> {
-    let context = auth.context(&request, true, false).await?;
+async fn nodes(
+    request: HttpRequest,
+    auth: web::Data<ApplicationState>,
+) -> Result<HttpResponse, ApiError> {
+    let context = auth.auth.context(&request, true, false).await?;
     let query = Query::parse(
         request.query_string(),
         &["limit", "cursor", "network"],
@@ -109,7 +117,7 @@ async fn nodes(request: HttpRequest, auth: web::Data<AuthHttp>) -> Result<HttpRe
 }
 async fn summary(
     request: &HttpRequest,
-    auth: &AuthHttp,
+    auth: &ApplicationState,
 ) -> Result<lightning_client::model::NodeSummary, ApiError> {
     no_query(request)?;
     let id = node_id(request)?;
@@ -123,16 +131,25 @@ async fn summary(
         counts.get(&id).copied().unwrap_or(Decimal::ZERO),
     ))
 }
-async fn node(request: HttpRequest, auth: web::Data<AuthHttp>) -> Result<HttpResponse, ApiError> {
-    auth.context(&request, true, false).await?;
+async fn node(
+    request: HttpRequest,
+    auth: web::Data<ApplicationState>,
+) -> Result<HttpResponse, ApiError> {
+    auth.auth.context(&request, true, false).await?;
     Ok(HttpResponse::Ok().json(summary(&request, &auth).await?))
 }
-async fn status(request: HttpRequest, auth: web::Data<AuthHttp>) -> Result<HttpResponse, ApiError> {
-    auth.context(&request, true, false).await?;
+async fn status(
+    request: HttpRequest,
+    auth: web::Data<ApplicationState>,
+) -> Result<HttpResponse, ApiError> {
+    auth.auth.context(&request, true, false).await?;
     Ok(HttpResponse::Ok().json(summary(&request, &auth).await?.status))
 }
-async fn policy(request: HttpRequest, auth: web::Data<AuthHttp>) -> Result<HttpResponse, ApiError> {
-    auth.context(&request, true, false).await?;
+async fn policy(
+    request: HttpRequest,
+    auth: web::Data<ApplicationState>,
+) -> Result<HttpResponse, ApiError> {
+    auth.auth.context(&request, true, false).await?;
     no_query(&request)?;
     let id = node_id(&request)?;
     let entry = auth
@@ -143,9 +160,9 @@ async fn policy(request: HttpRequest, auth: web::Data<AuthHttp>) -> Result<HttpR
 }
 async fn operations(
     request: HttpRequest,
-    auth: web::Data<AuthHttp>,
+    auth: web::Data<ApplicationState>,
 ) -> Result<HttpResponse, ApiError> {
-    let context = auth.context(&request, true, false).await?;
+    let context = auth.auth.context(&request, true, false).await?;
     let id = node_id(&request)?;
     let query = Query::parse(
         request.query_string(),
@@ -228,9 +245,9 @@ async fn operations(
 }
 async fn operation(
     request: HttpRequest,
-    auth: web::Data<AuthHttp>,
+    auth: web::Data<ApplicationState>,
 ) -> Result<HttpResponse, ApiError> {
-    auth.context(&request, true, false).await?;
+    let context = auth.auth.context(&request, true, false).await?;
     no_query(&request)?;
     let node = node_id(&request)?;
     let text = request
@@ -241,10 +258,7 @@ async fn operation(
     if id.to_string() != text {
         return Err(invalid());
     }
-    let operation = auth.journal.get(id).await?;
-    if operation.node_id != node {
-        return Err(ApiError::new(ErrorCode::NotFound));
-    }
+    let operation = auth.engine.observe(&context, &node, id).await?;
     Ok(HttpResponse::Ok().json(operation))
 }
 
@@ -255,10 +269,10 @@ struct Decode {
 }
 async fn decode(
     request: HttpRequest,
-    auth: web::Data<AuthHttp>,
+    auth: web::Data<ApplicationState>,
     body: web::Json<Decode>,
 ) -> Result<HttpResponse, ApiError> {
-    auth.context(&request, true, true).await?;
+    auth.auth.context(&request, true, true).await?;
     no_query(&request)?;
     let id = node_id(&request)?;
     let entry = auth
