@@ -1,11 +1,11 @@
 use crate::journal::{expire_reviews, Journal, JournalError};
 use chrono::{DateTime, Utc};
 use lightning_client::{
-    model::{Network, NodeBinding, Operation, VerifiedNetwork},
+    model::{Network, Operation},
     money::Decimal,
 };
-use rusqlite::{functions::FunctionFlags, params, Connection, TransactionBehavior};
-use sha2::{Digest, Sha256};
+use rusqlite::{functions::FunctionFlags, Connection, TransactionBehavior};
+use sha2::Digest;
 use std::collections::BTreeMap;
 
 pub struct HistoryScope {
@@ -29,8 +29,7 @@ impl Journal {
                 let mut statement = tx.prepare(
                     "SELECT node_id,COUNT(*)
                      FROM operations
-                     WHERE json_extract(body,'$.state') IN
-                       ('awaiting_confirmation','dispatching','pending','unknown')
+                     WHERE terminal=0
                      GROUP BY node_id",
                 )?;
                 let mut rows = statement.query([])?;
@@ -72,32 +71,64 @@ impl Journal {
         kind: Option<String>,
         max: usize,
     ) -> Result<HistoryObservation, JournalError> {
+        self.history_observation_bounded(node, state, kind, max, usize::MAX)
+            .await
+    }
+
+    pub async fn history_observation_bounded(
+        &self,
+        node: String,
+        state: Option<String>,
+        kind: Option<String>,
+        max: usize,
+        max_record_bytes: usize,
+    ) -> Result<HistoryObservation, JournalError> {
         self.run(move |connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             expire_reviews(&tx, Utc::now())?;
             let scope = scope(&tx, &node)?;
             let mut operations = Vec::new();
-            {
-                let mut statement = tx.prepare(
-                    "SELECT body FROM operations WHERE node_id=?1
-                     AND (?2 IS NULL OR json_extract(body,'$.state')=?2 OR
-                       (?2='nonterminal' AND json_extract(body,'$.state') IN
-                        ('awaiting_confirmation','dispatching','pending','unknown')))
-                     AND (?3 IS NULL OR json_extract(body,'$.request.kind')=?3)
-                     ORDER BY creation_seconds(json_extract(body,'$.created_at')) DESC,
-                       creation_nanos(json_extract(body,'$.created_at')) DESC,id ASC LIMIT ?4",
-                )?;
+            let truncated = {
+                let mut sql = "SELECT body FROM operations WHERE node_id=?1".to_string();
+                let mut values = vec![rusqlite::types::Value::Text(node)];
+                if let Some(state) = state {
+                    if state == "nonterminal" {
+                        sql.push_str(" AND terminal=0");
+                    } else {
+                        values.push(state.into());
+                        sql.push_str(&format!(" AND state=?{}", values.len()));
+                    }
+                }
+                if let Some(kind) = kind {
+                    values.push(kind.into());
+                    sql.push_str(&format!(" AND kind=?{}", values.len()));
+                }
                 let limit = i64::try_from(max.checked_add(1).ok_or(JournalError::Storage)?)
                     .map_err(|_| JournalError::Storage)?;
-                let rows = statement.query_map(params![node, state, kind, limit], |row| {
-                    row.get::<_, String>(0)
-                })?;
-                for row in rows {
-                    operations.push(serde_json::from_str(&row?)?);
+                values.push(limit.into());
+                sql.push_str(&format!(
+                    " ORDER BY created_at_ns DESC,id ASC LIMIT ?{}",
+                    values.len()
+                ));
+                let mut statement = tx.prepare(&sql)?;
+                let mut rows = statement.query(rusqlite::params_from_iter(values))?;
+                let mut truncated = false;
+                while let Some(row) = rows.next()? {
+                    if operations.len() == max {
+                        truncated = true;
+                        break;
+                    }
+                    let body = row
+                        .get_ref(0)?
+                        .as_str()
+                        .map_err(|_| JournalError::Storage)?;
+                    if body.len() > max_record_bytes {
+                        return Err(JournalError::ResponseTooLarge);
+                    }
+                    operations.push(serde_json::from_str(body)?);
                 }
-            }
-            let truncated = operations.len() > max;
-            operations.truncate(max);
+                truncated
+            };
             tx.commit()?;
             Ok(HistoryObservation {
                 scope,
@@ -110,35 +141,26 @@ impl Journal {
 }
 
 fn scope(connection: &Connection, node: &str) -> Result<HistoryScope, JournalError> {
-    let mut statement = connection.prepare(
-        "SELECT DISTINCT json_extract(body,'$.review.node') FROM operations
-         WHERE node_id=?1 ORDER BY json_extract(body,'$.review.node')",
-    )?;
-    let mut rows = statement.query([node])?;
-    let mut hash = Sha256::new();
-    let mut network = Network::Unknown;
-    let mut exists = false;
-    while let Some(row) = rows.next()? {
-        let binding: String = row.get(0)?;
-        let binding: NodeBinding = serde_json::from_str(&binding)?;
-        network = if exists {
-            Network::Unknown
-        } else {
-            match binding.network {
-                VerifiedNetwork::Mainnet => Network::Mainnet,
-                VerifiedNetwork::Testnet => Network::Testnet,
-                VerifiedNetwork::Signet => Network::Signet,
-                VerifiedNetwork::Regtest => Network::Regtest,
-            }
-        };
-        hash.update(serde_json::to_vec(&binding)?);
-        exists = true;
+    use rusqlite::OptionalExtension;
+    let stored: Option<(String, String)> = connection
+        .query_row(
+            "SELECT revision,network FROM history_scope WHERE node_id=?1",
+            [node],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    match stored {
+        Some((revision, network)) => Ok(HistoryScope {
+            exists: true,
+            revision,
+            network: serde_json::from_value(serde_json::Value::String(network))?,
+        }),
+        None => Ok(HistoryScope {
+            exists: false,
+            revision: hex::encode(sha2::Sha256::digest([])),
+            network: Network::Unknown,
+        }),
     }
-    Ok(HistoryScope {
-        exists,
-        revision: hex::encode(hash.finalize()),
-        network,
-    })
 }
 
 pub(crate) fn register_time_functions(connection: &Connection) -> Result<(), JournalError> {

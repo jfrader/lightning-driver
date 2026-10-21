@@ -141,6 +141,7 @@ impl From<JournalError> for ApiError {
             JournalError::NotReviewable => (ErrorCode::OperationNotReviewable, None),
             JournalError::ReviewExpired => (ErrorCode::ReviewExpired, None),
             JournalError::Revoked => (ErrorCode::SessionRequired, None),
+            JournalError::ResponseTooLarge => (ErrorCode::InternalError, None),
             JournalError::Storage | JournalError::Secret => (ErrorCode::StorageUnavailable, None),
         };
         Self {

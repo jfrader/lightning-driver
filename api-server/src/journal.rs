@@ -44,6 +44,8 @@ pub enum JournalError {
     Storage,
     #[error("Pending invoice secret cannot be authenticated")]
     Secret,
+    #[error("Response exceeds the configured byte limit")]
+    ResponseTooLarge,
 }
 
 impl From<rusqlite::Error> for JournalError {
@@ -181,14 +183,8 @@ impl Journal {
             workers: Arc::new(tokio::sync::Semaphore::new(SQLITE_WORKERS)),
         };
         journal.run(|connection| {
-            connection.execute_batch("PRAGMA journal_mode=WAL;
-                CREATE TABLE IF NOT EXISTS auth_meta (singleton INTEGER PRIMARY KEY CHECK(singleton=1), operator_id TEXT NOT NULL, generation INTEGER NOT NULL CHECK(typeof(generation)='integer' AND generation>=0));
-                CREATE TABLE IF NOT EXISTS credentials (credential_id TEXT PRIMARY KEY, passkey TEXT NOT NULL);
-                CREATE TABLE IF NOT EXISTS enrollment (token_hash BLOB PRIMARY KEY, generation INTEGER NOT NULL, expires_at INTEGER NOT NULL);
-                CREATE TABLE IF NOT EXISTS operations (id TEXT PRIMARY KEY, node_id TEXT NOT NULL, request_key TEXT NOT NULL, request_digest BLOB NOT NULL, body TEXT NOT NULL, dispatched INTEGER NOT NULL DEFAULT 0, UNIQUE(node_id,request_key));
-                CREATE TABLE IF NOT EXISTS resource_claims (node_id TEXT NOT NULL, resource TEXT NOT NULL, operation_id TEXT NOT NULL REFERENCES operations(id), PRIMARY KEY(node_id,resource));
-                CREATE TABLE IF NOT EXISTS pending_invoice_secrets (operation_id TEXT PRIMARY KEY REFERENCES operations(id), ciphertext BLOB NOT NULL);
-                CREATE INDEX IF NOT EXISTS operations_node ON operations(node_id);")?;
+            crate::migrations::migrate(connection)?;
+            connection.execute_batch("PRAGMA journal_mode=WAL;")?;
             connection.execute("INSERT OR IGNORE INTO auth_meta(singleton,operator_id,generation) VALUES(1,?1,0)",[Uuid::new_v4().to_string()])?;
             Ok(())
         }).await?;
@@ -211,6 +207,7 @@ impl Journal {
             let mut connection = Connection::open(path.as_path())?;
             connection.busy_timeout(Duration::from_secs(SQLITE_BUSY_SECONDS))?;
             connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
+            crate::migrations::register_functions(&connection)?;
             action(&mut connection)
         })
         .await
@@ -445,7 +442,8 @@ impl Journal {
     pub async fn recover(&self, now: DateTime<Utc>) -> Result<(), JournalError> {
         self.run(move |connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let mut statement = tx.prepare("SELECT body FROM operations WHERE dispatched=1")?;
+            let mut statement =
+                tx.prepare("SELECT body FROM operations WHERE dispatched=1 AND terminal=0")?;
             let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
             let mut recovering = Vec::new();
             for row in rows {
@@ -468,7 +466,9 @@ impl Journal {
             for operation in recovering {
                 save(&tx, &operation)?;
             }
-            expire_reviews(&tx, DateTime::<Utc>::MAX_UTC)?;
+            // Restart expires every undispatched review, including future-dated ones.
+            // The cutoff is MAX_UTC; the transition timestamp is the captured startup now.
+            expire_reviews_before(&tx, DateTime::<Utc>::MAX_UTC, now)?;
             tx.commit()?;
             Ok(())
         })
@@ -511,12 +511,20 @@ pub(crate) fn expire_reviews(
     connection: &Connection,
     now: DateTime<Utc>,
 ) -> Result<(), JournalError> {
+    expire_reviews_before(connection, now, now)
+}
+
+fn expire_reviews_before(
+    connection: &Connection,
+    cutoff: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Result<(), JournalError> {
     crate::history::register_time_functions(connection)?;
     connection.execute(
         "UPDATE operations
          SET body=json_set(body,'$.state','expired','$.updated_at',?1)
          WHERE dispatched=0
-           AND json_extract(body,'$.state')='awaiting_confirmation'
+           AND state='awaiting_confirmation'
            AND (
              creation_seconds(json_extract(body,'$.review.expires_at'))<?2
              OR (
@@ -525,9 +533,9 @@ pub(crate) fn expire_reviews(
              )
            )",
         params![
-            Utc::now().to_rfc3339(),
-            now.timestamp(),
-            i64::from(now.timestamp_subsec_nanos()),
+            now.to_rfc3339(),
+            cutoff.timestamp(),
+            i64::from(cutoff.timestamp_subsec_nanos()),
         ],
     )?;
     for table in ["resource_claims", "pending_invoice_secrets"] {
@@ -535,7 +543,7 @@ pub(crate) fn expire_reviews(
             "DELETE FROM {table}
              WHERE operation_id IN (
                SELECT id FROM operations
-               WHERE dispatched=0 AND json_extract(body,'$.state')='expired'
+               WHERE dispatched=0 AND state='expired'
              )"
         );
         connection.execute(&statement, [])?;
@@ -841,6 +849,57 @@ mod tests {
         assert!(
             matches!(journal.create(operation(),Uuid::new_v4(),vec![Resource::Wallet],None).await,Err(JournalError::ResourceBusy(id)) if id==original.id)
         );
+    }
+
+    #[tokio::test]
+    async fn transitions_keep_metadata_atomic_and_startup_cutoff_separate_from_timestamp() {
+        let (_directory, journal) = store().await;
+        let original = operation();
+        let undispatched = operation();
+        for operation in [&original, &undispatched] {
+            journal
+                .create(operation.clone(), Uuid::new_v4(), vec![], None)
+                .await
+                .unwrap();
+        }
+        let now = Utc::now();
+        journal
+            .claim(
+                original.id,
+                original.node_id.clone(),
+                original.review.digest.clone(),
+                original.review.policy_revision.clone(),
+                journal.authentication().await.unwrap().1,
+                now,
+            )
+            .await
+            .unwrap();
+        journal.recover(now).await.unwrap();
+        assert_eq!(journal.get(original.id).await.unwrap().updated_at, now);
+        let expired = journal.get(undispatched.id).await.unwrap();
+        assert_eq!(expired.state, OperationState::Expired);
+        assert_eq!(expired.updated_at, now);
+        journal
+            .record(
+                original.id,
+                OperationState::Succeeded,
+                OperationStage::Settled,
+                None,
+                None,
+                now,
+            )
+            .await
+            .unwrap();
+        journal.run(|connection| {
+            let mismatches: i64 = connection.query_row("SELECT count(*) FROM operations WHERE created_at_ns!=timestamp_ns(json_extract(body,'$.created_at')) OR updated_at_ns!=timestamp_ns(json_extract(body,'$.updated_at')) OR state!=json_extract(body,'$.state') OR kind!=json_extract(body,'$.request.kind') OR terminal!=(state IN ('succeeded','failed','expired')) OR sensitivity!=json_extract(body,'$.review.sensitive')", [], |row| row.get(0))?;
+            assert_eq!(mismatches, 0);
+            let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute("UPDATE operations SET body=json_set(body,'$.state','pending')", [])?;
+            assert_eq!(tx.query_row("SELECT count(*) FROM operations WHERE terminal=0 AND state='pending'", [], |row| row.get::<_, i64>(0))?, 2);
+            tx.rollback()?;
+            assert_eq!(connection.query_row("SELECT count(*) FROM operations WHERE terminal=1", [], |row| row.get::<_, i64>(0))?, 2);
+            Ok(())
+        }).await.unwrap();
     }
 
     #[test]
