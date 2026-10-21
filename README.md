@@ -1,6 +1,6 @@
 # Lightning node-manager backend
 
-This workspace runs the **passkey API, configured-node registry, durable operation journal, the operation engine with its create/authorize/confirm routes, local invoice decoding, and typed CLN REST, LND REST and LND gRPC adapters**. Live collection read routes (`balances`, `invoices`, `payments`, `peers`, `channels`, `transactions`, `fee-estimates`, `info`) and frontend asset serving are still pending, so those paths return JSON 404. Adapters are proven against the loopback synthetic harness only; no real daemon has been contacted, and nothing here is a real-node or production readiness claim.
+This workspace runs the **passkey and Nostr authentication API, configured-node registry, durable operation journal, the operation engine with its create/authorize/confirm routes, local invoice decoding, and typed CLN REST, LND REST and LND gRPC adapters**, plus the live collection read routes (`balances`, `invoices`, `payments`, `peers`, `channels`, `transactions`, `fee-estimates`, `info`). Frontend asset serving is still pending, so `/` returns JSON 404. Adapters are proven against the loopback synthetic harness only; no real daemon has been contacted, and nothing here is a real-node or production readiness claim.
 
 The versioned wire contract is [`api-server/openapi.json`](api-server/openapi.json). The frozen contract includes later-stage endpoints; their presence in that file is not an implementation claim.
 
@@ -59,7 +59,7 @@ Issue an enrollment token from a trusted host terminal:
 CARGO_BUILD_JOBS=2 cargo run --quiet -p api-server -- auth enrollment --config /tmp/opencode/lightning-auth-stage1/config.toml
 ```
 
-The command prints one random token once on stdout. It expires after `api.limits.preauth_seconds` (default 300 seconds), is hash-only at rest and is consumed when enrollment starts. Do not place it in a URL, command argument, log or persisted browser storage. Issue a new token if enrollment fails or is abandoned.
+The command prints one random token once on stdout. It expires after `api.limits.preauth_seconds` (default 300 seconds) and is hash-only at rest. A passkey enrollment consumes it when the ceremony starts; a Nostr enrollment consumes it only when the signature verifies, so a canceled or failed signature leaves the token usable until its expiry. Do not place it in a URL, command argument, log or persisted browser storage. Issue a new token if the passkey ceremony fails or is abandoned.
 
 Browser enrollment sequence:
 
@@ -68,7 +68,16 @@ Browser enrollment sequence:
 3. Pass the returned `options.publicKey` JSON to a compatible WebAuthn browser helper; POST its registration response with `challenge_id` to `/api/v1/auth/enrollment/finish`.
 4. Keep only the returned authenticated CSRF/expiry view in memory. The app session is an opaque HttpOnly cookie.
 
-Issue another host enrollment token to register an independent backup authenticator for the same operator. Enrollment does not create a second account or revoke existing authenticators. Login uses `/api/v1/auth/passkey/start` and `/finish` with a fresh anonymous bootstrap context. All ceremony state is held server-side, bounded, expiring and single-use, including failed verification attempts.
+Nostr enrollment uses the same host token and a NIP-07 signer:
+
+1. GET `/api/v1/auth/bootstrap` for the preauthentication cookie, CSRF token and expiry.
+2. POST `/api/v1/auth/nostr/start` with `{ "purpose": "enrollment", "token": "..." }`; the response carries a 120-second challenge and the exact event template.
+3. Sign the template with the NIP-07 extension (`window.nostr.signEvent`) and POST the returned event with `challenge_id` to `/api/v1/auth/nostr/finish`.
+4. The server verifies the NIP-01 id, BIP-340 signature, exact URL/method/purpose/challenge tags and a ±120-second `created_at`, then consumes the token and issues the session. A failed signature does not consume the token.
+
+Nostr login is `/api/v1/auth/nostr/start` with `{ "purpose": "login" }` and the same finish route. Link and unlink use the authenticated session and the same pair with `{ "purpose": "link" }` or `{ "purpose": "unlink", "pubkey": "..." }`; unlinking requires a fresh signature from the identity being removed and refuses to remove the last credential. Sensitive operation step-up uses `/nodes/{node_id}/operations/{operation_id}/authorize/nostr` and `/finish`, binding the event to the operation id and immutable review digest. The server never signs a Nostr event.
+
+Issue another host enrollment token to register an independent backup authenticator for the same operator. Enrollment does not create a second account or revoke existing authenticators. Passkey login uses `/api/v1/auth/passkey/start` and `/finish`; Nostr login uses `/api/v1/auth/nostr/start` with `{ "purpose": "login" }` and `/auth/nostr/finish`, both with a fresh anonymous bootstrap context. All ceremony state is held server-side, bounded, expiring and single-use, including failed verification attempts.
 
 Lost-all-authenticator recovery is host-only and requires explicit confirmation:
 
@@ -78,13 +87,14 @@ CARGO_BUILD_JOBS=2 cargo run --quiet -p api-server -- auth recovery \
   --confirm-reset-authentication
 ```
 
-Without the confirmation flag, the command refuses without modifying storage. Confirmed recovery atomically revokes all registered passkeys and previous enrollment tokens, advances the durable authentication generation, and prints one new enrollment token. Running sessions/ceremonies cannot authenticate after that generation changes. Re-enroll using the normal sequence. The operator ID, operation history, unresolved claims and encrypted pending-invoice records are not deleted by authentication recovery.
+Without the confirmation flag, the command refuses without modifying storage. Confirmed recovery atomically revokes all registered passkeys and Nostr identities, previous enrollment tokens and outstanding challenges, advances the durable authentication generation, and prints one new enrollment token. Running sessions/ceremonies cannot authenticate after that generation changes. Re-enroll using the normal sequence. The operator ID, operation history, unresolved claims and encrypted pending-invoice records are not deleted by authentication recovery.
 
-Stopping/restarting the API preserves passkeys and SQLite operation history but loses ephemeral sessions/grants. Startup marks potentially dispatched unfinished operations unknown and expires undispatched reviews; it never submits or retries a node action. There is no password fallback, legacy `/login`, `/logout`, money-moving `/api` route or supported `set-password` utility.
+Stopping/restarting the API preserves passkeys, Nostr identities and SQLite operation history but loses ephemeral sessions/grants. Startup marks potentially dispatched unfinished operations unknown and expires undispatched reviews; it never submits or retries a node action. There is no password fallback, legacy `/login`, `/logout`, money-moving `/api` route or supported `set-password` utility.
 
 ## Session and policy endpoints
 
-- GET `/api/v1/session` returns the current CSRF token, idle/absolute expiries, last authentication time and server reauthentication policy; unauthenticated access returns 401.
+- GET `/api/v1/session` returns the current CSRF token, idle/absolute expiries, last authentication time, the method that signed in (`passkey` or `nostr`), the Nostr pubkey when applicable and the server reauthentication policy; unauthenticated access returns 401.
+- GET `/api/v1/auth/nostr/identities` returns the enrolled Nostr identities (`pubkey`, `npub`, timestamps) and the passkey count to an authenticated session.
 - DELETE `/api/v1/session` requires exact Origin and the session's `X-CSRF-Token`, revokes that session and returns an empty 204 response.
 - GET `/api/v1/config` requires authentication and returns safe runtime policy only. It contains no database paths, node endpoints, certificates, macaroons, runes or other credential material.
 - JSON requests use `Content-Type: application/json`; responses/errors use `Cache-Control: no-store`. Bootstrap is reachable without an authenticated CSRF token. All POSTs use the preauth/session-bound token as appropriate; login is not a CSRF exemption.
