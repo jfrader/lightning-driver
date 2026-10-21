@@ -26,18 +26,21 @@ pub struct Selector {
 pub enum Rows {
     Nodes(Vec<NodeSummary>),
     Operations(Vec<Operation>),
+    Collection(Vec<serde_json::Value>),
 }
 impl Rows {
     fn len(&self) -> usize {
         match self {
             Self::Nodes(rows) => rows.len(),
             Self::Operations(rows) => rows.len(),
+            Self::Collection(rows) => rows.len(),
         }
     }
     fn bytes(&self) -> Result<usize, ApiError> {
         match self {
             Self::Nodes(rows) => serialized_size(rows, usize::MAX),
             Self::Operations(rows) => serialized_size(rows, usize::MAX),
+            Self::Collection(rows) => serialized_size(rows, usize::MAX),
         }
     }
 }
@@ -49,6 +52,7 @@ struct Snapshot {
     observed: DateTime<Utc>,
     expires: DateTime<Utc>,
     truncated: bool,
+    stale: bool,
     tokens: Vec<String>,
     bytes: usize,
 }
@@ -64,6 +68,14 @@ pub struct Snapshots {
 pub enum Paged {
     Nodes(Page<NodeSummary>),
     Operations(Page<Operation>),
+    Collection(Page<serde_json::Value>),
+}
+
+pub(crate) struct Observation {
+    pub network: Option<Network>,
+    pub at: DateTime<Utc>,
+    pub stale: bool,
+    pub truncated: bool,
 }
 
 struct ByteLimit<W> {
@@ -123,6 +135,27 @@ impl Snapshots {
         truncated: bool,
         now: DateTime<Utc>,
     ) -> Result<Paged, ApiError> {
+        self.begin_observed(
+            context,
+            selector,
+            rows,
+            Observation {
+                network,
+                at: now,
+                stale: false,
+                truncated,
+            },
+            now,
+        )
+    }
+    pub(crate) fn begin_observed(
+        &self,
+        context: &Context,
+        selector: Selector,
+        rows: Rows,
+        observation: Observation,
+        now: DateTime<Utc>,
+    ) -> Result<Paged, ApiError> {
         if selector.limit == 0
             || selector.limit > self.limits.pagination.max_limit
             || rows.len() > self.limits.pagination.snapshot_max_items
@@ -162,14 +195,15 @@ impl Snapshots {
             owner: context.snapshot_owner(),
             selector,
             rows,
-            network,
-            observed: now,
+            network: observation.network,
+            observed: observation.at,
             expires: (now
                 + chrono::Duration::seconds(i64::from(
                     self.limits.pagination.snapshot_ttl_seconds,
                 )))
             .min(context.expires_at),
-            truncated,
+            truncated: observation.truncated,
+            stale: observation.stale,
             tokens,
             bytes,
         };
@@ -225,6 +259,9 @@ impl Snapshot {
             Rows::Operations(rows) => self
                 .materialize(&rows[start..end], next_cursor, max_bytes)
                 .map(Paged::Operations),
+            Rows::Collection(rows) => self
+                .materialize(&rows[start..end], next_cursor, max_bytes)
+                .map(Paged::Collection),
         }
     }
 
@@ -251,7 +288,7 @@ impl Snapshot {
             network: self.network,
             next_cursor: &next_cursor,
             observed_at: self.observed,
-            stale: false,
+            stale: self.stale,
             truncated: self.truncated,
             items,
         };
@@ -261,7 +298,7 @@ impl Snapshot {
             network: self.network,
             next_cursor,
             observed_at: self.observed,
-            stale: false,
+            stale: self.stale,
             truncated: self.truncated,
             items: items.to_vec(),
         })
@@ -330,6 +367,7 @@ mod tests {
             observed: Utc::now(),
             expires: Utc::now(),
             truncated: false,
+            stale: false,
             tokens: vec![],
             bytes: 0,
         }

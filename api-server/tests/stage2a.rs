@@ -285,7 +285,11 @@ async fn sanitized_sorted_registry_snapshot_filters_and_strict_queries() {
         }
         if schema == "NodeSummary" {
             assert_eq!(value["unresolved_operation_count"], "1");
-            assert_eq!(value["capabilities"]["pay_invoice"]["reason"], "unverified");
+            assert_eq!(
+                value["capabilities"]["pay_invoice"]["reason"],
+                "not_configured"
+            );
+            assert_eq!(value["status"]["status"], "config_error");
         }
     }
     let mut empty = auth.clone();

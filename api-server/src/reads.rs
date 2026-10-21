@@ -19,6 +19,8 @@ pub fn configure(config: &mut web::ServiceConfig) {
         .route("/nodes", web::get().to(nodes))
         .route("/nodes/{node_id}", web::get().to(node))
         .route("/nodes/{node_id}/status", web::get().to(status))
+        .route("/nodes/{node_id}/info", web::get().to(info))
+        .route("/nodes/{node_id}/{collection:balances|invoices|payments|peers|channels|transactions|fee-estimates}", web::get().to(collection))
         .route("/nodes/{node_id}/policy", web::get().to(policy))
         .route("/nodes/{node_id}/decode", web::post().to(decode))
         .service(
@@ -63,6 +65,7 @@ fn response(page: Paged, max_bytes: usize) -> Result<HttpResponse, ApiError> {
     let bytes = match page {
         Paged::Nodes(page) => crate::pagination::bounded_json(&page, max_bytes)?,
         Paged::Operations(page) => crate::pagination::bounded_json(&page, max_bytes)?,
+        Paged::Collection(page) => crate::pagination::bounded_json(&page, max_bytes)?,
     };
     Ok(HttpResponse::Ok()
         .content_type("application/json")
@@ -125,6 +128,7 @@ async fn summary(
         .registry
         .get(&id)
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound))?;
+    auth.refresh_node(&id).await?;
     let counts = auth.journal.unresolved_counts().await?;
     Ok(entry.summary(
         Utc::now(),
@@ -157,6 +161,135 @@ async fn policy(
         .get(&id)
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound))?;
     Ok(HttpResponse::Ok().json(&entry.policy))
+}
+
+async fn info(
+    request: HttpRequest,
+    auth: web::Data<ApplicationState>,
+) -> Result<HttpResponse, ApiError> {
+    auth.auth.context(&request, true, false).await?;
+    let node = summary(&request, &auth).await?;
+    let entry = auth
+        .registry
+        .get(&node.id)
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound))?;
+    let observation = entry
+        .observation
+        .lock()
+        .map_err(|_| ApiError::new(ErrorCode::InternalError))?;
+    let (info, _) = observation
+        .as_ref()
+        .ok_or_else(|| ApiError::new(ErrorCode::NodeOffline))?;
+    let value = lightning_client::model::NodeInfo {
+        observed_at: info
+            .status
+            .observed_at
+            .ok_or_else(|| ApiError::new(ErrorCode::InternalError))?,
+        stale: node.status.stale,
+        node,
+        alias: info.alias.clone(),
+        version: info.version.clone(),
+    };
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(crate::pagination::bounded_json(
+            &value,
+            auth.limits().max_response_bytes,
+        )?))
+}
+
+async fn collection(
+    request: HttpRequest,
+    auth: web::Data<ApplicationState>,
+) -> Result<HttpResponse, ApiError> {
+    use crate::operations::ReadQuery;
+    use lightning_client::model::{ChannelState, InvoiceState, PaymentState};
+    let context = auth.auth.context(&request, true, false).await?;
+    let id = node_id(&request)?;
+    let entry = auth
+        .registry
+        .get(&id)
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound))?;
+    let (resource, read, filter) = match request.match_info().get("collection") {
+        Some("balances") => ("balances", ReadQuery::Balances, None),
+        Some("fee-estimates") => ("fee-estimates", ReadQuery::Fees, None),
+        Some("invoices") => ("invoices", ReadQuery::Invoices, Some("status")),
+        Some("payments") => ("payments", ReadQuery::Payments, Some("status")),
+        Some("peers") => ("peers", ReadQuery::Peers, None),
+        Some("channels") => ("channels", ReadQuery::Channels, Some("state")),
+        Some("transactions") => ("transactions", ReadQuery::Transactions, None),
+        _ => return Err(ApiError::new(ErrorCode::NotFound)),
+    };
+    if matches!(resource, "balances" | "fee-estimates") {
+        no_query(&request)?;
+        let observed = auth.observed(&id, resource, read).await?;
+        let mut value = observed.value;
+        value["stale"] = observed.stale.into();
+        return Ok(HttpResponse::Ok().content_type("application/json").body(
+            crate::pagination::bounded_json(&value, auth.limits().max_response_bytes)?,
+        ));
+    }
+    let allowed = if let Some(filter) = filter {
+        vec!["limit", "cursor", filter]
+    } else {
+        vec!["limit", "cursor"]
+    };
+    let query = Query::parse(request.query_string(), &allowed, auth.limits())?;
+    let state = query.filters.first().map(|(_, value)| value.clone());
+    if let Some(value) = &state {
+        match resource {
+            "invoices" => {
+                enum_value::<InvoiceState>(value)?;
+            }
+            "payments" => {
+                enum_value::<PaymentState>(value)?;
+            }
+            "channels" => {
+                enum_value::<ChannelState>(value)?;
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    let selector = Selector {
+        resource,
+        node: Some(id.clone()),
+        scope: entry.binding_revision.clone(),
+        filters: query.filters,
+        limit: query.limit,
+    };
+    if let Some(cursor) = query.cursor {
+        return response(
+            auth.snapshots
+                .next(&context, &selector, &cursor, Utc::now())?,
+            auth.limits().max_response_bytes,
+        );
+    }
+    let observed = auth.observed(&id, resource, read).await?;
+    let mut rows = observed
+        .value
+        .as_array()
+        .ok_or_else(|| ApiError::new(ErrorCode::InternalError))?
+        .clone();
+    if let Some(state) = state {
+        rows.retain(|row| row["state"].as_str() == Some(&state));
+    }
+    let truncated = observed.truncated || rows.len() > auth.limits().pagination.snapshot_max_items;
+    rows.truncate(auth.limits().pagination.snapshot_max_items);
+    response(
+        auth.snapshots.begin_observed(
+            &context,
+            selector,
+            Rows::Collection(rows),
+            crate::pagination::Observation {
+                network: Some(entry.observed_network()),
+                at: observed.at,
+                stale: observed.stale,
+                truncated,
+            },
+            Utc::now(),
+        )?,
+        auth.limits().max_response_bytes,
+    )
 }
 async fn operations(
     request: HttpRequest,

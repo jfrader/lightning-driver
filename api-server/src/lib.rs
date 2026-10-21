@@ -5,6 +5,7 @@ pub mod cli;
 pub mod error;
 pub mod history;
 pub mod journal;
+mod live;
 mod migrations;
 mod operations;
 pub mod pagination;

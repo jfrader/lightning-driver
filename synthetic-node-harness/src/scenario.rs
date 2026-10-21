@@ -45,6 +45,48 @@ pub struct Scenario {
 }
 
 impl Scenario {
+    /// Populate read-only journeys without invoking a mutation as a probe.
+    pub fn seed_collections(&mut self) {
+        let lnd: Value = serde_json::from_str(include_str!(
+            "../../api-server/tests/fixtures/lnd-v0.18.5-beta/synthetic.json"
+        ))
+        .expect("tagged LND fixture");
+        let cln: Value = serde_json::from_str(include_str!(
+            "../../api-server/tests/fixtures/cln-v25.02/synthetic.json"
+        ))
+        .expect("tagged CLN fixture");
+        self.invoice = Some(lnd["invoices"]["invoices"][0].clone());
+        let bolt11 = self.payment_invoice();
+        let hash = sha256::Hash::hash(&[self.seed; 32]);
+        if let Some(invoice) = &mut self.invoice {
+            invoice["r_hash"] = serde_json::json!(STANDARD.encode(hash.to_byte_array()));
+            invoice["payment_request"] = serde_json::json!(bolt11);
+        }
+        self.payment = Some(lnd["payments"]["payments"][0].clone());
+        self.lnd["transactions"] = lnd["transactions"].clone();
+        self.cln["listpays"] = cln["listpays"].clone();
+        self.lnd["info"]["synced_to_graph"] = serde_json::json!(true);
+        let mut invoice = cln["listinvoices"]["invoices"][0].clone();
+        invoice["bolt11"] = serde_json::json!(bolt11);
+        invoice["payment_hash"] = serde_json::json!(hash.to_string());
+        // The scenario serves one daemon family; its invoice storage follows that family.
+        self.cln["listinvoices"] = serde_json::json!({"invoices":[invoice]});
+    }
+    pub fn set_identity(&mut self, pubkey: &str, network: &str) {
+        self.lnd["info"]["identity_pubkey"] = serde_json::json!(pubkey);
+        self.lnd["info"]["chains"][0]["network"] = serde_json::json!(network);
+        self.cln["getinfo"]["id"] = serde_json::json!(pubkey);
+        self.cln["getinfo"]["network"] = serde_json::json!(network);
+    }
+    pub fn set_syncing(&mut self, syncing: bool) {
+        self.lnd["info"]["synced_to_chain"] = serde_json::json!(!syncing);
+        self.lnd["info"]["synced_to_graph"] = serde_json::json!(!syncing);
+        if syncing {
+            self.cln["getinfo"]["warning_bitcoind_sync"] = serde_json::json!("Synthetic syncing");
+        } else if let Some(info) = self.cln["getinfo"].as_object_mut() {
+            info.remove("warning_bitcoind_sync");
+        }
+    }
     pub fn new(seed: u8, now: DateTime<Utc>) -> Self {
         let mut lnd: Value = serde_json::from_str(include_str!(
             "../../api-server/tests/fixtures/lnd-v0.18.5-beta/synthetic.json"
@@ -193,7 +235,15 @@ impl Scenario {
                 row.clone()
             }
             "listinvoices" => {
-                json!({"invoices":self.invoice.iter().filter(|r| p.get("label").is_none_or(|v|v == &r["label"])).cloned().collect::<Vec<_>>()})
+                if self.cln["listinvoices"]["invoices"]
+                    .as_array()
+                    .is_some_and(|rows| !rows.is_empty())
+                    && p.get("label").is_none()
+                {
+                    self.cln["listinvoices"].clone()
+                } else {
+                    json!({"invoices":self.invoice.iter().filter(|r| p.get("label").is_none_or(|v|v == &r["label"])).cloned().collect::<Vec<_>>()})
+                }
             }
             "ListPayments" => json!({"payments":self.payment.iter().cloned().collect::<Vec<_>>()}),
             "listpays" => self.cln["listpays"].clone(),

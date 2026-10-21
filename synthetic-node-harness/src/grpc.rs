@@ -83,7 +83,18 @@ fn invoice(v: &Value) -> Option<ln::Invoice> {
         r_hash: b(v, "r_hash")?,
         value_msat: i(v, "value_msat")?,
         amt_paid_msat: i(v, "amt_paid_msat")?,
-        state: 0,
+        state: match s(v, "state")? {
+            "OPEN" => 0,
+            "SETTLED" => 1,
+            "CANCELED" => 2,
+            "ACCEPTED" => 3,
+            _ => return None,
+        },
+        settle_date: v
+            .get("settle_date")
+            .and_then(Value::as_str)
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0),
         creation_date: i(v, "creation_date")?,
         expiry: i(v, "expiry")?,
         payment_request: s(v, "payment_request")?.into(),
@@ -98,7 +109,14 @@ fn payment(v: &Value) -> Option<ln::Payment> {
         fee_msat: i(v, "fee_msat")?,
         creation_time_ns: i(v, "creation_time_ns")?,
         payment_index: u(v, "payment_index")?,
-        status: if v["status"] == "SUCCEEDED" { 2 } else { 1 },
+        status: match s(v, "status")? {
+            "UNKNOWN" => 0,
+            "IN_FLIGHT" => 1,
+            "SUCCEEDED" => 2,
+            "FAILED" => 3,
+            "INITIATED" => 4,
+            _ => return None,
+        },
         ..Default::default()
     })
 }
@@ -110,11 +128,12 @@ pub(crate) fn encode(method: &str, v: &Value) -> Option<Vec<u8>> {
             alias: s(v, "alias")?.into(),
             version: s(v, "version")?.into(),
             chains: vec![ln::Chain {
-                network: "regtest".into(),
+                network: s(&v["chains"][0], "network")?.into(),
                 ..Default::default()
             }],
-            synced_to_chain: true,
-            block_height: 100,
+            synced_to_chain: v["synced_to_chain"].as_bool()?,
+            synced_to_graph: v["synced_to_graph"].as_bool()?,
+            block_height: v["block_height"].as_u64()?.try_into().ok()?,
             ..Default::default()
         }),
         "WalletBalance" => frame(ln::WalletBalanceResponse {
