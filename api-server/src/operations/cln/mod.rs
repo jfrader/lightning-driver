@@ -189,10 +189,10 @@ impl ClnAdapter {
                 if let Some(channel) = channels.items.iter().find(|c| {
                     c.id == p.channel_id || c.funding_outpoint.as_ref() == Some(&p.channel_id)
                 }) {
-                    facts.close_target = channel
-                        .funding_outpoint
-                        .clone()
-                        .or_else(|| Some(channel.id.clone()));
+                    // `close` takes a peer id, short channel id or channel id; a funding
+                    // outpoint such as `txid:0` is rejected with -32602. `Channel::id` is
+                    // the CLN channel id when the node reports one.
+                    facts.close_target = Some(channel.id.clone());
                     facts.close_peer = Some(channel.peer_pubkey.clone());
                 }
             }

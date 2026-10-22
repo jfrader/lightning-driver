@@ -98,10 +98,7 @@ async fn reconciliation_unknown_interval_budget_and_restart_never_redispatch() {
 #[test]
 fn reconciliation_backoff_doubles_saturates_and_reports_lifetime_horizon() {
     let intervals: Vec<_> = (1..=10).map(reconciliation_interval_seconds).collect();
-    assert_eq!(
-        intervals,
-        [5, 10, 20, 40, 80, 160, 320, 640, 1280, 1800]
-    );
+    assert_eq!(intervals, [5, 10, 20, 40, 80, 160, 320, 640, 1280, 1800]);
     assert_eq!(reconciliation_interval_seconds(u32::MAX), 1800);
     let horizon: i64 = (1..RECONCILIATION_LIFETIME_ATTEMPTS)
         .map(reconciliation_interval_seconds)

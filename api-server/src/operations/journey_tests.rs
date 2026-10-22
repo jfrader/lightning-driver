@@ -233,6 +233,11 @@ async fn journey(backend: Backend, kind: OperationKind) {
     }
     if kind == OperationKind::CloseChannel && backend == Backend::ClnRest {
         assert_eq!(args["unilateraltimeout"], 0);
+        // CLN `close` rejects an outpoint; the durable target is the channel id.
+        assert_eq!(
+            args["id"],
+            "2222222222222222222222222222222222222222222222222222222222222222"
+        );
     }
     if kind == OperationKind::CloseChannel && backend == Backend::LndGrpc {
         assert_eq!(args["force"], false);
