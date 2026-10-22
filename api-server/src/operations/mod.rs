@@ -36,7 +36,7 @@ type Result<T> = std::result::Result<T, EngineError>;
 type ResponseFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const RECONCILIATION_LIFETIME_ATTEMPTS: u32 = 96;
-const RECONCILIATION_BASE_INTERVAL_SECONDS: i64 = 30;
+const RECONCILIATION_BASE_INTERVAL_SECONDS: i64 = 5;
 const RECONCILIATION_MAX_INTERVAL_SECONDS: i64 = 30 * 60;
 
 fn reconciliation_interval_seconds(attempts: u32) -> i64 {

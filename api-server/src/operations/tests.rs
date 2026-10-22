@@ -100,7 +100,7 @@ fn reconciliation_backoff_doubles_saturates_and_reports_lifetime_horizon() {
     let intervals: Vec<_> = (1..=10).map(reconciliation_interval_seconds).collect();
     assert_eq!(
         intervals,
-        [30, 60, 120, 240, 480, 960, 1800, 1800, 1800, 1800]
+        [5, 10, 20, 40, 80, 160, 320, 640, 1280, 1800]
     );
     assert_eq!(reconciliation_interval_seconds(u32::MAX), 1800);
     let horizon: i64 = (1..RECONCILIATION_LIFETIME_ATTEMPTS)
@@ -108,7 +108,7 @@ fn reconciliation_backoff_doubles_saturates_and_reports_lifetime_horizon() {
         .sum();
     let capped_horizon =
         i64::from(RECONCILIATION_LIFETIME_ATTEMPTS - 1) * RECONCILIATION_MAX_INTERVAL_SECONDS;
-    assert_eq!(horizon, 162090);
+    assert_eq!(horizon, 157355);
     assert_eq!(capped_horizon, 171000);
     eprintln!("96 attempts: first-to-last earliest reservation = {horizon}s; at the 30-minute cap = {capped_horizon}s (95 intervals)");
 }
@@ -161,7 +161,7 @@ async fn reconciliation_stored_next_attempt_gates_status_and_list_at_nanosecond_
     assert_eq!(reconciliation.attempts, 2);
     assert_eq!(
         reconciliation.next_attempt_at,
-        Some(next + chrono::Duration::seconds(60))
+        Some(next + chrono::Duration::seconds(10))
     );
     assert_eq!(f.fake.counts(), (1, 2));
 }
