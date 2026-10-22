@@ -9,6 +9,11 @@ use lightning_client::money::{Decimal, Msat};
 use serde_json::{json, Value};
 use transport::{Rpc, Transport};
 
+enum ObservedFacts {
+    Positive(Facts),
+    Rejected(Rejection),
+}
+
 // Only the operation engine can obtain this adapter or construct its claim permit.
 pub(super) struct ClnAdapter {
     transport: Transport,
@@ -267,11 +272,14 @@ impl ClnAdapter {
             .observe_facts(&evidence, close_type, &close_txids)
             .await
         {
-            Ok(Some(facts)) => {
+            Ok(Some(ObservedFacts::Positive(facts))) => {
                 evidence.class = Class::Positive;
                 evidence.facts = Some(facts);
             }
             Ok(None) => {}
+            Ok(Some(ObservedFacts::Rejected(rejection))) => {
+                evidence.class = Class::Rejected(rejection);
+            }
             Err(_) => evidence.class = Class::Lost,
         }
         evidence
@@ -282,7 +290,7 @@ impl ClnAdapter {
         evidence: &Evidence,
         close_type: Option<CloseType>,
         close_txids: &[String],
-    ) -> Result<Option<Facts>> {
+    ) -> Result<Option<ObservedFacts>> {
         let r = &evidence.reference;
         match evidence.kind {
             OperationKind::CreateInvoice => {
@@ -299,10 +307,10 @@ impl ClnAdapter {
                     return Ok(None);
                 }
                 let bolt11 = reads::text(&rows[0], "bolt11")?.to_string();
-                Ok(Some(Facts::Invoice {
+                Ok(Some(ObservedFacts::Positive(Facts::Invoice {
                     payment_hash: hash,
                     bolt11,
-                }))
+                })))
             }
             OperationKind::PayInvoice => {
                 let Some(hash) = &r.payment_hash else {
@@ -333,11 +341,11 @@ impl ClnAdapter {
                 if connected != (evidence.kind == OperationKind::ConnectPeer) {
                     return Ok(None);
                 }
-                Ok(Some(Facts::Peer {
+                Ok(Some(ObservedFacts::Positive(Facts::Peer {
                     pubkey: peer.clone(),
                     connected,
                     complete: true,
-                }))
+                })))
             }
             OperationKind::OpenChannel | OperationKind::CloseChannel => {
                 let Some(reference) = &r.channel else {
@@ -353,13 +361,39 @@ impl ClnAdapter {
                 else {
                     return Ok(None);
                 };
+                // Only an exact, forgotten closed channel whose funding was
+                // explicitly withheld proves an abandoned open. Absence, age,
+                // ONCHAIN alone, and close_cause alone cannot exclude a prior
+                // successful opening. Older CLN versions without this fact stay
+                // unknown. Never infer failure from a peer/capacity match.
+                if evidence.kind == OperationKind::OpenChannel
+                    && channel.state == ChannelState::Closed
+                    && reads::array(&closed, "closedchannels")?.iter().any(|row| {
+                        let exact_id = row.get("channel_id").and_then(Value::as_str)
+                            == Some(reference.as_str());
+                        let exact_outpoint = row
+                            .get("funding_txid")
+                            .and_then(Value::as_str)
+                            .zip(row.get("funding_outnum").and_then(Value::as_u64))
+                            .is_some_and(|(txid, outnum)| format!("{txid}:{outnum}") == *reference);
+                        (exact_id || exact_outpoint)
+                            && row.get("funding_withheld").and_then(Value::as_bool) == Some(true)
+                    })
+                {
+                    return Ok(Some(ObservedFacts::Rejected(Rejection::Refused)));
+                }
                 if evidence.kind == OperationKind::OpenChannel {
-                    Ok(Some(Facts::Open {
+                    if channel.state != ChannelState::Active
+                        && channel.state != ChannelState::Opening
+                    {
+                        return Ok(None);
+                    }
+                    Ok(Some(ObservedFacts::Positive(Facts::Open {
                         channel_id: Some(channel.id.clone()),
                         funding_outpoint: channel.funding_outpoint.clone(),
                         active: channel.state == ChannelState::Active,
                         published: true,
-                    }))
+                    })))
                 } else {
                     // A prior mutual response does not rule out later unilateral
                     // negotiation failure. Only the same closing transaction in
@@ -373,7 +407,7 @@ impl ClnAdapter {
                                 .and_then(Value::as_str)
                                 .is_some_and(|txid| close_txids.iter().any(|known| known == txid))
                     });
-                    Ok(Some(Facts::Close {
+                    Ok(Some(ObservedFacts::Positive(Facts::Close {
                         channel: reference.clone(),
                         close_type: if linked {
                             close_type.unwrap_or(CloseType::Unknown)
@@ -384,7 +418,7 @@ impl ClnAdapter {
                         confirmations: None,
                         closed: channel.state == ChannelState::Closed,
                         published: false,
-                    }))
+                    })))
                 }
             }
             // CLN transactions cannot prove the reviewed wallet-net send semantics;

@@ -595,6 +595,28 @@ pub enum OperationResult {
     },
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Reconciliation {
+    pub attempts: u32,
+    pub last_attempt_at: Option<Timestamp>,
+    pub last_outcome: Option<ReconciliationOutcome>,
+    pub exhausted: bool,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReconciliationOutcome {
+    InFlight,
+    Positive,
+    Rejected,
+    Withheld,
+    NotFound,
+    Invalid,
+    Pruned,
+    Conflict,
+    PaidElsewhere,
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Operation {
     pub id: Uuid,
@@ -609,6 +631,8 @@ pub struct Operation {
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub last_reconciled_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reconciliation: Option<Reconciliation>,
 }
 
 impl Operation {

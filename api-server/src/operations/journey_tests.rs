@@ -160,7 +160,7 @@ fn method(backend: Backend, kind: OperationKind) -> &'static str {
     }
 }
 async fn journey(backend: Backend, kind: OperationKind) {
-    let f = Journey::new(backend, false).await;
+    let mut f = Journey::new(backend, false).await;
     let mut browser = login(&f.state, None).await;
     let (status, op) = f.create(&browser, kind).await;
     assert_eq!(status, StatusCode::CREATED, "{backend:?} {kind:?}: {op}");
@@ -192,11 +192,14 @@ async fn journey(backend: Backend, kind: OperationKind) {
     if kind == OperationKind::OpenChannel {
         assert_eq!(result["state"], "pending");
     }
+    let clock = Arc::new(TestClock(Mutex::new(Utc::now())));
+    f.state.engine.clock = clock.clone();
     for _ in 0..4 {
         if result["state"] == "succeeded" {
             break;
         }
         result = f.observe(&browser, &op).await;
+        clock.advance(RECONCILIATION_INTERVAL_SECONDS);
     }
     assert_eq!(
         result["state"], "succeeded",

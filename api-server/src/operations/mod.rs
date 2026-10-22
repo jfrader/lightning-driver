@@ -35,6 +35,11 @@ use uuid::Uuid;
 type Result<T> = std::result::Result<T, EngineError>;
 type ResponseFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+const RECONCILIATION_ATTEMPTS: u32 = 12;
+const RECONCILIATION_INTERVAL_SECONDS: i64 = 30;
+const LIST_RECONCILIATION_CAP: usize = 2;
+const LIST_RECONCILIATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug)]
 pub(crate) struct EngineError {
     code: ErrorCode,
@@ -513,12 +518,40 @@ impl Engine {
             return Ok(operation);
         }
         let Some(query) = storage::observation_query(self, id, &pinned.config).await? else {
-            return Ok(operation);
+            return storage::status(self, context, node, id).await;
         };
         let evidence = pinned.adapter.observe_exact(query).await;
         storage::apply(self, id, evidence, true)
             .await
             .map_err(|e| e.claimed(id))
+    }
+
+    pub(crate) async fn observe_list(&self, context: &Context, node: &str) -> Result<()> {
+        self.live(context).await?;
+        let Ok(pinned) = self.pinned(node) else {
+            return Ok(());
+        };
+        let ids = storage::observation_candidates(self, &pinned.config).await?;
+        // Sequential, node-scoped work with a total deadline; each adapter also
+        // enforces its transport deadline. Cancellation never refunds an attempt.
+        if let Ok(result) = tokio::time::timeout(LIST_RECONCILIATION_DEADLINE, async {
+            for id in ids {
+                match self.observe(context, node, id).await {
+                    // Unverifiable node evidence cannot make durable history
+                    // unavailable or release its claims.
+                    Err(error) if error.code == ErrorCode::UpstreamInvalidResponse => {}
+                    result => {
+                        result?;
+                    }
+                }
+            }
+            Ok::<_, EngineError>(())
+        })
+        .await
+        {
+            result?;
+        }
+        Ok(())
     }
 }
 

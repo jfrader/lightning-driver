@@ -10,6 +10,135 @@ use tokio::{
 };
 
 const FIXTURE: &str = include_str!("../../../tests/fixtures/cln-v25.02/synthetic.json");
+
+#[tokio::test]
+async fn rejected_read_rpc_is_not_definite_open_failure() {
+    let config = config();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let endpoint = format!("http://{}/", listener.local_addr().unwrap())
+        .parse()
+        .unwrap();
+    let task = tokio::spawn(async move {
+        for (status, body) in [
+            (201, fixture()["getinfo"].clone()),
+            (
+                500,
+                json!({"code":-32602,"message":"synthetic read rejection"}),
+            ),
+        ] {
+            let (stream, _) = listener.accept().await.unwrap();
+            serve_stream(
+                stream,
+                status,
+                serde_json::to_vec(&body).unwrap(),
+                None,
+                false,
+            )
+            .await;
+        }
+    });
+    let evidence = adapter(
+        Transport::synthetic(endpoint, &Limits::default()),
+        config.clone(),
+    )
+    .observe_exact(query(
+        OperationKind::OpenChannel,
+        &config,
+        RecoveryReference {
+            channel: Some("ab".repeat(32)),
+            ..Default::default()
+        },
+    ))
+    .await;
+    assert!(matches!(evidence.class, Class::Lost));
+    task.await.unwrap();
+}
+
+#[tokio::test]
+async fn open_failure_requires_exact_closed_withheld_funding_not_absence_or_onchain() {
+    let config = config();
+    let reference = "ab".repeat(32);
+    for (channel, withheld, rejected) in [
+        (reference.clone(), true, true),
+        (reference.clone(), false, false),
+        ("cd".repeat(32), true, false),
+    ] {
+        let (transport, task) = scripted(
+            vec![
+                fixture()["getinfo"].clone(),
+                json!({"channels":[]}),
+                json!({"closedchannels":[{"channel_id":channel,"peer_id":peer(),"funding_withheld":withheld}]}),
+            ],
+            &Limits::default(),
+        )
+        .await;
+        let evidence = adapter(transport, config.clone())
+            .observe_exact(query(
+                OperationKind::OpenChannel,
+                &config,
+                RecoveryReference {
+                    channel: Some(reference.clone()),
+                    ..Default::default()
+                },
+            ))
+            .await;
+        assert_eq!(
+            matches!(evidence.class, Class::Rejected(Rejection::Refused)),
+            rejected
+        );
+        let captured = task.await.unwrap();
+        assert_eq!(captured.len(), 3);
+        for (request, method) in
+            captured
+                .iter()
+                .zip(["getinfo", "listpeerchannels", "listclosedchannels"])
+        {
+            assert!(request["headers"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("POST /v1/{method} ")));
+        }
+    }
+    for open in [
+        json!({"channels":[]}),
+        json!({"channels":[{"channel_id":reference,"peer_id":peer(),"state":"ONCHAIN"}]}),
+    ] {
+        let (transport, task) = scripted(
+            vec![
+                fixture()["getinfo"].clone(),
+                open,
+                json!({"closedchannels":[]}),
+            ],
+            &Limits::default(),
+        )
+        .await;
+        let evidence = adapter(transport, config.clone())
+            .observe_exact(query(
+                OperationKind::OpenChannel,
+                &config,
+                RecoveryReference {
+                    channel: Some(reference.clone()),
+                    ..Default::default()
+                },
+            ))
+            .await;
+        assert!(matches!(evidence.class, Class::NotFound));
+        task.await.unwrap();
+    }
+    let (transport, task) = server(503, json!({})).await;
+    let evidence = adapter(transport, config.clone())
+        .observe_exact(query(
+            OperationKind::OpenChannel,
+            &config,
+            RecoveryReference {
+                channel: Some(reference),
+                ..Default::default()
+            },
+        ))
+        .await;
+    assert!(matches!(evidence.class, Class::Lost));
+    task.await.unwrap();
+}
 fn fixture() -> Value {
     serde_json::from_str(FIXTURE).unwrap()
 }

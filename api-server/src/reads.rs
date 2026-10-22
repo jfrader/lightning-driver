@@ -322,6 +322,7 @@ async fn operations(
     let (scope, rows, truncated) = if query.cursor.is_some() {
         (auth.journal.history_scope(id.clone()).await?, None, false)
     } else {
+        auth.engine.observe_list(&context, &id).await?;
         let observation = auth
             .journal
             .history_observation_bounded(

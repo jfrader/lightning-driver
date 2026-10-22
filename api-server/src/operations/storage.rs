@@ -539,6 +539,7 @@ pub(super) async fn observation_query(
     config: &NodeConfig,
 ) -> Result<Option<ObservationQuery>> {
     let config = config.clone();
+    let now = engine.clock.now();
     job(engine,move |connection| {
         let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if !dispatched(&tx,id)? {return Ok(None);}
@@ -548,12 +549,60 @@ pub(super) async fn observation_query(
         let intent:ReviewedIntent=serde_json::from_str(&intent)?;
         if config.binding!=operation.review.node || config.generation!=intent.connection_generation {return Ok(None);}
         let knowledge:String=tx.query_row("SELECT evidence FROM operation_intents WHERE operation_id=?1",[id.to_string()],|row|row.get(0))?;
-        let knowledge:Knowledge=serde_json::from_str(&knowledge)?;
+        let mut knowledge:Knowledge=serde_json::from_str(&knowledge)?;
+        if knowledge.reconciliation.attempts >= RECONCILIATION_ATTEMPTS
+            || knowledge.reconciliation.last_attempt_at.is_some_and(|last| now.signed_duration_since(last) < chrono::Duration::seconds(RECONCILIATION_INTERVAL_SECONDS)) {
+            return Ok(None);
+        }
+        knowledge.reconciliation.attempts += 1;
+        knowledge.reconciliation.last_attempt_at = Some(now);
+        knowledge.reconciliation.last_outcome = Some(ReconciliationOutcome::InFlight);
+        knowledge.reconciliation.exhausted = knowledge.reconciliation.attempts >= RECONCILIATION_ATTEMPTS;
+        let mut projected = operation.clone();
+        projected.reconciliation = Some(knowledge.reconciliation.clone());
+        save(&tx, &projected)?;
         let sequence=sequence.checked_add(1).ok_or_else(||failure(ErrorCode::InternalError))?;
         tx.execute("UPDATE operation_intents SET next_sequence=?1 WHERE operation_id=?2",params![sequence,id.to_string()])?;
+        tx.execute("UPDATE operation_intents SET evidence=?1 WHERE operation_id=?2",params![serde_json::to_string(&knowledge)?,id.to_string()])?;
         tx.commit()?;
         let (close_type,close_txids)=match operation.result {Some(OperationResult::CloseChannel{close_type,txids,..})=>(Some(close_type),txids),_=>(None,vec![])};
         Ok(Some(ObservationQuery{request:operation.request.clone(),operation_id:id,binding:operation.review.node,generation:config.generation,kind:operation.request.kind(),claim_id:Uuid::parse_str(&claim).map_err(|_|failure(ErrorCode::StorageUnavailable))?,sequence,reference:knowledge.reference,close_type,close_txids}))
+    }).await
+}
+
+pub(super) async fn observation_candidates(
+    engine: &Engine,
+    config: &NodeConfig,
+) -> Result<Vec<Uuid>> {
+    let config = config.clone();
+    let now = engine.clock.now();
+    job(engine, move |connection| {
+        let mut statement = connection.prepare(
+            "SELECT o.id FROM operations o
+             JOIN operation_intents i ON i.operation_id=o.id
+             WHERE o.node_id=?1 AND o.dispatched=1 AND o.terminal=0
+               AND COALESCE(json_extract(i.evidence,'$.reconciliation.attempts'),0) < ?2
+               AND (json_extract(i.evidence,'$.reconciliation.last_attempt_at') IS NULL
+                    OR julianday(json_extract(i.evidence,'$.reconciliation.last_attempt_at')) <= julianday(?3))
+               AND json_extract(o.body,'$.review.node')=json(?4)
+               AND json_extract(i.intent,'$.connection_generation')=?5
+             ORDER BY json_extract(i.evidence,'$.reconciliation.last_attempt_at') ASC,o.id ASC
+             LIMIT ?6"
+        )?;
+        let mut rows = statement.query(params![
+            config.binding.node_id,
+            RECONCILIATION_ATTEMPTS,
+            (now-chrono::Duration::seconds(RECONCILIATION_INTERVAL_SECONDS)).to_rfc3339(),
+            serde_json::to_string(&config.binding)?,
+            config.generation.to_string(),
+            i64::try_from(LIST_RECONCILIATION_CAP).map_err(|_| failure(ErrorCode::InternalError))?,
+        ])?;
+        let mut ids = Vec::new();
+        while let Some(row) = rows.next()? {
+            let id: String = row.get(0)?;
+            ids.push(Uuid::parse_str(&id).map_err(|_| failure(ErrorCode::StorageUnavailable))?);
+        }
+        Ok(ids)
     }).await
 }
 

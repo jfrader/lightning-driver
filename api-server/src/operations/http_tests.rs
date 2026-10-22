@@ -297,6 +297,57 @@ async fn create(f: &HttpFixture, browser: &Browser, kind: OperationKind, key: Uu
     assert_eq!(status, StatusCode::CREATED, "{operation}");
     operation
 }
+
+#[actix_web::test]
+async fn one_list_request_observes_only_the_node_cap_and_cursor_never_observes() {
+    let f = HttpFixture::new().await;
+    let browser = login(&f.state, None).await;
+    *f.fake.execute.lock().unwrap() = Script::Lost;
+    for index in 0..LIST_RECONCILIATION_CAP + 2 {
+        let mut input = request(OperationKind::CreateInvoice, Utc::now());
+        if let OperationRequest::CreateInvoice(params) = &mut input {
+            params.description = format!("list invoice {index}");
+        }
+        let (status, op, _) = call(
+            &f.state,
+            authenticated(post("/api/v1/nodes/synthetic/operations"), &browser)
+                .insert_header(("Idempotency-Key", Uuid::new_v4().to_string()))
+                .set_json(input),
+            "Operation",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{op}");
+        confirm(&f.state, &browser, &op, Value::Null).await;
+    }
+    let (status, page, _) = call(
+        &f.state,
+        authenticated(get("/api/v1/nodes/synthetic/operations?limit=1"), &browser),
+        "OperationsPage",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        f.fake.counts(),
+        (LIST_RECONCILIATION_CAP + 2, LIST_RECONCILIATION_CAP)
+    );
+    let cursor = page["next_cursor"].as_str().unwrap();
+    let url = url::Url::parse_with_params(
+        "https://manager.example.invalid/api/v1/nodes/synthetic/operations",
+        [("limit", "1"), ("cursor", cursor)],
+    )
+    .unwrap();
+    let (status, page, _) = call(
+        &f.state,
+        authenticated(
+            get(&format!("{}?{}", url.path(), url.query().unwrap())),
+            &browser,
+        ),
+        "OperationsPage",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(f.fake.counts().1, LIST_RECONCILIATION_CAP);
+}
 async fn grant(state: &ApplicationState, browser: &mut Browser, operation: &Value) -> Value {
     let digest = &operation["review"]["digest"];
     let (status, start, _) = call(

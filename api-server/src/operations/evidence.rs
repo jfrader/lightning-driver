@@ -102,6 +102,8 @@ pub(super) struct Knowledge {
     pub accepted: bool,
     pub published: bool,
     pub conflict: bool,
+    #[serde(default)]
+    pub reconciliation: Reconciliation,
 }
 impl Knowledge {
     pub fn new(intent: &ReviewedIntent) -> Self {
@@ -112,6 +114,7 @@ impl Knowledge {
             accepted: false,
             published: false,
             conflict: false,
+            reconciliation: Reconciliation::default(),
         }
     }
 }
@@ -277,6 +280,16 @@ pub(super) fn transition(
     }
     let reference = merge_reference(&knowledge.reference, &evidence.reference, !read || preknown)?;
     let original = serde_json::to_value(&operation)?;
+    let outcome = match &evidence.class {
+        Class::Positive => ReconciliationOutcome::Positive,
+        Class::Rejected(_) => ReconciliationOutcome::Rejected,
+        Class::Lost => ReconciliationOutcome::Withheld,
+        Class::NotFound => ReconciliationOutcome::NotFound,
+        Class::Partial => ReconciliationOutcome::Invalid,
+        Class::Pruned => ReconciliationOutcome::Pruned,
+        Class::Conflict => ReconciliationOutcome::Conflict,
+        Class::PaidElsewhere => ReconciliationOutcome::PaidElsewhere,
+    };
     let terminal = operation.state.terminal();
     let mut paid_hash = None;
     let mut release = false;
@@ -384,6 +397,10 @@ pub(super) fn transition(
     }
     knowledge.reference = reference;
     knowledge.sequence = knowledge.sequence.max(evidence.sequence);
+    if read && evidence.sequence == allocated_sequence {
+        knowledge.reconciliation.last_outcome = Some(outcome);
+        operation.reconciliation = Some(knowledge.reconciliation.clone());
+    }
     // Compare before changing timestamps; last_reconciled tracks reads, not RPC responses.
     if serde_json::to_value(&operation)? != original {
         operation.updated_at = now;
