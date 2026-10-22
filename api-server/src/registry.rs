@@ -95,7 +95,7 @@ impl Registry {
 }
 
 fn binding(node: &NodeSettings) -> Result<String, serde_json::Error> {
-    fingerprint(&(
+    let ca_binding = fingerprint(&(
         "binding-v1",
         &node.id,
         node.backend,
@@ -104,7 +104,13 @@ fn binding(node: &NodeSettings) -> Result<String, serde_json::Error> {
         &node.endpoint,
         &node.certificate_file,
         &node.credential_file,
-    ))
+    ))?;
+    match node.tls_verification {
+        lightning_client::settings::TlsVerification::Ca => Ok(ca_binding),
+        lightning_client::settings::TlsVerification::Pinned => {
+            fingerprint(&(ca_binding, node.tls_verification))
+        }
+    }
 }
 
 impl Entry {

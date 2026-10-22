@@ -2,6 +2,7 @@ mod grpc;
 mod reads;
 #[cfg(test)]
 mod tests;
+mod tls;
 mod transport;
 
 use super::*;

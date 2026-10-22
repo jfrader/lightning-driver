@@ -688,6 +688,7 @@ fn settings(directory: &std::path::Path, endpoint: url::Url) -> NodeSettings {
         backend: Backend::ClnRest,
         endpoint,
         certificate_file: cert,
+        tls_verification: lightning_client::settings::TlsVerification::Ca,
         credential_file: rune,
         expected_pubkey: peer(),
         network: Network::Regtest,
