@@ -550,14 +550,20 @@ pub(super) async fn observation_query(
         if config.binding!=operation.review.node || config.generation!=intent.connection_generation {return Ok(None);}
         let knowledge:String=tx.query_row("SELECT evidence FROM operation_intents WHERE operation_id=?1",[id.to_string()],|row|row.get(0))?;
         let mut knowledge:Knowledge=serde_json::from_str(&knowledge)?;
-        if knowledge.reconciliation.attempts >= RECONCILIATION_ATTEMPTS
-            || knowledge.reconciliation.last_attempt_at.is_some_and(|last| now.signed_duration_since(last) < chrono::Duration::seconds(RECONCILIATION_INTERVAL_SECONDS)) {
+        if knowledge.reconciliation.attempts >= RECONCILIATION_LIFETIME_ATTEMPTS
+            || knowledge.reconciliation.next_attempt_at.is_some_and(|next| now < next) {
             return Ok(None);
         }
         knowledge.reconciliation.attempts += 1;
         knowledge.reconciliation.last_attempt_at = Some(now);
         knowledge.reconciliation.last_outcome = Some(ReconciliationOutcome::InFlight);
-        knowledge.reconciliation.exhausted = knowledge.reconciliation.attempts >= RECONCILIATION_ATTEMPTS;
+        knowledge.reconciliation.exhausted = knowledge.reconciliation.attempts >= RECONCILIATION_LIFETIME_ATTEMPTS;
+        knowledge.reconciliation.next_attempt_at = if knowledge.reconciliation.exhausted {
+            None
+        } else {
+            Some(now.checked_add_signed(chrono::Duration::seconds(reconciliation_interval_seconds(knowledge.reconciliation.attempts)))
+                .ok_or_else(|| failure(ErrorCode::InternalError))?)
+        };
         let mut projected = operation.clone();
         projected.reconciliation = Some(knowledge.reconciliation.clone());
         save(&tx, &projected)?;
@@ -577,22 +583,26 @@ pub(super) async fn observation_candidates(
     let config = config.clone();
     let now = engine.clock.now();
     job(engine, move |connection| {
+        crate::history::register_time_functions(connection)?;
         let mut statement = connection.prepare(
             "SELECT o.id FROM operations o
              JOIN operation_intents i ON i.operation_id=o.id
              WHERE o.node_id=?1 AND o.dispatched=1 AND o.terminal=0
                AND COALESCE(json_extract(i.evidence,'$.reconciliation.attempts'),0) < ?2
-               AND (json_extract(i.evidence,'$.reconciliation.last_attempt_at') IS NULL
-                    OR julianday(json_extract(i.evidence,'$.reconciliation.last_attempt_at')) <= julianday(?3))
-               AND json_extract(o.body,'$.review.node')=json(?4)
-               AND json_extract(i.intent,'$.connection_generation')=?5
+               AND (json_extract(i.evidence,'$.reconciliation.next_attempt_at') IS NULL
+                    OR creation_seconds(json_extract(i.evidence,'$.reconciliation.next_attempt_at')) < ?3
+                    OR (creation_seconds(json_extract(i.evidence,'$.reconciliation.next_attempt_at')) = ?3
+                        AND creation_nanos(json_extract(i.evidence,'$.reconciliation.next_attempt_at')) <= ?4))
+               AND json_extract(o.body,'$.review.node')=json(?5)
+               AND json_extract(i.intent,'$.connection_generation')=?6
              ORDER BY json_extract(i.evidence,'$.reconciliation.last_attempt_at') ASC,o.id ASC
-             LIMIT ?6"
+             LIMIT ?7"
         )?;
         let mut rows = statement.query(params![
             config.binding.node_id,
-            RECONCILIATION_ATTEMPTS,
-            (now-chrono::Duration::seconds(RECONCILIATION_INTERVAL_SECONDS)).to_rfc3339(),
+            RECONCILIATION_LIFETIME_ATTEMPTS,
+            now.timestamp(),
+            now.timestamp_subsec_nanos(),
             serde_json::to_string(&config.binding)?,
             config.generation.to_string(),
             i64::try_from(LIST_RECONCILIATION_CAP).map_err(|_| failure(ErrorCode::InternalError))?,

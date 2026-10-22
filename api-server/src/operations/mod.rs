@@ -35,8 +35,15 @@ use uuid::Uuid;
 type Result<T> = std::result::Result<T, EngineError>;
 type ResponseFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
-const RECONCILIATION_ATTEMPTS: u32 = 12;
-const RECONCILIATION_INTERVAL_SECONDS: i64 = 30;
+const RECONCILIATION_LIFETIME_ATTEMPTS: u32 = 96;
+const RECONCILIATION_BASE_INTERVAL_SECONDS: i64 = 30;
+const RECONCILIATION_MAX_INTERVAL_SECONDS: i64 = 30 * 60;
+
+fn reconciliation_interval_seconds(attempts: u32) -> i64 {
+    RECONCILIATION_BASE_INTERVAL_SECONDS
+        .saturating_mul(i64::from(2_u32.saturating_pow(attempts.saturating_sub(1))))
+        .min(RECONCILIATION_MAX_INTERVAL_SECONDS)
+}
 const LIST_RECONCILIATION_CAP: usize = 2;
 const LIST_RECONCILIATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
 

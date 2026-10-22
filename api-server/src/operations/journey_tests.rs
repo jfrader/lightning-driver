@@ -199,7 +199,9 @@ async fn journey(backend: Backend, kind: OperationKind) {
             break;
         }
         result = f.observe(&browser, &op).await;
-        clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+        if let Some(next) = result["reconciliation"]["next_attempt_at"].as_str() {
+            *clock.0.lock().unwrap() = next.parse().unwrap();
+        }
     }
     assert_eq!(
         result["state"], "succeeded",

@@ -36,14 +36,32 @@ async fn reconciliation_unknown_interval_budget_and_restart_never_redispatch() {
     let grant = f.authorize(&op).await;
     *f.fake.execute.lock().unwrap() = Script::Lost;
     f.confirm(&op, grant).await.unwrap();
-    for attempt in 1..=RECONCILIATION_ATTEMPTS {
+    // Keep this synthetic authentication session valid over the entire policy horizon.
+    f.settings.limits.session_absolute_seconds = 4 * 24 * 60 * 60;
+    f.settings.limits.session_idle_seconds = f.settings.limits.session_absolute_seconds;
+    f.reopen().await;
+    for attempt in 1..=RECONCILIATION_LIFETIME_ATTEMPTS {
         f.fake.script(Script::Absent);
         let observed = f.engine.observe(&f.context, &f.node, op.id).await.unwrap();
         assert_eq!(observed.state, OperationState::Unknown);
         assert_eq!(observed.stage, OperationStage::Reconciling);
         let reconciliation = observed.reconciliation.unwrap();
         assert_eq!(reconciliation.attempts, attempt);
-        assert_eq!(reconciliation.exhausted, attempt == RECONCILIATION_ATTEMPTS);
+        assert_eq!(
+            reconciliation.exhausted,
+            attempt == RECONCILIATION_LIFETIME_ATTEMPTS
+        );
+        assert_eq!(
+            reconciliation.next_attempt_at,
+            if reconciliation.exhausted {
+                None
+            } else {
+                Some(
+                    f.clock.now()
+                        + chrono::Duration::seconds(reconciliation_interval_seconds(attempt)),
+                )
+            }
+        );
         assert_eq!(
             reconciliation.last_outcome,
             Some(ReconciliationOutcome::NotFound)
@@ -51,19 +69,101 @@ async fn reconciliation_unknown_interval_budget_and_restart_never_redispatch() {
         let before = f.fake.counts();
         f.engine.observe(&f.context, &f.node, op.id).await.unwrap();
         assert_eq!(f.fake.counts(), before);
-        f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+        if attempt == RECONCILIATION_LIFETIME_ATTEMPTS {
+            assert!(storage::observation_candidates(&f.engine, &f.fake.config)
+                .await
+                .unwrap()
+                .is_empty());
+            f.engine.observe_list(&f.context, &f.node).await.unwrap();
+            assert_eq!(f.fake.counts(), before);
+        }
+        f.advance_reconciliation(op.id).await;
         if attempt == 1 {
             f.reopen().await;
         }
     }
     f.reopen().await;
     for _ in 0..3 {
-        f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+        f.clock.advance(RECONCILIATION_MAX_INTERVAL_SECONDS);
         let observed = f.engine.observe(&f.context, &f.node, op.id).await.unwrap();
         assert!(observed.reconciliation.unwrap().exhausted);
     }
-    assert_eq!(f.fake.counts(), (1, RECONCILIATION_ATTEMPTS as usize));
+    assert_eq!(
+        f.fake.counts(),
+        (1, RECONCILIATION_LIFETIME_ATTEMPTS as usize)
+    );
     assert!(f.stored(op.id).await.1 > 0);
+}
+
+#[test]
+fn reconciliation_backoff_doubles_saturates_and_reports_lifetime_horizon() {
+    let intervals: Vec<_> = (1..=10).map(reconciliation_interval_seconds).collect();
+    assert_eq!(
+        intervals,
+        [30, 60, 120, 240, 480, 960, 1800, 1800, 1800, 1800]
+    );
+    assert_eq!(reconciliation_interval_seconds(u32::MAX), 1800);
+    let horizon: i64 = (1..RECONCILIATION_LIFETIME_ATTEMPTS)
+        .map(reconciliation_interval_seconds)
+        .sum();
+    let capped_horizon =
+        i64::from(RECONCILIATION_LIFETIME_ATTEMPTS - 1) * RECONCILIATION_MAX_INTERVAL_SECONDS;
+    assert_eq!(horizon, 162090);
+    assert_eq!(capped_horizon, 171000);
+    eprintln!("96 attempts: first-to-last earliest reservation = {horizon}s; at the 30-minute cap = {capped_horizon}s (95 intervals)");
+}
+
+#[tokio::test]
+async fn reconciliation_stored_next_attempt_gates_status_and_list_at_nanosecond_boundary() {
+    let mut f = Fixture::new().await;
+    let op = f.create(OperationKind::OpenChannel).await;
+    let grant = f.authorize(&op).await;
+    *f.fake.execute.lock().unwrap() = Script::Lost;
+    f.confirm(&op, grant).await.unwrap();
+    f.fake.script(Script::Absent);
+    let observed = f.engine.observe(&f.context, &f.node, op.id).await.unwrap();
+    let next = observed.reconciliation.unwrap().next_attempt_at.unwrap();
+    assert!(storage::observation_query(&f.engine, op.id, &f.fake.config)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(storage::observation_candidates(&f.engine, &f.fake.config)
+        .await
+        .unwrap()
+        .is_empty());
+    *f.clock.0.lock().unwrap() = next - chrono::Duration::nanoseconds(1);
+    assert!(storage::observation_query(&f.engine, op.id, &f.fake.config)
+        .await
+        .unwrap()
+        .is_none());
+    assert!(storage::observation_candidates(&f.engine, &f.fake.config)
+        .await
+        .unwrap()
+        .is_empty());
+    assert_eq!(f.fake.counts(), (1, 1));
+    *f.clock.0.lock().unwrap() = next;
+    assert_eq!(
+        storage::observation_candidates(&f.engine, &f.fake.config)
+            .await
+            .unwrap(),
+        vec![op.id]
+    );
+    let query = storage::observation_query(&f.engine, op.id, &f.fake.config)
+        .await
+        .unwrap()
+        .unwrap();
+    f.fake.script(Script::Absent);
+    let evidence = f.fake.observe_exact(query).await;
+    let observed = storage::apply(&f.engine, op.id, evidence, true)
+        .await
+        .unwrap();
+    let reconciliation = observed.reconciliation.unwrap();
+    assert_eq!(reconciliation.attempts, 2);
+    assert_eq!(
+        reconciliation.next_attempt_at,
+        Some(next + chrono::Duration::seconds(60))
+    );
+    assert_eq!(f.fake.counts(), (1, 2));
 }
 
 #[tokio::test]
@@ -77,7 +177,7 @@ async fn reconciliation_open_resolves_after_absence_and_failed_read() {
         f.fake.script(script);
         let observed = f.engine.observe(&f.context, &f.node, op.id).await.unwrap();
         assert_eq!(observed.state, OperationState::Unknown);
-        f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+        f.advance_reconciliation(op.id).await;
     }
     let observed = f.engine.observe(&f.context, &f.node, op.id).await.unwrap();
     assert_eq!(observed.state, OperationState::Succeeded);
@@ -99,7 +199,7 @@ async fn reconciliation_exact_open_failure_releases_once_without_redispatch() {
     assert_eq!(observed.state, OperationState::Failed);
     assert_eq!(observed.error.unwrap().code, ErrorCode::UpstreamRejected);
     assert_eq!(f.stored(op.id).await.1, 0);
-    f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+    f.advance_reconciliation(op.id).await;
     f.fake.script(Script::Reject);
     f.engine.observe(&f.context, &f.node, op.id).await.unwrap();
     assert_eq!(f.stored(op.id).await.1, 0);
@@ -521,6 +621,17 @@ struct Fixture {
     node: String,
 }
 impl Fixture {
+    async fn advance_reconciliation(&self, id: Uuid) {
+        let operation = storage::load_local(&self.engine, id).await.unwrap();
+        if let Some(next) = operation
+            .reconciliation
+            .and_then(|record| record.next_attempt_at)
+        {
+            let mut now = self.clock.0.lock().unwrap();
+            *now = (*now).max(next);
+        }
+    }
+
     async fn new() -> Self {
         let directory = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
@@ -1071,7 +1182,7 @@ async fn exact_txid_confirmation_refresh_keeps_success_and_uses_read_start_order
         .await
         .unwrap()
         .unwrap();
-    f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+    f.advance_reconciliation(op.id).await;
     let newer = storage::observation_query(&f.engine, op.id, &config)
         .await
         .unwrap()
@@ -1100,7 +1211,7 @@ async fn exact_txid_confirmation_refresh_keeps_success_and_uses_read_start_order
         matches!(final_op.result,Some(OperationResult::SendOnchain{confirmations:Some(value),..}) if value==Decimal::ZERO)
     );
     f.fake.script(Script::WrongReference);
-    f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+    f.advance_reconciliation(op.id).await;
     assert!(f.engine.observe(&f.context, &f.node, op.id).await.is_err());
     assert_eq!(f.fake.counts(), (1, 3));
     assert_eq!(f.stored(op.id).await, (true, 0, false));
@@ -1114,7 +1225,7 @@ async fn all_eight_terminal_outcome_survives_late_rejection_and_absence() {
         let grant = f.authorize(&op).await;
         f.confirm(&op, grant).await.unwrap();
         for script in [Script::Reject, Script::Absent] {
-            f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+            f.advance_reconciliation(op.id).await;
             f.fake.script(script);
             assert_eq!(
                 f.engine
@@ -1140,7 +1251,7 @@ async fn paid_hash_exclusion_and_old_group_never_credit_or_release_wrong_attempt
     assert!(f.engine.observe(&f.context, &f.node, op.id).await.is_err());
     assert!(f.stored(op.id).await.1 > 0);
     f.fake.script(Script::Accepted);
-    f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+    f.advance_reconciliation(op.id).await;
     assert_eq!(
         f.engine
             .observe(&f.context, &f.node, op.id)
@@ -1150,7 +1261,7 @@ async fn paid_hash_exclusion_and_old_group_never_credit_or_release_wrong_attempt
         OperationState::Pending
     );
     f.fake.script(Script::Success);
-    f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+    f.advance_reconciliation(op.id).await;
     assert_eq!(
         f.engine
             .observe(&f.context, &f.node, op.id)
@@ -1160,7 +1271,7 @@ async fn paid_hash_exclusion_and_old_group_never_credit_or_release_wrong_attempt
         OperationState::Succeeded
     );
     f.fake.script(Script::OldGroup);
-    f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+    f.advance_reconciliation(op.id).await;
     assert!(f.engine.observe(&f.context, &f.node, op.id).await.is_err());
     assert_eq!(
         storage::load_local(&f.engine, op.id).await.unwrap().state,
@@ -1356,7 +1467,7 @@ async fn all_eight_uncertainty_sequence_never_releases_or_fabricates_references(
             assert_eq!(observed.state, OperationState::Unknown);
             assert!(observed.result.is_none());
             assert_eq!(f.stored(op.id).await, before);
-            f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+            f.advance_reconciliation(op.id).await;
         }
         assert_eq!(f.fake.counts(), (1, 5));
     }
@@ -1856,7 +1967,7 @@ async fn closed_unknown_type_pending_then_unilateral_is_truthful_terminal_failur
     assert_eq!(pending.state, OperationState::Pending);
     assert_eq!(pending.stage, OperationStage::ChannelClosed);
     assert!(f.stored(op.id).await.1 > 0);
-    f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+    f.advance_reconciliation(op.id).await;
     let query = storage::observation_query(&f.engine, op.id, &config)
         .await
         .unwrap()
@@ -2154,7 +2265,7 @@ async fn all_eight_cross_identity_observations_cannot_change_public_or_release_c
         let completed = f.confirm(&op, grant).await.unwrap();
         let original = serde_json::to_value(&completed).unwrap();
         for case in 0..5 {
-            f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+            f.advance_reconciliation(op.id).await;
             let query = storage::observation_query(&f.engine, op.id, &f.fake.config)
                 .await
                 .unwrap()
@@ -2302,7 +2413,7 @@ async fn close_confirmation_refresh_and_observation_rollback_preserve_terminal_f
         .await
         .unwrap()
         .unwrap();
-    f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+    f.advance_reconciliation(op.id).await;
     let newer = storage::observation_query(&f.engine, op.id, &f.fake.config)
         .await
         .unwrap()
@@ -2333,7 +2444,7 @@ async fn close_confirmation_refresh_and_observation_rollback_preserve_terminal_f
         matches!(final_op.result,Some(OperationResult::CloseChannel{confirmations:Some(value),..}) if value==Decimal::ZERO)
     );
     f.fake.script(Script::WrongReference);
-    f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+    f.advance_reconciliation(op.id).await;
     assert!(f.engine.observe(&f.context, &f.node, op.id).await.is_err());
     assert_eq!(f.fake.counts(), (1, 3));
     assert_eq!(f.stored(op.id).await, (true, 0, false));
@@ -2548,7 +2659,7 @@ async fn positive_pending_facts_survive_later_absence_and_open_requires_active_c
             assert_eq!(observed.state, OperationState::Pending);
             assert_eq!(observed.stage, pending.stage);
             assert_eq!(f.stored(op.id).await, before);
-            f.clock.advance(RECONCILIATION_INTERVAL_SECONDS);
+            f.advance_reconciliation(op.id).await;
         }
         assert_eq!(
             f.engine

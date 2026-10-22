@@ -599,6 +599,8 @@ pub enum OperationResult {
 pub struct Reconciliation {
     pub attempts: u32,
     pub last_attempt_at: Option<Timestamp>,
+    #[serde(default)]
+    pub next_attempt_at: Option<Timestamp>,
     pub last_outcome: Option<ReconciliationOutcome>,
     pub exhausted: bool,
 }
