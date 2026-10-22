@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 #[derive(Default)]
 pub struct Registry {
     nodes: BTreeMap<String, Entry>,
+    retained: std::sync::Mutex<usize>,
 }
 
 pub struct Entry {
@@ -27,6 +28,30 @@ pub struct Entry {
     pub(crate) observation: std::sync::Mutex<Option<(crate::operations::InfoObservation, String)>>,
     pub(crate) reads: tokio::sync::Mutex<crate::live::Cache>,
     pub(crate) last_error: std::sync::Mutex<Option<(DateTime<Utc>, ErrorCode)>>,
+}
+
+#[cfg(test)]
+impl Registry {
+    /// Seeds one cached read and its byte accounting, returning the new total.
+    pub(crate) async fn seed_read_for_test(&self, id: &str, bytes: usize) -> usize {
+        let cached = self
+            .nodes
+            .get(id)
+            .unwrap()
+            .reads
+            .lock()
+            .await
+            .seed_for_test("channels", bytes);
+        self.set_retained_bytes(cached);
+        cached
+    }
+}
+
+impl Entry {
+    /// Clears every cached read for this node and returns the bytes released.
+    pub(crate) async fn invalidate_reads(&self) -> usize {
+        self.reads.lock().await.invalidate()
+    }
 }
 
 fn fingerprint(value: &impl Serialize) -> Result<String, serde_json::Error> {
@@ -70,7 +95,33 @@ impl Registry {
                 },
             );
         }
-        Ok(Self { nodes })
+        Ok(Self {
+            nodes,
+            retained: std::sync::Mutex::new(0),
+        })
+    }
+    /// Bytes currently held by every cached node read, across all nodes.
+    pub(crate) fn retained_bytes(&self) -> usize {
+        *self
+            .retained
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+    pub(crate) fn set_retained_bytes(&self, bytes: usize) {
+        *self
+            .retained
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = bytes;
+    }
+    /// Drops one node's cached reads after a committed change and releases their bytes.
+    pub(crate) async fn invalidate_reads(&self, id: &str) -> usize {
+        let Some(entry) = self.nodes.get(id) else {
+            return 0;
+        };
+        let released = entry.invalidate_reads().await;
+        let remaining = self.retained_bytes().saturating_sub(released);
+        self.set_retained_bytes(remaining);
+        remaining
     }
     pub fn get(&self, id: &str) -> Option<&Entry> {
         self.nodes.get(id)

@@ -15,6 +15,34 @@ pub(crate) struct Cache {
     values: BTreeMap<&'static str, Observed>,
 }
 
+#[cfg(test)]
+impl Cache {
+    /// Puts a value in the cache so a test can prove it is dropped.
+    pub(crate) fn seed_for_test(&mut self, resource: &'static str, bytes: usize) -> usize {
+        self.values.insert(
+            resource,
+            Observed {
+                value: Value::Array(Vec::new()),
+                at: Utc::now(),
+                stale: false,
+                truncated: false,
+                bytes,
+            },
+        );
+        self.values.values().map(|value| value.bytes).sum()
+    }
+}
+
+impl Cache {
+    /// Drops every cached read and returns the bytes it held.
+    pub(crate) fn invalidate(&mut self) -> usize {
+        self.checked = None;
+        let released = self.values.values().map(|value| value.bytes).sum();
+        self.values.clear();
+        released
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct Observed {
     pub value: Value,
@@ -147,16 +175,12 @@ impl ApplicationState {
             truncated,
             bytes,
         };
-        let mut retained = self
-            .observation_bytes
-            .lock()
-            .map_err(|_| ApiError::new(ErrorCode::InternalError))?;
         let replaced = cache.values.get(resource).map_or(0, |value| value.bytes);
-        let remaining = retained.saturating_sub(replaced);
+        let remaining = self.registry.retained_bytes().saturating_sub(replaced);
         if bytes > self.limits().snapshot_cache_bytes.saturating_sub(remaining) {
             return Err(ApiError::new(ErrorCode::RateLimited));
         }
-        *retained = remaining + bytes;
+        self.registry.set_retained_bytes(remaining + bytes);
         cache.values.insert(resource, observed.clone());
         Ok(observed)
     }

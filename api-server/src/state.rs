@@ -9,7 +9,6 @@ pub struct ApplicationState {
     pub registry: Arc<crate::registry::Registry>,
     pub snapshots: crate::pagination::Snapshots,
     pub(crate) engine: Engine,
-    pub(crate) observation_bytes: Arc<std::sync::Mutex<usize>>,
 }
 
 impl ApplicationState {
@@ -23,7 +22,7 @@ impl ApplicationState {
         let auth = AuthHttp::new(settings.api.clone(), journal.clone())?;
         let mut registry = crate::registry::Registry::new(settings)
             .map_err(|_| ApiError::new(ErrorCode::NotConfigured))?;
-        let engine =
+        let mut engine =
             Engine::from_settings(settings, &registry, journal.clone(), auth.manager.clone())
                 .await?;
         for node in &settings.nodes {
@@ -31,13 +30,14 @@ impl ApplicationState {
                 registry.mark_unavailable(&node.id, code);
             }
         }
+        let registry = Arc::new(registry);
+        engine.attach_reads(Arc::clone(&registry));
         Ok(Self {
             auth,
             journal,
-            registry: Arc::new(registry),
+            registry,
             snapshots: crate::pagination::Snapshots::new(settings.api.limits.clone()),
             engine,
-            observation_bytes: Arc::new(std::sync::Mutex::new(0)),
         })
     }
 }

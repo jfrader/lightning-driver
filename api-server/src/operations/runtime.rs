@@ -76,6 +76,7 @@ impl Engine {
         }
         Ok(Self {
             journal,
+            reads: None,
             auth,
             nodes: Arc::new(nodes),
             unavailable: Arc::new(unavailable),

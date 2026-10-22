@@ -726,6 +726,7 @@ impl Fixture {
         )]);
         let engine = Engine {
             journal,
+            reads: None,
             auth,
             nodes: Arc::new(nodes),
             unavailable: Arc::new(BTreeMap::new()),

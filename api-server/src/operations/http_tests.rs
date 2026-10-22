@@ -387,6 +387,25 @@ async fn confirm(
 }
 
 #[actix_web::test]
+async fn a_claim_that_reaches_the_node_drops_its_cached_reads() {
+    let f = HttpFixture::new().await;
+    let browser = login(&f.state, None).await;
+    assert_eq!(
+        f.state.registry.seed_read_for_test("synthetic", 64).await,
+        64
+    );
+
+    let operation = create(&f, &browser, OperationKind::NewAddress, Uuid::new_v4()).await;
+    let (status, confirmed) = confirm(&f.state, &browser, &operation, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+    assert_eq!(
+        f.state.registry.retained_bytes(),
+        0,
+        "a claim that reached the node drops that node's cached reads"
+    );
+}
+
+#[actix_web::test]
 async fn sensitive_and_low_risk_use_production_factory_and_one_shot_claims() {
     let f = HttpFixture::new().await;
     let mut browser = login(&f.state, None).await;
@@ -492,7 +511,7 @@ async fn unknown_restart_removed_node_and_revoked_session_never_redispatch() {
         confirm(&f.state, &browser, &operation, Value::Null).await.0,
         StatusCode::OK
     );
-    f.fake.script(Script::Absent);
+    f.fake.script(Script::Lost);
     let (status, observed, _) = call(
         &f.state,
         authenticated(get(&path(&operation, "")), &browser),
