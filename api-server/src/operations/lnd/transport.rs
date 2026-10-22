@@ -308,6 +308,12 @@ impl Rest {
             if rpc == Rpc::Disconnect {
                 obj.remove("pub_key");
             }
+            // LND's REST gateway accepts the protobuf JSON name for this field only.
+            if rpc == Rpc::CheckPermissions {
+                if let Some(value) = obj.remove("full_method") {
+                    obj.insert("fullMethod".into(), value);
+                }
+            }
             for key in [
                 "channel_point",
                 "payment_hash_hex",

@@ -52,11 +52,22 @@ pub(super) fn amount(v: &Value, key: &str) -> Result<Option<Decimal>> {
 pub(super) fn small(v: &Value, key: &str) -> Result<Option<Decimal>> {
     match v.get(key) {
         None | Some(Value::Null) => Ok(None),
-        Some(n) => n
+        Some(Value::Number(n)) => n
             .as_u64()
             .and_then(|n| Decimal::new(n).ok())
             .map(Some)
             .ok_or_else(invalid),
+        // LND's REST gateway renders 64-bit integers as decimal strings.
+        Some(Value::String(s))
+            if !s.is_empty()
+                && s.bytes().all(|b| b.is_ascii_digit())
+                && (s.len() == 1 || !s.starts_with('0')) =>
+        {
+            Ok(Some(
+                Decimal::new(s.parse::<u64>().map_err(|_| invalid())?).map_err(|_| invalid())?,
+            ))
+        }
+        _ => Err(invalid()),
     }
 }
 pub(super) fn hash(v: &Value, key: &str) -> Result<String> {

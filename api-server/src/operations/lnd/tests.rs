@@ -1520,11 +1520,25 @@ async fn permission_preparation_is_read_only_and_checks_tagged_method_permission
             } else {
                 let p: Value = serde_json::from_slice(&cap[1].body).unwrap();
                 assert_eq!(reads::bytes(&p, "macaroon").unwrap(), MAC);
-                assert_eq!(p["full_method"], rpc.method());
+                assert_eq!(p["fullMethod"], rpc.method());
                 assert_eq!(p["permissions"], json!(rpc.permissions()));
             }
         }
     }
+}
+
+#[test]
+fn rest_decimal_strings_for_64_bit_integers_are_accepted_but_not_leading_zeros() {
+    assert_eq!(
+        reads::small(&json!({"n": "6"}), "n").unwrap(),
+        Some(Decimal::new(6).unwrap())
+    );
+    assert_eq!(
+        reads::small(&json!({"n": 6}), "n").unwrap(),
+        Some(Decimal::new(6).unwrap())
+    );
+    assert!(reads::small(&json!({"n": "06"}), "n").is_err());
+    assert!(reads::small(&json!({"n": "-1"}), "n").is_err());
 }
 
 #[tokio::test]
