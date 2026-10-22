@@ -35,7 +35,7 @@ artifact, no public edge.
 | P1.6 Restart/reconnect/recovery drills | Open | Pieces tested; full scripted drill missing. |
 | P1.7 Observability and ops runbook | Open | No log contract or runbook yet. |
 | P1.8 UI and accessibility gaps | Partly done | Count invalidation and desktop sign-in methods fixed; mobile tab-bar overlap, long-value wrapping, 390/768/1280 and forced-colors audit still open. |
-| P1.9 Bundle performance | Accepted debt | Entry route grew 447 B with P0.4/P0.7; budget re-recorded at 265,474 B. No structural headroom yet: the generated validators are the largest initial module (520 kB minified) and need a split that preserves first use. |
+| P1.9 Bundle performance | Accepted debt | Entry route grew 1,272 B across this pass (P0.4, P0.7, the reconciliation copy); budget re-recorded twice, latest `266,299 B` gzip, chart chunk `86,845 B`. No structural headroom yet: the generated validators are the largest initial module (520 kB minified) and need a split that preserves first use. |
 | P1.10 GURI-2924 Drawer scrim token | Separate | Library repository, own issue and version bump. |
 
 ## P2 — product and delivery
