@@ -232,12 +232,13 @@ async fn journey(backend: Backend, kind: OperationKind) {
         assert_eq!(args["label"], format!("ld-{}", op["id"].as_str().unwrap()));
     }
     if kind == OperationKind::CloseChannel && backend == Backend::ClnRest {
-        assert_eq!(args["unilateraltimeout"], 0);
         // CLN `close` rejects an outpoint; the durable target is the channel id.
         assert_eq!(
             args["id"],
             "2222222222222222222222222222222222222222222222222222222222222222"
         );
+        // `unilateraltimeout: 0` means force close now; a cooperative close omits it.
+        assert!(args.get("unilateraltimeout").is_none());
     }
     if kind == OperationKind::CloseChannel && backend == Backend::LndGrpc {
         assert_eq!(args["force"], false);

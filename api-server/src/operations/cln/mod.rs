@@ -540,7 +540,11 @@ fn command(
             let _ = p;
             (
                 Rpc::Close,
-                json!({"id":close_target.ok_or_else(||failure(ErrorCode::NotFound))?,"unilateraltimeout":0}),
+                // Cooperative by default: CLN treats `unilateraltimeout: 0` as "force close
+                // now", which broadcasts our commitment and leaves the channel onchain for
+                // the CSV delay. Omitting it keeps the fee-negotiated close and its 48-hour
+                // force fallback; a peer that never answers ends at the RPC deadline.
+                json!({"id":close_target.ok_or_else(||failure(ErrorCode::NotFound))?}),
             )
         }
         OperationRequest::NewAddress(_) => (Rpc::NewAddr, json!({"addresstype":"bech32"})),

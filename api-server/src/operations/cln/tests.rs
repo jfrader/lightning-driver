@@ -754,7 +754,8 @@ async fn dispatch_is_one_shot_and_returns_publication_not_completion() {
                 assert_eq!(close_type, CloseType::Unilateral);
                 assert!(!closed);
                 assert!(published);
-                assert_eq!(captured["params"]["unilateraltimeout"], 0);
+                // A cooperative close omits the timeout; 0 would force close now.
+                assert!(captured["params"].get("unilateraltimeout").is_none());
             }
             Facts::Send {
                 fee_sat,
