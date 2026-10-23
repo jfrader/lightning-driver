@@ -36,6 +36,8 @@ impl ApiError {
             ErrorCode::ChallengeExpired => "Authentication challenge expired. Start again.",
             ErrorCode::ChallengeInvalid => "Authentication challenge is invalid or consumed.",
             ErrorCode::LastCredential => "Keep at least one sign-in method.",
+            ErrorCode::ReauthRequired => "Sign in again to continue.",
+            ErrorCode::EnrollmentUnavailable => "Enrollment is not available.",
             ErrorCode::RateLimited => "Too many requests. Wait before starting again.",
             ErrorCode::ReadOnly => "This node is read-only.",
             ErrorCode::NotFound => "Resource not found.",
