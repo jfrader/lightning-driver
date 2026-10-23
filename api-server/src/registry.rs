@@ -218,7 +218,14 @@ impl Entry {
                 node_id: self.id.clone(),
                 status: match self.unavailable {
                     Some(ErrorCode::NotConfigured) => NodeConnection::ConfigError,
-                    _ => NodeConnection::Unsupported,
+                    Some(ErrorCode::NodeAuthError) => NodeConnection::AuthError,
+                    Some(ErrorCode::IdentityChanged) | Some(ErrorCode::NetworkMismatch) => {
+                        NodeConnection::IdentityMismatch
+                    }
+                    Some(ErrorCode::NodeOffline) => NodeConnection::Offline,
+                    Some(_) => NodeConnection::Unsupported,
+                    // Configured and constructible, but no observation has landed yet.
+                    None => NodeConnection::Connecting,
                 },
                 synced_to_chain: None,
                 synced_to_graph: None,
