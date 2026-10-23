@@ -89,9 +89,12 @@ impl ClnAdapter {
         let now = Utc::now();
         let node = &self.config.binding.node_id;
         Ok(match query {
-            ReadQuery::Bitcoin | ReadQuery::BitcoinPeers => {
-                return Err(failure(ErrorCode::Unsupported))
-            }
+            ReadQuery::Bitcoin
+            | ReadQuery::BitcoinPeers
+            | ReadQuery::WatchtowerServer
+            | ReadQuery::WatchtowerClient
+            | ReadQuery::WatchtowerTowers
+            | ReadQuery::WatchtowerTower(_) => return Err(failure(ErrorCode::Unsupported)),
             ReadQuery::Info => ReadResult::Info(info),
             ReadQuery::Balances => ReadResult::Balances(reads::balances(
                 &self.call(Rpc::ListFunds, json!({})).await?,

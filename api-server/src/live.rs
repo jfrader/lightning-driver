@@ -12,7 +12,7 @@ use std::collections::BTreeMap;
 #[derive(Default)]
 pub(crate) struct Cache {
     pub(crate) checked: Option<DateTime<Utc>>,
-    values: BTreeMap<&'static str, Observed>,
+    values: BTreeMap<String, Observed>,
 }
 
 #[cfg(test)]
@@ -20,7 +20,7 @@ impl Cache {
     /// Puts a value in the cache so a test can prove it is dropped.
     pub(crate) fn seed_for_test(&mut self, resource: &'static str, bytes: usize) -> usize {
         self.values.insert(
-            resource,
+            resource.into(),
             Observed {
                 value: Value::Array(Vec::new()),
                 at: Utc::now(),
@@ -109,7 +109,8 @@ impl ApplicationState {
         resource: &'static str,
         query: ReadQuery,
     ) -> Result<Observed, ApiError> {
-        if !matches!(query, ReadQuery::Bitcoin | ReadQuery::BitcoinPeers) {
+        if !query.is_watchtower() && !matches!(query, ReadQuery::Bitcoin | ReadQuery::BitcoinPeers)
+        {
             self.refresh_node(id).await?;
         }
         let entry = self
@@ -118,7 +119,11 @@ impl ApplicationState {
             .ok_or_else(|| ApiError::new(ErrorCode::NotFound))?;
         let mut cache = self.read_cache(entry).await?;
         let now = Utc::now();
-        if let Some(value) = cache.values.get(resource) {
+        let key = match query {
+            ReadQuery::WatchtowerTower(key) => format!("{resource}:{}", hex::encode(key)),
+            _ => resource.to_owned(),
+        };
+        if let Some(value) = cache.values.get(&key) {
             if now.signed_duration_since(value.at).num_seconds()
                 < i64::from(self.limits().rpc_seconds)
             {
@@ -130,7 +135,8 @@ impl ApplicationState {
             Ok((value, _)) => value,
             Err(error) if error.code == ErrorCode::RateLimited => return Err(error),
             Err(error)
-                if matches!(query, ReadQuery::Bitcoin | ReadQuery::BitcoinPeers)
+                if (query.is_watchtower()
+                    || matches!(query, ReadQuery::Bitcoin | ReadQuery::BitcoinPeers))
                     && matches!(
                         error.code,
                         ErrorCode::IdentityChanged | ErrorCode::NetworkMismatch
@@ -142,9 +148,13 @@ impl ApplicationState {
                 return Err(error);
             }
             Err(error) => {
+                if matches!(query, ReadQuery::WatchtowerTower(_)) {
+                    // Tower detail cannot label an expired observation as stale.
+                    return Err(error);
+                }
                 return cache
                     .values
-                    .get(resource)
+                    .get(&key)
                     .cloned()
                     .map(|mut value| {
                         value.stale = true;
@@ -157,6 +167,12 @@ impl ApplicationState {
             ReadResult::Balances(value) => (serde_json::to_value(value), false),
             ReadResult::Fees(value) => (serde_json::to_value(value), false),
             ReadResult::Bitcoin(value) => (serde_json::to_value(value), false),
+            ReadResult::WatchtowerServer(value) => (serde_json::to_value(value), false),
+            ReadResult::WatchtowerClient(value) => (serde_json::to_value(value), false),
+            ReadResult::WatchtowerTower(value) => (serde_json::to_value(value), false),
+            ReadResult::WatchtowerTowers(value) => {
+                (serde_json::to_value(value.items), value.truncated)
+            }
             ReadResult::BitcoinPeers(value) => (serde_json::to_value(value.items), value.truncated),
             ReadResult::Invoices(value) => (serde_json::to_value(value.items), value.truncated),
             ReadResult::Payments(value) => (serde_json::to_value(value.items), value.truncated),
@@ -175,13 +191,13 @@ impl ApplicationState {
             truncated,
             bytes,
         };
-        let replaced = cache.values.get(resource).map_or(0, |value| value.bytes);
+        let replaced = cache.values.get(&key).map_or(0, |value| value.bytes);
         let remaining = self.registry.retained_bytes().saturating_sub(replaced);
         if bytes > self.limits().snapshot_cache_bytes.saturating_sub(remaining) {
             return Err(ApiError::new(ErrorCode::RateLimited));
         }
         self.registry.set_retained_bytes(remaining + bytes);
-        cache.values.insert(resource, observed.clone());
+        cache.values.insert(key, observed.clone());
         Ok(observed)
     }
 }

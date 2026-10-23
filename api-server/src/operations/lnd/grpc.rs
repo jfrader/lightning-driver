@@ -1,5 +1,6 @@
 use super::*;
 use lnd_grpc_rust::{lnrpc as ln, routerrpc as router, walletrpc as wallet};
+use lnd_grpc_rust::{watchtowerrpc as tower, wtclientrpc as wt};
 use std::{
     pin::Pin,
     sync::{
@@ -180,7 +181,19 @@ impl Grpc {
         };
         let mut ln = ln::lightning_client::LightningClient::new(channel.clone());
         let mut router = router::router_client::RouterClient::new(channel.clone());
-        let mut wallet = wallet::wallet_kit_client::WalletKitClient::new(channel);
+        let mut wallet = wallet::wallet_kit_client::WalletKitClient::new(channel.clone());
+        let mut tower = tower::watchtower_client::WatchtowerClient::new(channel.clone());
+        let mut wt = wt::watchtower_client_client::WatchtowerClientClient::new(channel);
+        macro_rules! tower_unary {
+            ($client:ident, $method:ident, $request:expr, $map:expr) => {{
+                let response = $client
+                    .$method(self.request($request)?)
+                    .await
+                    .map_err(|e| CallError::status(rpc, e.code(), e.message()))?
+                    .into_inner();
+                reply.frames.push(($map)(response));
+            }};
+        }
         macro_rules! unary {
             ($method:ident,$request:expr,$map:expr) => {{
                 let response = ln
@@ -193,6 +206,11 @@ impl Grpc {
         }
         let result: std::result::Result<(), CallError> = async {
             match rpc {
+                Rpc::TowerInfo => tower_unary!(tower, get_info, tower::GetInfoRequest {}, |v: tower::GetInfoResponse| json!({"pubkey":base64(v.pubkey),"listeners":v.listeners,"uris":v.uris})),
+                Rpc::TowerStats => tower_unary!(wt, stats, wt::StatsRequest {}, |v: wt::StatsResponse| json!({"num_backups":v.num_backups,"num_pending_backups":v.num_pending_backups,"num_failed_backups":v.num_failed_backups,"num_sessions_acquired":v.num_sessions_acquired,"num_sessions_exhausted":v.num_sessions_exhausted})),
+                Rpc::TowerPolicy => tower_unary!(wt, policy, wt::PolicyRequest { policy_type: p["policy_type"].as_i64().and_then(|n| i32::try_from(n).ok()).ok_or(CallError::Invalid)? }, |v: wt::PolicyResponse| json!({"max_updates":v.max_updates,"sweep_sat_per_vbyte":v.sweep_sat_per_vbyte})),
+                Rpc::Towers => tower_unary!(wt, list_towers, wt::ListTowersRequest { include_sessions:false, exclude_exhausted_sessions:false }, |v: wt::ListTowersResponse| json!({"towers":v.towers.into_iter().map(project_tower).collect::<Vec<_>>()})),
+                Rpc::Tower => tower_unary!(wt, get_tower_info, wt::GetTowerInfoRequest { pubkey:b(&p,"pubkey")?, include_sessions:true, exclude_exhausted_sessions:false }, project_tower),
                 Rpc::Info => unary!(get_info, ln::GetInfoRequest {}, project_info),
                 Rpc::Wallet => unary!(wallet_balance, ln::WalletBalanceRequest::default(), project_wallet),
                 Rpc::ChannelBalance => unary!(channel_balance, ln::ChannelBalanceRequest {}, project_balances),
@@ -303,6 +321,12 @@ fn b(v: &Value, key: &str) -> std::result::Result<Vec<u8>, CallError> {
 }
 fn base64(b: impl AsRef<[u8]>) -> String {
     base64::engine::general_purpose::STANDARD.encode(b)
+}
+fn project_tower(v: wt::Tower) -> Value {
+    json!({"pubkey":base64(v.pubkey),"addresses":v.addresses,"session_info":v.session_info.into_iter().map(|i| json!({
+        "policy_type":i.policy_type,"active_session_candidate":i.active_session_candidate,"num_sessions":i.num_sessions,
+        "sessions":i.sessions.into_iter().map(|s| json!({"id":base64(s.id),"num_backups":s.num_backups,"num_pending_backups":s.num_pending_backups,"max_backups":s.max_backups,"sweep_sat_per_vbyte":s.sweep_sat_per_vbyte})).collect::<Vec<_>>()
+    })).collect::<Vec<_>>()})
 }
 // Explicit ProtoJSON bridge: never serialize generated Rust messages wholesale.
 // Only this allowlist reaches shared LND normalization; wire secrets/raw data do not.

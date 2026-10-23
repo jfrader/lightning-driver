@@ -14,6 +14,8 @@ mod bitcoin;
 mod journeys;
 #[path = "nostr_http_tests.rs"]
 mod nostr;
+#[path = "watchtower_http_tests.rs"]
+mod watchtower;
 
 const HOST: &str = "manager.example.invalid";
 const ORIGIN: &str = "https://manager.example.invalid";

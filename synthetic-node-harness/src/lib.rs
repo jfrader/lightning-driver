@@ -8,7 +8,7 @@ pub use bitcoin_rpc::{BitcoinFault, BitcoinHarness, BitcoinScenario};
 mod scenario;
 mod server;
 
-pub use scenario::{Fault, Scenario, PEER, POINT, TXID};
+pub use scenario::{Fault, Scenario, WatchtowerRole, PEER, POINT, TXID};
 pub use server::Harness;
 
 #[cfg(test)]

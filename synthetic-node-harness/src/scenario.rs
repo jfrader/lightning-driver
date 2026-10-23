@@ -25,8 +25,19 @@ pub enum Fault {
     StreamError,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WatchtowerRole {
+    Missing,
+    ClientOnly,
+    ServerOnly,
+    Both,
+    InactiveServer,
+    DeniedMacaroon,
+}
+
 /// All state belongs to one isolated node. No callbacks or adapter injection.
 pub struct Scenario {
+    pub(crate) watchtower_role: WatchtowerRole,
     pub(crate) lnd: Value,
     pub(crate) cln: Value,
     pub(crate) now: DateTime<Utc>,
@@ -45,6 +56,42 @@ pub struct Scenario {
 }
 
 impl Scenario {
+    pub fn seed_watchtower(&mut self, role: WatchtowerRole, sessions: usize) {
+        self.watchtower_role = role;
+        let key = STANDARD.encode(hex::decode(PEER).expect("synthetic tower pubkey"));
+        self.lnd["tower_info"] = json!({"pubkey":key,"listeners":["127.0.0.1:9911"],"uris":[format!("{PEER}@127.0.0.1:9911")]});
+        self.lnd["tower_stats"] = json!({"num_backups":9,"num_pending_backups":2,"num_failed_backups":3,"num_sessions_acquired":4,"num_sessions_exhausted":1});
+        self.lnd["tower_policy"] = json!({"max_updates":1024,"sweep_sat_per_vbyte":5});
+        let sessions = (0..sessions).map(|i| {
+            let mut id = [0_u8;33];
+            id[..8].copy_from_slice(&(i as u64).to_be_bytes());
+            json!({"id":STANDARD.encode(id),"num_backups":1,"num_pending_backups":0,"max_backups":1024,"sweep_sat_per_vbyte":5})
+        }).collect::<Vec<_>>();
+        self.lnd["tower"] = json!({"pubkey":key,"addresses":["127.0.0.1:9911"],"session_info":[{"policy_type":"ANCHOR","active_session_candidate":true,"num_sessions":sessions.len(),"sessions":sessions}]});
+    }
+    pub(crate) fn watchtower_error(&self, method: &str, p: &Value) -> Option<(i32, &'static str)> {
+        if !matches!(
+            method,
+            "TowerGetInfo" | "Stats" | "Policy" | "ListTowers" | "GetTowerInfo"
+        ) {
+            return None;
+        }
+        let server = method == "TowerGetInfo";
+        match self.watchtower_role {
+            WatchtowerRole::DeniedMacaroon => return Some((2, "permission denied")),
+            WatchtowerRole::InactiveServer if server => return Some((2, "watchtower not active")),
+            WatchtowerRole::Missing => return Some((12, "unknown service")),
+            WatchtowerRole::ClientOnly if server => return Some((12, "unknown service")),
+            WatchtowerRole::ServerOnly | WatchtowerRole::InactiveServer if !server => {
+                return Some((12, "unknown service"))
+            }
+            _ => {}
+        }
+        if method == "Policy" && p["policy_type"] != 1 && p["policy_type"] != "ANCHOR" {
+            return Some((2, "no client for the given blob type"));
+        }
+        None
+    }
     /// Populate read-only journeys without invoking a mutation as a probe.
     pub fn seed_collections(&mut self) {
         let lnd: Value = serde_json::from_str(include_str!(
@@ -102,6 +149,7 @@ impl Scenario {
         cln["listinvoices"]["invoices"] = json!([]);
         cln["listpays"]["pays"] = json!([]);
         Self {
+            watchtower_role: WatchtowerRole::Missing,
             lnd,
             cln,
             now,
@@ -218,6 +266,23 @@ impl Scenario {
             *self.effects.entry(method.into()).or_default() += 1;
         }
         let value = match method {
+            "TowerGetInfo" => self.lnd["tower_info"].clone(),
+            "Stats" => self.lnd["tower_stats"].clone(),
+            "Policy" => self.lnd["tower_policy"].clone(),
+            "ListTowers" => {
+                if p["include_sessions"] != false {
+                    return None;
+                }
+                let mut tower = self.lnd["tower"].clone();
+                tower["session_info"][0]["sessions"] = json!([]);
+                json!({"towers":[tower]})
+            }
+            "GetTowerInfo" => {
+                if p["include_sessions"] != true || p["pubkey"] != self.lnd["tower"]["pubkey"] {
+                    return None;
+                }
+                self.lnd["tower"].clone()
+            }
             "GetInfo" => self.lnd["info"].clone(),
             "getinfo" => self.cln["getinfo"].clone(),
             "WalletBalance" => self.lnd["wallet"].clone(),

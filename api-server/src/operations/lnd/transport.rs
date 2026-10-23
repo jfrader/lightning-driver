@@ -27,6 +27,11 @@ pub(super) enum Rpc {
     Address,
     Send,
     EstimateFee,
+    TowerInfo,
+    TowerStats,
+    TowerPolicy,
+    Towers,
+    Tower,
 }
 impl Rpc {
     pub fn streamed(self) -> bool {
@@ -56,6 +61,11 @@ impl Rpc {
             Self::Address => "/lnrpc.Lightning/NewAddress",
             Self::Send => "/lnrpc.Lightning/SendCoins",
             Self::EstimateFee => "/walletrpc.WalletKit/EstimateFee",
+            Self::TowerInfo => "/watchtowerrpc.Watchtower/GetInfo",
+            Self::TowerStats => "/wtclientrpc.WatchtowerClient/Stats",
+            Self::TowerPolicy => "/wtclientrpc.WatchtowerClient/Policy",
+            Self::Towers => "/wtclientrpc.WatchtowerClient/ListTowers",
+            Self::Tower => "/wtclientrpc.WatchtowerClient/GetTowerInfo",
         }
     }
     pub fn permissions(self) -> Vec<Value> {
@@ -100,6 +110,21 @@ impl Rpc {
             Self::PendingChannels => (get, "v1/channels/pending".into()),
             Self::ClosedChannels => (get, "v1/channels/closed".into()),
             Self::Transactions => (get, "v1/transactions".into()),
+            Self::TowerInfo => (get, "v2/watchtower/server".into()),
+            Self::TowerStats => (get, "v2/watchtower/client/stats".into()),
+            Self::TowerPolicy => (get, "v2/watchtower/client/policy".into()),
+            Self::Towers => (get, "v2/watchtower/client".into()),
+            Self::Tower => (
+                get,
+                format!(
+                    "v2/watchtower/client/info/{}",
+                    base64::engine::general_purpose::URL_SAFE.encode(
+                        base64::engine::general_purpose::STANDARD
+                            .decode(required("pubkey")?)
+                            .map_err(|_| CallError::Invalid)?
+                    )
+                ),
+            ),
             Self::CheckPermissions => (post, "v1/macaroon/checkpermissions".into()),
             Self::AddInvoice => (post, "v1/invoices".into()),
             Self::Pay => (post, "v2/router/send".into()),
@@ -132,14 +157,40 @@ impl Rpc {
 }
 #[derive(Clone, Copy, Debug)]
 pub(super) enum CallError {
+    Inactive,
+    UnregisteredPolicy,
     Offline,
     Limit,
     Invalid,
     Status(tonic::Code),
 }
 impl CallError {
+    pub fn status(rpc: Rpc, code: tonic::Code, message: &str) -> Self {
+        if matches!(
+            rpc,
+            Rpc::TowerInfo | Rpc::TowerStats | Rpc::TowerPolicy | Rpc::Towers | Rpc::Tower
+        ) && code == tonic::Code::Unknown
+        {
+            // LND's macaroon bakery may return a plain error (gRPC Unknown).
+            if message == "permission denied" {
+                return Self::Status(tonic::Code::PermissionDenied);
+            }
+            if matches!(
+                message,
+                "watchtower not active" | "watchtower client not active"
+            ) {
+                return Self::Inactive;
+            }
+            if rpc == Rpc::TowerPolicy && message == "no client for the given blob type" {
+                return Self::UnregisteredPolicy;
+            }
+        }
+        Self::Status(code)
+    }
     pub fn read_code(self) -> ErrorCode {
         match self {
+            Self::Inactive => ErrorCode::NotConfigured,
+            Self::UnregisteredPolicy => ErrorCode::UpstreamRejected,
             Self::Invalid => ErrorCode::UpstreamInvalidResponse,
             Self::Status(tonic::Code::PermissionDenied | tonic::Code::Unauthenticated) => {
                 ErrorCode::NodeAuthError
@@ -314,6 +365,9 @@ impl Rest {
             if rpc == Rpc::Disconnect {
                 obj.remove("pub_key");
             }
+            if rpc == Rpc::Tower {
+                obj.remove("pubkey");
+            }
             // LND's REST gateway accepts the protobuf JSON name for this field only.
             if rpc == Rpc::CheckPermissions {
                 if let Some(value) = obj.remove("full_method") {
@@ -373,7 +427,13 @@ impl Rest {
         }
         if !success {
             let v: Value = serde_json::from_slice(&buffer).map_err(|_| CallError::Invalid)?;
-            return Err(status_error(&v)?);
+            let error = status_error(&v)?;
+            return Err(match error {
+                CallError::Status(code) => {
+                    CallError::status(rpc, code, v["message"].as_str().unwrap_or_default())
+                }
+                error => error,
+            });
         }
         if rpc.streamed() {
             if !buffer.is_empty() {

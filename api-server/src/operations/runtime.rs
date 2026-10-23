@@ -322,7 +322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_state_constructs_all_three_adapters_without_network_contact() {
+    async fn production_state_registers_all_adapters_despite_failed_lnd_surface_probes() {
         let directory = directory();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -358,7 +358,10 @@ mod tests {
                 allow_insecure_loopback: false,
                 client_identity: Default::default(),
                 reauth: Default::default(),
-                limits: Default::default(),
+                limits: lightning_client::settings::Limits {
+                    rpc_seconds: 1,
+                    ..Default::default()
+                },
             },
             nodes,
         };
@@ -370,7 +373,16 @@ mod tests {
         .unwrap();
         assert_eq!(state.engine.nodes.len(), 3);
         assert!(state.engine.unavailable.is_empty());
-        for (_, entry) in state.registry.entries() {
+        for (id, entry) in state.registry.entries() {
+            let mut expected = ReadAvailability::lightning();
+            if id != "synthetic-2" {
+                let unavailable = Capability {
+                    enabled: false,
+                    reason: Some(CapabilityReason::NotConfigured),
+                };
+                expected.watchtower_server = unavailable.clone();
+                expected.watchtower_client = unavailable;
+            }
             assert_eq!(
                 serde_json::to_value(
                     entry
@@ -378,7 +390,7 @@ mod tests {
                         .read_availability
                 )
                 .unwrap(),
-                serde_json::to_value(ReadAvailability::lightning()).unwrap()
+                serde_json::to_value(expected).unwrap()
             );
         }
         let mut without_policy = settings.clone();
@@ -388,9 +400,9 @@ mod tests {
             Err(crate::registry::RegistryError::LightningPolicyRequired)
         ));
         tokio::task::yield_now().await;
-        assert_eq!(
-            listener.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
+        assert!(
+            listener.accept().is_ok(),
+            "LND registration probes contact the configured endpoint"
         );
     }
 }
