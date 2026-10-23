@@ -9,6 +9,7 @@ pub mod journal;
 mod live;
 mod migrations;
 pub mod nostr;
+mod observability;
 mod operations;
 pub mod pagination;
 pub mod reads;

@@ -549,6 +549,22 @@ impl AuthManager {
     }
 
     pub fn revoke(&self, context: &Context) -> Result<(), AuthError> {
+        let mut attempt = crate::observability::AuthAttempt::new(
+            if context.nostr_pubkey.is_some() {
+                crate::observability::Method::Nostr
+            } else {
+                crate::observability::Method::Passkey
+            },
+            crate::observability::AuthAction::SignOut,
+        );
+        let result = self.revoke_context(context);
+        if result.is_ok() {
+            attempt.success();
+        }
+        result
+    }
+
+    fn revoke_context(&self, context: &Context) -> Result<(), AuthError> {
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
         memory.contexts.remove(&context.key);
         memory
@@ -597,14 +613,26 @@ impl AuthManager {
         finish: AuthenticationFinish,
         now: DateTime<Utc>,
     ) -> Result<NewContext, AuthError> {
-        let (ceremony, _verification) = self.take_ceremony(context, finish.challenge_id, now)?;
-        let Purpose::Login(state) = ceremony.purpose else {
-            return Err(AuthError::Challenge);
-        };
-        self.verify_authentication(finish.credential, state, ceremony.generation)
-            .await?;
-        self.revoke(context)?;
-        self.create_context(now, ceremony.generation, true, context.identity)
+        let mut attempt = crate::observability::AuthAttempt::new(
+            crate::observability::Method::Passkey,
+            crate::observability::AuthAction::SignIn,
+        );
+        let result = async {
+            let (ceremony, _verification) =
+                self.take_ceremony(context, finish.challenge_id, now)?;
+            let Purpose::Login(state) = ceremony.purpose else {
+                return Err(AuthError::Challenge);
+            };
+            self.verify_authentication(finish.credential, state, ceremony.generation)
+                .await?;
+            self.revoke_context(context)?;
+            self.create_context(now, ceremony.generation, true, context.identity)
+        }
+        .await;
+        if result.is_ok() {
+            attempt.success();
+        }
+        result
     }
 
     pub async fn start_enrollment(
@@ -613,40 +641,52 @@ impl AuthManager {
         token: Zeroizing<String>,
         now: DateTime<Utc>,
     ) -> Result<RegistrationChallenge, AuthError> {
-        if context.last_authenticated_at.is_some() {
-            return Err(AuthError::Session);
+        let result = async {
+            if context.last_authenticated_at.is_some() {
+                return Err(AuthError::Session);
+            }
+            if token.len() != 64 {
+                return Err(AuthError::Authentication);
+            }
+            let generation = self
+                .journal
+                .claim_enrollment(token, now)
+                .await
+                .map_err(|_| AuthError::Authentication)?;
+            if generation != context.generation {
+                return Err(AuthError::Session);
+            }
+            let passkeys = self.passkeys().await?;
+            if passkeys.len() >= MAX_AUTHENTICATORS {
+                return Err(AuthError::Limited);
+            }
+            let exclude = passkeys
+                .iter()
+                .map(|passkey| passkey.cred_id().clone())
+                .collect();
+            let operator = self.journal.authentication().await?.0;
+            let (options, state) = self
+                .webauthn
+                .start_passkey_registration(operator, "operator", "Operator", Some(exclude))
+                .map_err(|_| AuthError::Authentication)?;
+            let (challenge_id, expires_at) =
+                self.insert_ceremony(context, Purpose::Enrollment(state), now)?;
+            Ok(RegistrationChallenge {
+                challenge_id,
+                expires_at,
+                options,
+            })
         }
-        if token.len() != 64 {
-            return Err(AuthError::Authentication);
+        .await;
+        if result.is_err() {
+            crate::observability::Event::Auth {
+                method: crate::observability::Method::Passkey,
+                action: crate::observability::AuthAction::Enroll,
+                outcome: "failure",
+            }
+            .emit();
         }
-        let generation = self
-            .journal
-            .claim_enrollment(token, now)
-            .await
-            .map_err(|_| AuthError::Authentication)?;
-        if generation != context.generation {
-            return Err(AuthError::Session);
-        }
-        let passkeys = self.passkeys().await?;
-        if passkeys.len() >= MAX_AUTHENTICATORS {
-            return Err(AuthError::Limited);
-        }
-        let exclude = passkeys
-            .iter()
-            .map(|passkey| passkey.cred_id().clone())
-            .collect();
-        let operator = self.journal.authentication().await?.0;
-        let (options, state) = self
-            .webauthn
-            .start_passkey_registration(operator, "operator", "Operator", Some(exclude))
-            .map_err(|_| AuthError::Authentication)?;
-        let (challenge_id, expires_at) =
-            self.insert_ceremony(context, Purpose::Enrollment(state), now)?;
-        Ok(RegistrationChallenge {
-            challenge_id,
-            expires_at,
-            options,
-        })
+        result
     }
 
     pub async fn finish_enrollment(
@@ -655,28 +695,40 @@ impl AuthManager {
         finish: RegistrationFinish,
         now: DateTime<Utc>,
     ) -> Result<NewContext, AuthError> {
-        let (ceremony, _verification) = self.take_ceremony(context, finish.challenge_id, now)?;
-        let Purpose::Enrollment(state) = ceremony.purpose else {
-            return Err(AuthError::Challenge);
-        };
-        let permit = self
-            .workers
-            .clone()
-            .acquire_owned()
+        let mut attempt = crate::observability::AuthAttempt::new(
+            crate::observability::Method::Passkey,
+            crate::observability::AuthAction::Enroll,
+        );
+        let result = async {
+            let (ceremony, _verification) =
+                self.take_ceremony(context, finish.challenge_id, now)?;
+            let Purpose::Enrollment(state) = ceremony.purpose else {
+                return Err(AuthError::Challenge);
+            };
+            let permit = self
+                .workers
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| AuthError::Storage)?;
+            let webauthn = self.webauthn.clone();
+            let (passkey, _permit) = tokio::task::spawn_blocking(move || {
+                let result = webauthn
+                    .finish_passkey_registration(&finish.credential, &state)
+                    .map_err(|_| AuthError::Authentication);
+                result.map(|passkey| (passkey, permit))
+            })
             .await
-            .map_err(|_| AuthError::Storage)?;
-        let webauthn = self.webauthn.clone();
-        let (passkey, _permit) = tokio::task::spawn_blocking(move || {
-            let result = webauthn
-                .finish_passkey_registration(&finish.credential, &state)
-                .map_err(|_| AuthError::Authentication);
-            result.map(|passkey| (passkey, permit))
-        })
-        .await
-        .map_err(|_| AuthError::Authentication)??;
-        self.register_passkey(passkey, ceremony.generation).await?;
-        self.revoke(context)?;
-        self.create_context(now, ceremony.generation, true, context.identity)
+            .map_err(|_| AuthError::Authentication)??;
+            self.register_passkey(passkey, ceremony.generation).await?;
+            self.revoke_context(context)?;
+            self.create_context(now, ceremony.generation, true, context.identity)
+        }
+        .await;
+        if result.is_ok() {
+            attempt.success();
+        }
+        result
     }
 
     pub async fn start_authorization(

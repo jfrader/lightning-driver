@@ -100,7 +100,7 @@ async fn serve(settings: Settings) -> Result<(), StartupError> {
         .bind(settings.api.bind)
         .map_err(|_| StartupError::Listener)?;
     for address in server.addrs() {
-        eprintln!("API listening on {address}");
+        crate::observability::Event::startup(&settings, address).emit();
     }
     let server = server.run();
     let result = server.await.map_err(|_| StartupError::Listener);

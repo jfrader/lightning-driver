@@ -200,7 +200,7 @@ pub(super) async fn status(
     let node = node.to_string();
     job(engine, move |connection| {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        crate::journal::expire_reviews(&tx, e.clock.now())?;
+        let expired = crate::journal::expire_reviews(&tx, e.clock.now())?;
         let generation = generation(&tx)?;
         e.auth
             .with_claim_session(&context, generation, e.clock.now(), |session| {
@@ -210,6 +210,7 @@ pub(super) async fn status(
                 }
                 session.project(&mut operation);
                 tx.commit()?;
+                crate::journal::log_expired(expired);
                 Ok(operation)
             })
     })
@@ -221,6 +222,8 @@ pub(super) async fn uncertain(engine: &Engine, id: Uuid, code: ErrorCode) -> Res
     job(engine, move |connection| {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let mut operation = load(&tx, id)?;
+        let from = operation.state;
+        let stage = operation.stage;
         if !operation.state.terminal() && dispatched(&tx, id)? {
             let knowledge: String = tx.query_row(
                 "SELECT evidence FROM operation_intents WHERE operation_id=?1",
@@ -248,6 +251,9 @@ pub(super) async fn uncertain(engine: &Engine, id: Uuid, code: ErrorCode) -> Res
             }
         }
         tx.commit()?;
+        if from != operation.state || stage != operation.stage {
+            crate::observability::Event::transition(Some(from), &operation).emit();
+        }
         Ok(operation)
     })
     .await
@@ -266,7 +272,7 @@ pub(super) async fn replay(
     let input = input.to_string();
     job(engine, move |connection| {
         let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        crate::journal::expire_reviews(&tx, e.clock.now())?;
+        let expired = crate::journal::expire_reviews(&tx, e.clock.now())?;
         let gate = e.node(&node)?;
         let pinned = gate.lock().map_err(|_| failure(ErrorCode::InternalError))?;
         let generation = generation(&tx)?;
@@ -281,6 +287,7 @@ pub(super) async fn replay(
                     session.project(operation);
                 }
                 tx.commit()?;
+                crate::journal::log_expired(expired);
                 Ok(operation)
             })
     })
@@ -299,14 +306,14 @@ pub(super) async fn create(
     let context = context.clone();
     job(engine,move |connection| {
         let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        crate::journal::expire_reviews(&tx,e.clock.now())?;
+        let expired = crate::journal::expire_reviews(&tx,e.clock.now())?;
         let gate=e.node(&intent.operation.node_id)?;let pinned=gate.lock().map_err(|_|failure(ErrorCode::InternalError))?;
         let generation=generation(&tx)?;
         e.auth.with_claim_session(&context,generation,e.clock.now(),|session| {
             let now=e.clock.now();let config=&pinned.as_ref().ok_or_else(||failure(ErrorCode::NotFound))?.config;
                 writable(config)?;
             if let Some(mut existing)=replay_in(&tx,&intent.operation.node_id,key,&intent.input_digest)? {
-                session.project(&mut existing);tx.commit()?;return Ok((existing, false));
+                session.project(&mut existing);tx.commit()?;crate::journal::log_expired(expired);return Ok((existing, false));
             }
             check(&intent,&intent.operation,config,Some(&facts),now)?;
             paid(&tx,&intent)?;
@@ -321,7 +328,10 @@ pub(super) async fn create(
             for resource in intent.resources() {tx.execute("INSERT INTO resource_claims VALUES(?1,?2,?3)",params![operation.node_id,resource.key(),operation.id.to_string()])?;}
             if let Some(secret)=secret {tx.execute("INSERT INTO pending_invoice_secrets VALUES(?1,?2)",params![operation.id.to_string(),secret.0])?;}
             e.faults.hit(FaultPoint::BeforeCreateCommit)?;
-            tx.commit()?;Ok((operation.clone(), true))
+            tx.commit()?;
+            crate::journal::log_expired(expired);
+            crate::observability::Event::transition(None, operation).emit();
+            Ok((operation.clone(), true))
         })
     }).await
 }
@@ -454,6 +464,7 @@ pub(super) async fn claim(
                 }
                 session.consume(&operation, authorization)?;
                 e.faults.hit(FaultPoint::AfterGrantRemoval)?;
+                let from = operation.state;
                 operation.state = OperationState::Dispatching;
                 operation.stage = OperationStage::Submitted;
                 operation.authorization.status = if operation.review.sensitive {
@@ -478,6 +489,7 @@ pub(super) async fn claim(
                 e.faults.hit(FaultPoint::BeforeClaimCommit)?;
                 tx.commit()
                     .map_err(|error| EngineError::from(error).claimed(id))?;
+                crate::observability::Event::transition(Some(from), &operation).emit();
                 e.faults
                     .hit(FaultPoint::CommitAcknowledgement)
                     .map_err(|error| error.claimed(id))?;
@@ -571,6 +583,12 @@ pub(super) async fn observation_query(
         tx.execute("UPDATE operation_intents SET next_sequence=?1 WHERE operation_id=?2",params![sequence,id.to_string()])?;
         tx.execute("UPDATE operation_intents SET evidence=?1 WHERE operation_id=?2",params![serde_json::to_string(&knowledge)?,id.to_string()])?;
         tx.commit()?;
+        crate::observability::Event::Reconciliation {
+            operation_id: id,
+            attempt: knowledge.reconciliation.attempts,
+            next_delay_seconds: knowledge.reconciliation.next_attempt_at.map(|next| next.signed_duration_since(now).num_seconds()),
+            exhausted: knowledge.reconciliation.exhausted,
+        }.emit();
         let (close_type,close_txids)=match operation.result {Some(OperationResult::CloseChannel{close_type,txids,..})=>(Some(close_type),txids),_=>(None,vec![])};
         Ok(Some(ObservationQuery{request:operation.request.clone(),operation_id:id,binding:operation.review.node,generation:config.generation,kind:operation.request.kind(),claim_id:Uuid::parse_str(&claim).map_err(|_|failure(ErrorCode::StorageUnavailable))?,sequence,reference:knowledge.reference,close_type,close_txids}))
     }).await
@@ -637,6 +655,8 @@ pub(super) async fn apply(
             |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
         )?;
         let claim = Uuid::parse_str(&claim).map_err(|_| failure(ErrorCode::StorageUnavailable))?;
+        let from = operation.state;
+        let stage = operation.stage;
         let transition = evidence::transition(
             &intent,
             operation,
@@ -675,6 +695,9 @@ pub(super) async fn apply(
         }
         e.faults.hit(FaultPoint::ObservationCommit)?;
         tx.commit()?;
+        if from != transition.operation.state || stage != transition.operation.stage {
+            crate::observability::Event::transition(Some(from), &transition.operation).emit();
+        }
         Ok(transition.operation)
     })
     .await

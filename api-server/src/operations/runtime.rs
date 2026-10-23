@@ -75,6 +75,7 @@ impl Engine {
             if node.kind() == NodeKind::Bitcoin {
                 match crate::bitcoin::BitcoinReads::connect(node, &settings.api.limits).await {
                     Ok(reads) => {
+                        crate::observability::Event::registration(node, None).emit();
                         monitors.insert(
                             node.id.clone(),
                             MonitorNode {
@@ -84,6 +85,7 @@ impl Engine {
                         );
                     }
                     Err(error) => {
+                        crate::observability::Event::registration(node, Some(error.code())).emit();
                         unavailable.insert(node.id.clone(), (true, error.code()));
                     }
                 }
@@ -92,10 +94,12 @@ impl Engine {
             let result = construct(node, &settings.api, entry).await;
             match result {
                 Ok(pinned) => {
+                    crate::observability::Event::registration(node, None).emit();
                     registry.register_availability(&node.id, pinned.reads.availability().await);
                     nodes.insert(node.id.clone(), Arc::new(Mutex::new(Some(pinned))));
                 }
                 Err(error) => {
+                    crate::observability::Event::registration(node, Some(error.code)).emit();
                     unavailable.insert(
                         node.id.clone(),
                         (node.read_only.unwrap_or(true), error.code),

@@ -313,7 +313,7 @@ impl Journal {
                 if digest!=digest_before { return Err(JournalError::IdempotencyConflict(existing.id)); }
                 return Ok(Created::Existing(Box::new(existing)));
             }
-            expire_reviews(&tx,Utc::now())?;
+            let expired = expire_reviews(&tx,Utc::now())?;
             for resource in &resources {
                 if let Some(blocker)=tx.query_row("SELECT operation_id FROM resource_claims WHERE node_id=?1 AND resource=?2",params![operation.node_id,resource.key()],|row|row.get::<_,String>(0)).optional()? {
                     let id=Uuid::parse_str(&blocker).map_err(|_|JournalError::Storage)?;
@@ -326,6 +326,8 @@ impl Journal {
             for resource in resources { tx.execute("INSERT INTO resource_claims(node_id,resource,operation_id) VALUES(?1,?2,?3)",params![operation.node_id,resource.key(),operation.id.to_string()])?; }
             if let Some(ciphertext)=secret { tx.execute("INSERT INTO pending_invoice_secrets(operation_id,ciphertext) VALUES(?1,?2)",params![operation.id.to_string(),ciphertext.0])?; }
             tx.commit()?;
+            log_expired(expired);
+            crate::observability::Event::transition(None, &operation).emit();
             Ok(Created::New(Box::new(operation)))
         }).await
     }
@@ -333,9 +335,10 @@ impl Journal {
     pub async fn get(&self, id: Uuid) -> Result<Operation, JournalError> {
         self.run(move |connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            expire_reviews(&tx, Utc::now())?;
+            let expired = expire_reviews(&tx, Utc::now())?;
             let operation = load(&tx, id)?;
             tx.commit()?;
+            log_expired(expired);
             Ok(operation)
         })
         .await
@@ -385,6 +388,7 @@ impl Journal {
             if operation.review.expires_at <= now {
                 return Err(JournalError::ReviewExpired);
             }
+            let from = operation.state;
             operation.state = OperationState::Dispatching;
             operation.stage = OperationStage::Submitted;
             operation.authorization.status = if operation.review.sensitive {
@@ -398,6 +402,7 @@ impl Journal {
                 params![serde_json::to_string(&operation)?, id.to_string()],
             )?;
             tx.commit()?;
+            crate::observability::Event::transition(Some(from), &operation).emit();
             Ok(Claimed::New(Box::new(operation)))
         })
         .await
@@ -420,6 +425,8 @@ impl Journal {
             let dispatched:bool=tx.query_row("SELECT dispatched FROM operations WHERE id=?1",[id.to_string()],|row|row.get(0))?;
             if !dispatched { return Err(JournalError::NotReviewable); }
             if matches!(state,OperationState::AwaitingConfirmation|OperationState::Dispatching|OperationState::Expired) {return Err(JournalError::NotReviewable);}
+            let from = operation.state;
+            let old_stage = operation.stage;
             operation.state=state;operation.stage=stage;operation.result=result.or(operation.result);
             operation.error=error;operation.updated_at=now;operation.last_reconciled_at=Some(now);
             save(&tx,&operation)?;
@@ -429,7 +436,11 @@ impl Journal {
                 } else { tx.execute("DELETE FROM resource_claims WHERE operation_id=?1",[id.to_string()])?; }
                 tx.execute("DELETE FROM pending_invoice_secrets WHERE operation_id=?1",[id.to_string()])?;
             }
-            tx.commit()?;Ok(operation)
+            tx.commit()?;
+            if from != operation.state || old_stage != operation.stage {
+                crate::observability::Event::transition(Some(from), &operation).emit();
+            }
+            Ok(operation)
         }).await
     }
 
@@ -460,6 +471,8 @@ impl Journal {
             for row in rows {
                 let mut operation: Operation = serde_json::from_str(&row?)?;
                 if !operation.state.terminal() {
+                    let from = operation.state;
+                    let stage = operation.stage;
                     operation.state = OperationState::Unknown;
                     operation.stage = OperationStage::Reconciling;
                     operation.updated_at = now;
@@ -470,17 +483,23 @@ impl Journal {
                         operation_id: Some(operation.id),
                         outcome: ErrorOutcome::Unknown,
                     });
-                    recovering.push(operation);
+                    recovering.push((from, stage, operation));
                 }
             }
             drop(statement);
-            for operation in recovering {
-                save(&tx, &operation)?;
+            for (_, _, operation) in &recovering {
+                save(&tx, operation)?;
             }
             // Restart expires every undispatched review, including future-dated ones.
             // The cutoff is MAX_UTC; the transition timestamp is the captured startup now.
-            expire_reviews_before(&tx, DateTime::<Utc>::MAX_UTC, now)?;
+            let expired = expire_reviews_before(&tx, DateTime::<Utc>::MAX_UTC, now)?;
             tx.commit()?;
+            log_expired(expired);
+            for (from, stage, operation) in recovering {
+                if from != operation.state || stage != operation.stage {
+                    crate::observability::Event::transition(Some(from), &operation).emit();
+                }
+            }
             Ok(())
         })
         .await
@@ -525,7 +544,7 @@ fn save(connection: &Connection, operation: &Operation) -> Result<(), JournalErr
 pub(crate) fn expire_reviews(
     connection: &Connection,
     now: DateTime<Utc>,
-) -> Result<(), JournalError> {
+) -> Result<Vec<crate::observability::Event<'static>>, JournalError> {
     expire_reviews_before(connection, now, now)
 }
 
@@ -533,10 +552,11 @@ fn expire_reviews_before(
     connection: &Connection,
     cutoff: DateTime<Utc>,
     now: DateTime<Utc>,
-) -> Result<(), JournalError> {
+) -> Result<Vec<crate::observability::Event<'static>>, JournalError> {
     crate::history::register_time_functions(connection)?;
-    connection.execute(
-        "UPDATE operations
+    let expired = {
+        let mut statement = connection.prepare(
+            "UPDATE operations
          SET body=json_set(body,'$.state','expired','$.updated_at',?1)
          WHERE dispatched=0
            AND state='awaiting_confirmation'
@@ -546,13 +566,41 @@ fn expire_reviews_before(
                creation_seconds(json_extract(body,'$.review.expires_at'))=?2
                AND creation_nanos(json_extract(body,'$.review.expires_at'))<=?3
              )
-           )",
-        params![
+            ) RETURNING json_object(
+                'id', id,
+                'kind', kind,
+                'stage', json_extract(body,'$.stage')
+            )",
+        )?;
+        let mut rows = statement.query(params![
             now.to_rfc3339(),
             cutoff.timestamp(),
             i64::from(cutoff.timestamp_subsec_nanos()),
-        ],
-    )?;
+        ])?;
+        let mut expired = Vec::new();
+        while let Some(row) = rows.next()? {
+            // Return only log metadata, not potentially large request/result bodies.
+            #[derive(serde::Deserialize)]
+            struct Expired {
+                id: Uuid,
+                kind: lightning_client::model::OperationKind,
+                stage: OperationStage,
+            }
+            if let Ok(body) = row.get::<_, String>(0) {
+                if let Ok(operation) = serde_json::from_str::<Expired>(&body) {
+                    expired.push(crate::observability::Event::OperationTransition {
+                        operation_id: operation.id,
+                        kind: operation.kind,
+                        from: Some(OperationState::AwaitingConfirmation),
+                        to: OperationState::Expired,
+                        stage: operation.stage,
+                        outcome: ErrorOutcome::NotDispatched,
+                    });
+                }
+            }
+        }
+        expired
+    };
     for table in ["resource_claims", "pending_invoice_secrets"] {
         let statement = format!(
             "DELETE FROM {table}
@@ -563,7 +611,13 @@ fn expire_reviews_before(
         );
         connection.execute(&statement, [])?;
     }
-    Ok(())
+    Ok(expired)
+}
+
+pub(crate) fn log_expired(expired: Vec<crate::observability::Event<'static>>) {
+    for event in expired {
+        event.emit();
+    }
 }
 
 fn ensure_protected(path: &Path) -> Result<(), JournalError> {

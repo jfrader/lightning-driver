@@ -116,6 +116,11 @@ impl ResponseError for ApiError {
         let mut response = HttpResponse::build(self.status_code());
         response.insert_header(("Cache-Control", "no-store"));
         if self.code == ErrorCode::RateLimited {
+            crate::observability::Event::RateLimited {
+                scope: "api",
+                retry_after_seconds: Some(self.retry_after.unwrap_or(60)),
+            }
+            .emit();
             response.insert_header(("Retry-After", self.retry_after.unwrap_or(60).to_string()));
         }
         response.json(ErrorEnvelope {

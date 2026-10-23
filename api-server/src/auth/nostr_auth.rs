@@ -199,6 +199,25 @@ impl AuthManager {
         request: NostrStart,
         now: DateTime<Utc>,
     ) -> Result<NostrChallenge, AuthError> {
+        let action = crate::observability::AuthAction::nostr(&request.purpose);
+        self.start_nostr_inner(context, request, now)
+            .await
+            .inspect_err(|_| {
+                crate::observability::Event::Auth {
+                    method: crate::observability::Method::Nostr,
+                    action,
+                    outcome: "failure",
+                }
+                .emit();
+            })
+    }
+
+    async fn start_nostr_inner(
+        &self,
+        context: &Context,
+        request: NostrStart,
+        now: DateTime<Utc>,
+    ) -> Result<NostrChallenge, AuthError> {
         let authenticated = context.last_authenticated_at.is_some();
         if !matches!(
             request.purpose.as_str(),
@@ -358,7 +377,15 @@ impl AuthManager {
         now: DateTime<Utc>,
     ) -> Result<(String, String, Option<NewContext>), AuthError> {
         self.preflight_nostr(context, finish.challenge_id, now)
-            .await?;
+            .await
+            .inspect_err(|_| {
+                crate::observability::Event::Auth {
+                    method: crate::observability::Method::Nostr,
+                    action: crate::observability::AuthAction::Challenge,
+                    outcome: "failure",
+                }
+                .emit();
+            })?;
         self.verify_nostr_transaction(context, finish, operation, now)
             .await
     }
@@ -407,6 +434,7 @@ impl AuthManager {
             .map_err(|_| AuthError::Storage)?;
         self.journal.run(move |connection| {
             let _permit = permit;
+            let mut attempt = crate::observability::AuthAttempt::new(crate::observability::Method::Nostr, crate::observability::AuthAction::Challenge);
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let Some(challenge) = StoredChallenge::load(&tx, finish.challenge_id)? else { return Ok(Err(AuthError::Challenge)); };
             let mut memory = manager.memory.lock().map_err(|_| JournalError::Storage)?;
@@ -414,6 +442,7 @@ impl AuthManager {
             let current: i64 = tx.query_row("SELECT generation FROM auth_meta WHERE singleton=1", [], |row| row.get(0))?;
             if let Err(error) = challenge.validate(&context, current, &memory, now) { return Ok(Err(error)); }
             let StoredChallenge { generation, nonce_hash, binding, .. } = challenge;
+            attempt.action(crate::observability::AuthAction::nostr(&binding.purpose));
             memory.nostr_failures.retain(|_, queue| {
                 while queue.front().is_some_and(|time| *time + Duration::seconds(RATE_WINDOW_SECONDS) <= now) { queue.pop_front(); }
                 !queue.is_empty()
@@ -508,6 +537,7 @@ impl AuthManager {
                 memory.nostr_pending.clear();
                 memory.grants.clear();
             }
+            attempt.success();
             Ok(Ok((binding.purpose,key,session)))
         }).await?
     }
