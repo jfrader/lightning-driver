@@ -274,8 +274,14 @@ impl Credentials {
         {
             return Err(failure(ErrorCode::NotConfigured));
         }
-        let certificate = read_protected(&settings.certificate_file, false)
-            .map_err(|_| failure(ErrorCode::NotConfigured))?;
+        let certificate = read_protected(
+            settings
+                .certificate_file
+                .as_deref()
+                .ok_or_else(|| failure(ErrorCode::NotConfigured))?,
+            false,
+        )
+        .map_err(|_| failure(ErrorCode::NotConfigured))?;
         let bytes = zeroize::Zeroizing::new(
             read_protected(&settings.credential_file, true)
                 .map_err(|_| failure(ErrorCode::NotConfigured))?,

@@ -191,7 +191,7 @@ fn settings(dir: &std::path::Path, endpoint: url::Url, backend: Backend) -> Node
         label: "Synthetic".into(),
         backend,
         endpoint,
-        certificate_file: cert,
+        certificate_file: Some(cert),
         tls_verification: lightning_client::settings::TlsVerification::Ca,
         credential_file: mac,
         expected_pubkey: Some(peer()),
@@ -828,9 +828,17 @@ async fn pinned_tls_case(ip: bool, rotate: bool, wrong_san: bool, ca: bool) {
         };
         if rotate {
             let (other, _, _) = stock_lnd_certificate("subjectAltName=DNS:localhost,IP:127.0.0.1");
-            std::fs::copy(other.path().join("tls.cert"), &s.certificate_file).unwrap();
+            std::fs::copy(
+                other.path().join("tls.cert"),
+                s.certificate_file.as_ref().unwrap(),
+            )
+            .unwrap();
         } else {
-            std::fs::copy(cert_dir.path().join("tls.cert"), &s.certificate_file).unwrap();
+            std::fs::copy(
+                cert_dir.path().join("tls.cert"),
+                s.certificate_file.as_ref().unwrap(),
+            )
+            .unwrap();
         }
         let output = if grpc {
             LndGrpcAdapter::connect(&s, &Limits::default(), config(backend))
@@ -899,7 +907,18 @@ async fn configuration_and_identity_fail_closed_without_mutation() {
         assert!(Rest::connect(&s, &Limits::default()).is_err());
     }
     s.endpoint = "https://localhost:1/".parse().unwrap();
-    std::fs::write(&s.certificate_file, b"").unwrap();
+    let certificate = s.certificate_file.take();
+    for verification in [
+        lightning_client::settings::TlsVerification::Ca,
+        lightning_client::settings::TlsVerification::Pinned,
+    ] {
+        s.tls_verification = verification;
+        assert!(Rest::connect(&s, &Limits::default()).is_err());
+        assert!(grpc::Grpc::connect(&s, &Limits::default()).await.is_err());
+    }
+    s.certificate_file = certificate;
+    s.tls_verification = lightning_client::settings::TlsVerification::Ca;
+    std::fs::write(s.certificate_file.as_ref().unwrap(), b"").unwrap();
     assert!(Rest::connect(&s, &Limits::default()).is_err());
     assert!(grpc::Grpc::connect(&s, &Limits::default()).await.is_err());
     let mut wrong = fixture()["info"].clone();

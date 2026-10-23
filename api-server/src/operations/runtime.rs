@@ -124,8 +124,13 @@ impl Engine {
 
 // Bind the connection generation to effective settings AND protected material, never paths alone.
 fn material_revision(node: &NodeSettings, binding: &str) -> Result<[u8; 32]> {
-    let certificate = read_protected(&node.certificate_file, false)
-        .map_err(|_| failure(ErrorCode::NotConfigured))?;
+    let certificate = read_protected(
+        node.certificate_file
+            .as_deref()
+            .ok_or_else(|| failure(ErrorCode::NotConfigured))?,
+        false,
+    )
+    .map_err(|_| failure(ErrorCode::NotConfigured))?;
     let credential = zeroize::Zeroizing::new(
         read_protected(&node.credential_file, true)
             .map_err(|_| failure(ErrorCode::NotConfigured))?,

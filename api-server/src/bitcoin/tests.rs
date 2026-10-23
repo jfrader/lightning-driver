@@ -138,6 +138,45 @@ async fn ibd_pruning_warnings_and_absent_peer_values_are_projected() {
     assert!(peers.items[0].synced_headers.is_none());
 }
 #[tokio::test]
+async fn plaintext_loopback_never_reads_certificate_material() {
+    let harness = BitcoinHarness::start().await.unwrap();
+    let mut settings = harness.settings();
+    assert!(settings.certificate_file.is_none());
+    for certificate in [
+        None,
+        Some(settings.credential_file.with_file_name("missing-cert")),
+    ] {
+        settings.certificate_file = certificate;
+        let reads = BitcoinReads::connect(&settings, &Limits::default())
+            .await
+            .unwrap();
+        reads.read(ReadQuery::Bitcoin).await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn https_transport_requires_certificate_for_ca_and_pinned_tls() {
+    let harness = BitcoinHarness::start().await.unwrap();
+    let mut settings = harness.settings();
+    settings.endpoint.set_scheme("https").unwrap();
+    for verification in [
+        lightning_client::settings::TlsVerification::Ca,
+        lightning_client::settings::TlsVerification::Pinned,
+    ] {
+        settings.tls_verification = verification;
+        assert_eq!(
+            BitcoinReads::connect(&settings, &Limits::default())
+                .await
+                .err()
+                .unwrap()
+                .code(),
+            ErrorCode::NotConfigured
+        );
+    }
+    assert!(harness.scenario.lock().unwrap().calls.is_empty());
+}
+
+#[tokio::test]
 async fn plaintext_remote_addresses_are_rejected_before_rpc_contact() {
     let harness = BitcoinHarness::start().await.unwrap();
     let mut settings = harness.settings();
