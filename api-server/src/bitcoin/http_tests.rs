@@ -14,7 +14,7 @@ impl Fixture {
     async fn with_limits(limits: Limits) -> Self {
         let directory = tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in("/tmp/opencode")
+            .tempdir()
             .unwrap();
         let harness = BitcoinHarness::start().await.unwrap();
         let settings = Settings {

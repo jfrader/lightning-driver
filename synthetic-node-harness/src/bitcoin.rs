@@ -64,7 +64,7 @@ impl BitcoinHarness {
         let directory = tempfile::Builder::new()
             .prefix("bitcoin-synthetic-")
             .permissions(std::fs::Permissions::from_mode(0o700))
-            .tempdir_in("/tmp/opencode")?;
+            .tempdir()?;
         let credential = directory.path().join("cookie");
         std::fs::write(&credential, CREDENTIAL)?;
         std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o600))?;
