@@ -76,7 +76,7 @@ fn check_config(
     if settings.backend != b
         || c.backend != b
         || settings.id != c.binding.node_id
-        || settings.expected_pubkey != c.binding.identity_pubkey
+        || settings.expected_pubkey.as_deref() != Some(c.binding.identity_pubkey.as_str())
         || settings.network != intent::network(&c.binding)
     {
         return Err(failure(ErrorCode::NotConfigured));

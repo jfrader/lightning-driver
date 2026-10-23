@@ -29,7 +29,7 @@ impl ClnAdapter {
         if settings.backend != Backend::ClnRest
             || config.backend != Backend::ClnRest
             || settings.id != config.binding.node_id
-            || settings.expected_pubkey != config.binding.identity_pubkey
+            || settings.expected_pubkey.as_deref() != Some(config.binding.identity_pubkey.as_str())
             || settings.network != intent::network(&config.binding)
         {
             return Err(failure(ErrorCode::NotConfigured));

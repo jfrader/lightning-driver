@@ -820,11 +820,12 @@ fn settings(directory: &std::path::Path, endpoint: url::Url) -> NodeSettings {
         certificate_file: cert,
         tls_verification: lightning_client::settings::TlsVerification::Ca,
         credential_file: rune,
-        expected_pubkey: peer(),
+        expected_pubkey: Some(peer()),
+        expected_genesis: None,
         network: Network::Regtest,
-        read_only: false,
-        policy: config().policy.limits,
-        peer_policy: PeerPolicy::default(),
+        read_only: Some(false),
+        policy: Some(config().policy.limits),
+        peer_policy: Some(PeerPolicy::default()),
     }
 }
 async fn tls_server(host: &str) -> (url::Url, tokio::task::JoinHandle<Option<Value>>) {

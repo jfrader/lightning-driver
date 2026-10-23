@@ -16,7 +16,7 @@ impl Journey {
             .await
             .unwrap();
         let mut node = harness.node("synthetic");
-        node.read_only = read_only;
+        node.read_only = Some(read_only);
         let settings = Settings {
             api: ApiSettings {
                 bind: "127.0.0.1:0".parse().unwrap(),

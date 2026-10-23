@@ -1,5 +1,5 @@
 use crate::{
-    model::{Backend, Network, ReauthMode},
+    model::{Backend, Network, NodeKind, ReauthMode},
     money::{Decimal, Msat},
 };
 use serde::{Deserialize, Serialize};
@@ -154,12 +154,74 @@ pub struct NodeSettings {
     #[serde(default)]
     pub tls_verification: TlsVerification,
     pub credential_file: PathBuf,
-    pub expected_pubkey: String,
+    pub expected_pubkey: Option<String>,
+    pub expected_genesis: Option<String>,
     pub network: Network,
-    pub read_only: bool,
-    pub policy: MoneyPolicy,
-    #[serde(default)]
-    pub peer_policy: PeerPolicy,
+    pub read_only: Option<bool>,
+    pub policy: Option<MoneyPolicy>,
+    pub peer_policy: Option<PeerPolicy>,
+}
+
+impl NodeSettings {
+    pub fn kind(&self) -> NodeKind {
+        self.backend.kind()
+    }
+
+    fn validate_kind(&self) -> Result<(), SettingsError> {
+        if self.kind() == NodeKind::Bitcoin {
+            if self.expected_pubkey.is_some()
+                || self.read_only.is_some()
+                || self.policy.is_some()
+                || self.peer_policy.is_some()
+            {
+                return Err(SettingsError("Bitcoin nodes cannot configure Lightning fields: expected_pubkey, read_only, policy or peer_policy"));
+            }
+            let genesis = self
+                .expected_genesis
+                .as_deref()
+                .ok_or(SettingsError("Bitcoin nodes require expected_genesis"))?;
+            if genesis.len() != 64 || !genesis.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+                return Err(SettingsError(
+                    "Bitcoin expected_genesis must be a 32-byte hex hash",
+                ));
+            }
+            return Ok(());
+        }
+        if self.expected_genesis.is_some() {
+            return Err(SettingsError(
+                "Lightning nodes cannot configure expected_genesis",
+            ));
+        }
+        let expected_pubkey = self
+            .expected_pubkey
+            .as_deref()
+            .ok_or(SettingsError("Lightning nodes require expected_pubkey"))?;
+        let identity = expected_pubkey
+            .parse::<bitcoin::secp256k1::PublicKey>()
+            .map_err(|_| SettingsError("Invalid expected node identity"))?;
+        if identity.to_string() != expected_pubkey {
+            return Err(SettingsError(
+                "Expected node identity must be canonical compressed hex",
+            ));
+        }
+        self.read_only
+            .ok_or(SettingsError("Lightning nodes require read_only"))?;
+        self.policy
+            .as_ref()
+            .ok_or(SettingsError("Lightning nodes require policy"))?
+            .validate()?;
+        let peers = self
+            .peer_policy
+            .as_ref()
+            .ok_or(SettingsError("Lightning nodes require peer_policy"))?;
+        for host in &peers.allowed_hosts {
+            validate_peer_host(host)?;
+        }
+        if peers.allowed_ports.contains(&0) {
+            return Err(SettingsError("Invalid P2P port policy"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -278,28 +340,14 @@ impl Settings {
                 return Err(SettingsError("Invalid node label"));
             }
             validate_endpoint(&node.endpoint)?;
-            if node.tls_verification == TlsVerification::Pinned && node.backend == Backend::ClnRest
+            if node.tls_verification == TlsVerification::Pinned
+                && !matches!(node.backend, Backend::LndGrpc | Backend::LndRest)
             {
                 return Err(SettingsError("Pinned TLS requires an LND backend"));
             }
-            let identity = node
-                .expected_pubkey
-                .parse::<bitcoin::secp256k1::PublicKey>()
-                .map_err(|_| SettingsError("Invalid expected node identity"))?;
-            if identity.to_string() != node.expected_pubkey {
-                return Err(SettingsError(
-                    "Expected node identity must be canonical compressed hex",
-                ));
-            }
+            node.validate_kind()?;
             if node.network == Network::Unknown {
                 return Err(SettingsError("Expected node network is required"));
-            }
-            node.policy.validate()?;
-            for host in &node.peer_policy.allowed_hosts {
-                validate_peer_host(host)?;
-            }
-            if node.peer_policy.allowed_ports.contains(&0) {
-                return Err(SettingsError("Invalid P2P port policy"));
             }
         }
         Ok(())
@@ -603,17 +651,40 @@ mod tests {
             certificate_file: PathBuf::from("UNUSED_CERT"),
             tls_verification: TlsVerification::Ca,
             credential_file: PathBuf::from("UNUSED_CREDENTIAL"),
-            expected_pubkey: identity,
+            expected_pubkey: Some(identity),
+            expected_genesis: None,
             network: Network::Regtest,
-            read_only: false,
-            policy: policy.limits,
-            peer_policy: PeerPolicy::default(),
+            read_only: Some(false),
+            policy: Some(policy.limits),
+            peer_policy: Some(PeerPolicy::default()),
         };
         let mut settings = Settings {
             api: api("https://manager.example.invalid", false),
             nodes: vec![node.clone()],
         };
         assert!(settings.validate().is_ok());
+        for (field, message) in [
+            ("expected_pubkey", "Lightning nodes require expected_pubkey"),
+            ("read_only", "Lightning nodes require read_only"),
+            ("policy", "Lightning nodes require policy"),
+            ("peer_policy", "Lightning nodes require peer_policy"),
+        ] {
+            let mut missing = node.clone();
+            match field {
+                "expected_pubkey" => missing.expected_pubkey = None,
+                "read_only" => missing.read_only = None,
+                "policy" => missing.policy = None,
+                "peer_policy" => missing.peer_policy = None,
+                _ => unreachable!(),
+            }
+            assert_eq!(missing.validate_kind().unwrap_err().0, message);
+        }
+        let mut stray = node.clone();
+        stray.expected_genesis = Some("ab".repeat(32));
+        assert_eq!(
+            stray.validate_kind().unwrap_err().0,
+            "Lightning nodes cannot configure expected_genesis"
+        );
         settings.nodes.push(node.clone());
         assert!(settings.validate().is_err());
         settings.nodes.pop();
@@ -627,18 +698,90 @@ mod tests {
         settings.nodes[0].network = Network::Unknown;
         assert!(settings.validate().is_err());
         settings.nodes[0] = node.clone();
-        settings.nodes[0].expected_pubkey = "not-a-key".into();
+        settings.nodes[0].expected_pubkey = Some("not-a-key".into());
         assert!(settings.validate().is_err());
         settings.nodes[0] = node.clone();
         settings.nodes[0].endpoint = "http://node.example.invalid".parse().unwrap();
         assert!(settings.validate().is_err());
         settings.nodes[0] = node.clone();
-        settings.nodes[0].policy.default_max_routing_fee_msat =
-            Msat("9223372036854775807".parse().unwrap());
+        settings.nodes[0]
+            .policy
+            .as_mut()
+            .unwrap()
+            .default_max_routing_fee_msat = Msat("9223372036854775807".parse().unwrap());
         assert!(settings.validate().is_err());
         settings.nodes[0] = node;
-        settings.nodes[0].policy.send_onchain_sat.min = Decimal::ZERO;
+        settings.nodes[0]
+            .policy
+            .as_mut()
+            .unwrap()
+            .send_onchain_sat
+            .min = Decimal::ZERO;
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn bitcoin_settings_validate_identity_and_reject_lightning_fields() {
+        let base = serde_json::json!({
+            "id":"bitcoin-lab", "label":"Bitcoin Core lab", "backend":"bitcoin_rpc",
+            "endpoint":"https://bitcoin.example.invalid", "certificate_file":"UNUSED_CERT",
+            "credential_file":"UNUSED_CREDENTIAL", "network":"testnet4",
+            "expected_genesis":"0000000000000000000000000000000000000000000000000000000000000001"
+        });
+        let check = |value| {
+            let node: NodeSettings = serde_json::from_value(value).unwrap();
+            assert_eq!(node.kind(), NodeKind::Bitcoin);
+            Settings {
+                api: api("https://manager.example.invalid", false),
+                nodes: vec![node],
+            }
+            .validate()
+        };
+        assert!(check(base.clone()).is_ok());
+        let mut value = base.clone();
+        value.as_object_mut().unwrap().remove("expected_genesis");
+        assert_eq!(
+            check(value).unwrap_err().0,
+            "Bitcoin nodes require expected_genesis"
+        );
+        for invalid in ["", "not-a-hash", &"ab".repeat(31), &"ab".repeat(33)] {
+            let mut value = base.clone();
+            value["expected_genesis"] = invalid.into();
+            assert_eq!(
+                check(value).unwrap_err().0,
+                "Bitcoin expected_genesis must be a 32-byte hex hash"
+            );
+        }
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../api-server/tests/fixtures/api-examples.json"
+        ))
+        .unwrap();
+        let policy = &fixtures["fixtures"]["node_policy"]["value"];
+        let mut money = policy.clone();
+        for key in ["node_id", "revision", "read_only"] {
+            money.as_object_mut().unwrap().remove(key);
+        }
+        for (key, field) in [
+            (
+                "expected_pubkey",
+                serde_json::json!(
+                    "021111111111111111111111111111111111111111111111111111111111111111"
+                ),
+            ),
+            ("read_only", serde_json::json!(false)),
+            ("policy", money),
+            (
+                "peer_policy",
+                serde_json::json!({"allowed_hosts":[],"allowed_ports":[]}),
+            ),
+        ] {
+            let mut value = base.clone();
+            value[key] = field;
+            assert_eq!(check(value).unwrap_err().0, "Bitcoin nodes cannot configure Lightning fields: expected_pubkey, read_only, policy or peer_policy");
+        }
+        let mut value = base;
+        value["unexpected"] = true.into();
+        assert!(serde_json::from_value::<NodeSettings>(value).is_err());
     }
 
     #[test]

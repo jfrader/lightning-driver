@@ -310,7 +310,7 @@ async fn cursor_snapshot_is_immutable_and_bound_to_session_limit_and_node() {
         StatusCode::BAD_REQUEST
     );
     f.settings.nodes[0].expected_pubkey =
-        "02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5".into();
+        Some("02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5".into());
     f.restart().await;
     let browser = login(&f.state, Some(other.authenticator)).await;
     assert_eq!(

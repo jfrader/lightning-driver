@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use lightning_client::{
     model::{
-        Capabilities, Capability, CapabilityReason, ErrorCode, Network, NodeConnection, NodeStatus,
-        NodeSummary,
+        Capabilities, Capability, CapabilityReason, ErrorCode, Network, NodeConnection, NodeKind,
+        NodeStatus, NodeSummary, ReadAvailability,
     },
     money::Decimal,
     settings::{NodePolicy, NodeSettings, Settings},
@@ -62,6 +62,11 @@ impl Registry {
     pub fn new(settings: &Settings) -> Result<Self, serde_json::Error> {
         let mut nodes = BTreeMap::new();
         for node in &settings.nodes {
+            let limits = node.policy.as_ref().ok_or_else(|| {
+                <serde_json::Error as serde::ser::Error>::custom(
+                    "This runtime requires a Lightning node policy; Bitcoin runtime support is not implemented",
+                )
+            })?;
             let binding_revision = binding(node)?;
             let revision = fingerprint(&(
                 "policy-v1",
@@ -89,8 +94,8 @@ impl Registry {
                     policy: NodePolicy {
                         node_id: node.id.clone(),
                         revision,
-                        read_only: node.read_only,
-                        limits: node.policy.clone(),
+                        read_only: node.read_only.unwrap_or(true),
+                        limits: limits.clone(),
                     },
                 },
             );
@@ -168,6 +173,8 @@ impl Entry {
     pub fn summary(&self, now: DateTime<Utc>, unresolved: Decimal) -> NodeSummary {
         let mut summary = NodeSummary {
             id: self.policy.node_id.clone(),
+            kind: NodeKind::Lightning,
+            read_availability: ReadAvailability::lightning(),
             label: self.label.clone(),
             backend: self.backend,
             network: Network::Unknown,
@@ -321,6 +328,21 @@ mod tests {
         common: Option<CapabilityReason>,
         payment: Option<CapabilityReason>,
     ) {
+        assert_eq!(summary.kind, NodeKind::Lightning);
+        let reads = serde_json::to_value(summary.read_availability).unwrap();
+        for resource in [
+            "payments",
+            "invoices",
+            "onchain",
+            "channels",
+            "peers",
+            "operations",
+        ] {
+            assert_eq!(
+                reads[resource],
+                serde_json::json!({"enabled":true,"reason":null})
+            );
+        }
         let capabilities = serde_json::to_value(summary.capabilities).unwrap();
         assert_eq!(capabilities.as_object().unwrap().len(), 8);
         for (kind, capability) in capabilities.as_object().unwrap() {

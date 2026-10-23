@@ -194,11 +194,12 @@ fn settings(dir: &std::path::Path, endpoint: url::Url, backend: Backend) -> Node
         certificate_file: cert,
         tls_verification: lightning_client::settings::TlsVerification::Ca,
         credential_file: mac,
-        expected_pubkey: peer(),
+        expected_pubkey: Some(peer()),
+        expected_genesis: None,
         network: Network::Regtest,
-        read_only: false,
-        policy: config(backend).policy.limits,
-        peer_policy: PeerPolicy::default(),
+        read_only: Some(false),
+        policy: Some(config(backend).policy.limits),
+        peer_policy: Some(PeerPolicy::default()),
     }
 }
 fn grpc_frame<M: Message>(m: M) -> Vec<u8> {
