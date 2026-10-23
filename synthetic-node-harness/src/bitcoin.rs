@@ -98,7 +98,7 @@ impl BitcoinHarness {
     }
     pub fn settings(&self) -> NodeSettings {
         serde_json::from_value(json!({"id":"bitcoin-lab","label":"Synthetic Bitcoin Core","backend":"bitcoin_rpc",
-            "endpoint":format!("http://{}/",self.address),"certificate_file":self.directory.path().join("unused"),
+            "endpoint":format!("http://{}/",self.address),
             "credential_file":self.directory.path().join("cookie"),"expected_genesis":GENESIS,"network":"regtest"})).unwrap()
     }
     pub fn rotate_cookie(&self) -> io::Result<()> {

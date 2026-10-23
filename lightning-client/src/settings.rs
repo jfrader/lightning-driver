@@ -150,7 +150,7 @@ pub struct NodeSettings {
     pub label: String,
     pub backend: Backend,
     pub endpoint: Url,
-    pub certificate_file: PathBuf,
+    pub certificate_file: Option<PathBuf>,
     #[serde(default)]
     pub tls_verification: TlsVerification,
     pub credential_file: PathBuf,
@@ -169,6 +169,9 @@ impl NodeSettings {
 
     fn validate_kind(&self) -> Result<(), SettingsError> {
         if self.kind() == NodeKind::Bitcoin {
+            if self.endpoint.scheme() == "https" && self.certificate_file.is_none() {
+                return Err(SettingsError("An HTTPS node requires a certificate file"));
+            }
             if self.expected_pubkey.is_some()
                 || self.read_only.is_some()
                 || self.policy.is_some()
@@ -186,6 +189,9 @@ impl NodeSettings {
                 ));
             }
             return Ok(());
+        }
+        if self.certificate_file.is_none() {
+            return Err(SettingsError("Lightning nodes require a certificate file"));
         }
         if self.expected_genesis.is_some() {
             return Err(SettingsError(
@@ -311,7 +317,11 @@ impl Settings {
             }
         }
         for node in &mut settings.nodes {
-            for reference in [&mut node.certificate_file, &mut node.credential_file] {
+            for reference in node
+                .certificate_file
+                .iter_mut()
+                .chain(std::iter::once(&mut node.credential_file))
+            {
                 if reference.is_relative() {
                     *reference = base.join(&*reference);
                 }
@@ -659,7 +669,7 @@ mod tests {
             label: "Synthetic".into(),
             backend: Backend::LndGrpc,
             endpoint: "https://node.example.invalid".parse().unwrap(),
-            certificate_file: PathBuf::from("UNUSED_CERT"),
+            certificate_file: Some(PathBuf::from("UNUSED_CERT")),
             tls_verification: TlsVerification::Ca,
             credential_file: PathBuf::from("UNUSED_CREDENTIAL"),
             expected_pubkey: Some(identity),
@@ -675,6 +685,10 @@ mod tests {
         };
         assert!(settings.validate().is_ok());
         for (field, message) in [
+            (
+                "certificate_file",
+                "Lightning nodes require a certificate file",
+            ),
             ("expected_pubkey", "Lightning nodes require expected_pubkey"),
             ("read_only", "Lightning nodes require read_only"),
             ("policy", "Lightning nodes require policy"),
@@ -682,6 +696,7 @@ mod tests {
         ] {
             let mut missing = node.clone();
             match field {
+                "certificate_file" => missing.certificate_file = None,
                 "expected_pubkey" => missing.expected_pubkey = None,
                 "read_only" => missing.read_only = None,
                 "policy" => missing.policy = None,
@@ -793,6 +808,111 @@ mod tests {
         let mut value = base;
         value["unexpected"] = true.into();
         assert!(serde_json::from_value::<NodeSettings>(value).is_err());
+    }
+
+    #[test]
+    fn bitcoin_http_loopback_loads_without_certificate() {
+        let (directory, settings) = load_node_configuration(bitcoin_node_configuration());
+        let settings = settings.unwrap();
+        assert!(settings.nodes[0].certificate_file.is_none());
+        assert_eq!(
+            settings.nodes[0].credential_file,
+            directory.path().join("cookie")
+        );
+        assert_eq!(
+            settings.api.database,
+            directory.path().join("manager.sqlite")
+        );
+    }
+
+    #[test]
+    fn bitcoin_https_requires_certificate() {
+        let mut node = bitcoin_node_configuration();
+        node["endpoint"] = "https://bitcoin.example.invalid/".into();
+        let (_, result) = load_node_configuration(node.clone());
+        assert_eq!(
+            result.err().unwrap().0,
+            "An HTTPS node requires a certificate file"
+        );
+        node["certificate_file"] = "ca.pem".into();
+        let (directory, result) = load_node_configuration(node);
+        assert_eq!(
+            result.unwrap().nodes[0].certificate_file,
+            Some(directory.path().join("ca.pem"))
+        );
+    }
+
+    #[test]
+    fn lightning_requires_certificate() {
+        let (_, result) = load_node_configuration(lightning_node_configuration());
+        assert_eq!(
+            result.err().unwrap().0,
+            "Lightning nodes require a certificate file"
+        );
+    }
+
+    #[test]
+    fn lightning_with_certificate_loads_and_resolves_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        for certificate in [PathBuf::from("tls.cert"), directory.path().join("tls.cert")] {
+            let mut node = lightning_node_configuration();
+            node["certificate_file"] = serde_json::to_value(&certificate).unwrap();
+            let (config_directory, result) = load_node_configuration(node);
+            let settings = result.unwrap();
+            assert_eq!(
+                settings.nodes[0].certificate_file,
+                Some(if certificate.is_relative() {
+                    config_directory.path().join(certificate)
+                } else {
+                    certificate
+                })
+            );
+        }
+    }
+
+    fn bitcoin_node_configuration() -> serde_json::Value {
+        serde_json::json!({
+            "id":"bitcoin-lab", "label":"Bitcoin Core lab", "backend":"bitcoin_rpc",
+            "endpoint":"http://127.0.0.1:18443/", "credential_file":"cookie",
+            "network":"regtest", "expected_genesis":"ab".repeat(32)
+        })
+    }
+
+    fn lightning_node_configuration() -> serde_json::Value {
+        let fixtures: serde_json::Value = serde_json::from_str(include_str!(
+            "../../api-server/tests/fixtures/api-examples.json"
+        ))
+        .unwrap();
+        let mut policy = fixtures["fixtures"]["node_policy"]["value"].clone();
+        for key in ["node_id", "revision", "read_only"] {
+            policy.as_object_mut().unwrap().remove(key);
+        }
+        serde_json::json!({
+            "id":"lightning-lab", "label":"Lightning lab", "backend":"lnd_grpc",
+            "endpoint":"https://localhost:10009/", "credential_file":"macaroon",
+            "network":"regtest",
+            "expected_pubkey":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798",
+            "read_only":false, "policy":policy,
+            "peer_policy":{"allowed_hosts":[],"allowed_ports":[]}
+        })
+    }
+
+    fn load_node_configuration(
+        node: serde_json::Value,
+    ) -> (tempfile::TempDir, Result<Settings, SettingsError>) {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.json");
+        let config = serde_json::json!({
+            "api": {
+                "bind":"127.0.0.1:8080", "public_origin":"https://manager.example.invalid",
+                "rp_id":"manager.example.invalid", "database":"manager.sqlite",
+                "invoice_key_file":"invoice.key"
+            },
+            "nodes":[node]
+        });
+        std::fs::write(&path, serde_json::to_vec(&config).unwrap()).unwrap();
+        let result = Settings::load(&path);
+        (directory, result)
     }
 
     #[test]

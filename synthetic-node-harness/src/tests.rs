@@ -99,7 +99,8 @@ async fn disposable_tls_and_wire_authentication_are_required() {
         let directory = harness.directory().to_owned();
         let node = harness.node("synthetic");
         let cert =
-            reqwest::Certificate::from_pem(&std::fs::read(node.certificate_file).unwrap()).unwrap();
+            reqwest::Certificate::from_pem(&std::fs::read(node.certificate_file.unwrap()).unwrap())
+                .unwrap();
         let client = reqwest::Client::builder()
             .no_proxy()
             .tls_built_in_root_certs(false)

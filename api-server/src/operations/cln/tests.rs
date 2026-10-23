@@ -817,7 +817,7 @@ fn settings(directory: &std::path::Path, endpoint: url::Url) -> NodeSettings {
         label: "Synthetic".into(),
         backend: Backend::ClnRest,
         endpoint,
-        certificate_file: cert,
+        certificate_file: Some(cert),
         tls_verification: lightning_client::settings::TlsVerification::Ca,
         credential_file: rune,
         expected_pubkey: Some(peer()),
@@ -908,12 +908,15 @@ async fn configured_tls_root_hostname_and_file_credentials_fail_closed() {
         assert!(Transport::connect(&invalid, &Limits::default()).is_err());
     }
     invalid = settings.clone();
-    invalid.certificate_file = directory.path().join("missing");
+    invalid.certificate_file = None;
     assert!(Transport::connect(&invalid, &Limits::default()).is_err());
-    std::fs::write(&settings.certificate_file, b"").unwrap();
+    invalid = settings.clone();
+    invalid.certificate_file = Some(directory.path().join("missing"));
+    assert!(Transport::connect(&invalid, &Limits::default()).is_err());
+    std::fs::write(settings.certificate_file.as_ref().unwrap(), b"").unwrap();
     assert!(Transport::connect(&settings, &Limits::default()).is_err());
     std::fs::write(
-        &settings.certificate_file,
+        settings.certificate_file.as_ref().unwrap(),
         include_bytes!("../../../tests/fixtures/cln-v25.02/synthetic-ca.pem"),
     )
     .unwrap();

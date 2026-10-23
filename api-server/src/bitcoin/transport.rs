@@ -91,7 +91,8 @@ impl Transport {
             builder = builder.resolve_to_addrs(host, &addresses);
         } else {
             let certificate =
-                read_protected(&node.certificate_file, false).map_err(|_| invalid())?;
+                read_protected(node.certificate_file.as_deref().ok_or_else(invalid)?, false)
+                    .map_err(|_| invalid())?;
             builder = builder.https_only(true).tls_built_in_root_certs(false);
             builder = match node.tls_verification {
                 TlsVerification::Ca => builder.add_root_certificate(
