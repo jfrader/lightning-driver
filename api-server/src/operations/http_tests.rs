@@ -106,6 +106,7 @@ impl HttpFixture {
             scripts: Mutex::new(VecDeque::new()),
             effects: Mutex::new(HashMap::new()),
             execution_barrier: Mutex::new(None),
+            observation_barrier: Mutex::new(None),
             prerequisites: Mutex::new(None),
         });
         let mut fixture = Self {

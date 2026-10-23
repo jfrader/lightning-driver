@@ -113,6 +113,7 @@ impl Engine {
             clock: Arc::new(WallClock),
             key: Arc::new(key),
             tasks: Arc::new(tokio::sync::Semaphore::new(EXECUTION_TASKS)),
+            observations: Arc::default(),
             faults: Faults::default(),
         })
     }

@@ -25,7 +25,7 @@ use lightning_client::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     future::Future,
     pin::Pin,
     sync::{Arc, Mutex},
@@ -285,6 +285,7 @@ pub(crate) struct Engine {
     clock: Arc<dyn Clock>,
     key: Arc<PendingSecretKey>,
     tasks: Arc<tokio::sync::Semaphore>,
+    observations: Arc<Mutex<BTreeSet<Uuid>>>,
     faults: Faults,
 }
 
@@ -456,13 +457,8 @@ impl Engine {
         digest: &str,
         authorization: Option<Uuid>,
     ) -> Result<(Operation, bool)> {
-        let outcome = self
-            .dispatch_once(context, node, id, digest, authorization)
-            .await?;
-        if outcome.1 {
-            self.invalidate_reads(node).await;
-        }
-        Ok(outcome)
+        self.dispatch_once(context, node, id, digest, authorization)
+            .await
     }
 
     async fn dispatch_once(
@@ -486,9 +482,16 @@ impl Engine {
         let digest = digest.to_string();
         tokio::spawn(async move {
             let _slot = slot;
-            engine
-                .confirm_task(context, node, id, digest, authorization, cancelled)
-                .await
+            let outcome = engine
+                .confirm_task(context, node.clone(), id, digest, authorization, cancelled)
+                .await;
+            if match &outcome {
+                Ok((_, dispatched)) => *dispatched,
+                Err(error) => error.outcome == ErrorOutcome::Unknown,
+            } {
+                engine.invalidate_reads(&node).await;
+            }
+            outcome
         })
         .await
         .map_err(|_| failure(ErrorCode::InternalError).claimed(id))?
@@ -578,6 +581,9 @@ impl Engine {
         id: Uuid,
     ) -> Result<Operation> {
         let operation = storage::status(self, context, node, id).await?;
+        let Some(_observation) = Observation::acquire(self.observations.clone(), id)? else {
+            return Ok(operation);
+        };
         let Ok(pinned) = self.pinned(node) else {
             return Ok(operation);
         };
@@ -617,11 +623,25 @@ impl Engine {
             return Ok(());
         };
         let ids = storage::observation_candidates(self, &pinned.config).await?;
-        // Sequential, node-scoped work with a total deadline; each adapter also
-        // enforces its transport deadline. Cancellation never refunds an attempt.
+        // Dropping a join handle bounds response latency without cancelling a
+        // reserved observation. Shared task slots and operation guards bound and
+        // deduplicate the work; adapters enforce their own transport deadlines.
+        let mut tasks = Vec::new();
+        for id in ids {
+            let Ok(slot) = self.tasks.clone().try_acquire_owned() else {
+                break;
+            };
+            let engine = self.clone();
+            let context = context.clone();
+            let node = node.to_owned();
+            tasks.push(tokio::spawn(async move {
+                let _slot = slot;
+                engine.observe(&context, &node, id).await
+            }));
+        }
         if let Ok(result) = tokio::time::timeout(LIST_RECONCILIATION_DEADLINE, async {
-            for id in ids {
-                match self.observe(context, node, id).await {
+            for task in tasks {
+                match task.await.map_err(|_| failure(ErrorCode::InternalError))? {
                     // Unverifiable node evidence cannot make durable history
                     // unavailable or release its claims.
                     Err(error) if error.code == ErrorCode::UpstreamInvalidResponse => {}
@@ -637,6 +657,31 @@ impl Engine {
             result?;
         }
         Ok(())
+    }
+}
+
+struct Observation {
+    active: Arc<Mutex<BTreeSet<Uuid>>>,
+    id: Uuid,
+}
+impl Observation {
+    fn acquire(active: Arc<Mutex<BTreeSet<Uuid>>>, id: Uuid) -> Result<Option<Self>> {
+        if !active
+            .lock()
+            .map_err(|_| failure(ErrorCode::InternalError))?
+            .insert(id)
+        {
+            return Ok(None);
+        }
+        Ok(Some(Self { active, id }))
+    }
+}
+impl Drop for Observation {
+    fn drop(&mut self) {
+        self.active
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.id);
     }
 }
 

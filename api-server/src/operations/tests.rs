@@ -226,6 +226,108 @@ async fn reconciliation_list_is_node_scoped_and_capped() {
     assert_eq!(f.fake.counts().1, LIST_RECONCILIATION_CAP);
 }
 
+#[tokio::test]
+async fn dispatched_confirmation_invalidates_after_caller_drop_and_persistence_failure() {
+    for drop_caller in [true, false] {
+        let mut f = Fixture::new().await;
+        let settings = lightning_client::settings::Settings {
+            api: f.settings.clone(),
+            nodes: vec![serde_json::from_value(serde_json::json!({
+                "id":f.node, "label":"Synthetic", "backend":"lnd_rest",
+                "endpoint":"https://never-contact.example.invalid",
+                "certificate_file":"UNUSED", "credential_file":"UNUSED",
+                "expected_pubkey":peer(), "network":"regtest", "read_only":false,
+                "policy":f.fake.config.policy.limits
+            }))
+            .unwrap()],
+        };
+        let registry = Arc::new(crate::registry::Registry::new(&settings).unwrap());
+        f.engine.attach_reads(registry.clone());
+        registry.seed_read_for_test(&f.node, 64).await;
+        let op = f.create(OperationKind::NewAddress).await;
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        *f.fake.execution_barrier.lock().unwrap() = Some(barrier.clone());
+        if !drop_caller {
+            f.fault(FaultPoint::BeforeResult);
+        }
+        let engine = f.engine.clone();
+        let context = f.context.clone();
+        let node = f.node.clone();
+        let waiter = tokio::spawn(async move {
+            engine
+                .confirm_once(&context, &node, op.id, &op.review.digest, None)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while f.fake.counts().0 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        if drop_caller {
+            waiter.abort();
+            assert!(waiter.await.unwrap_err().is_cancelled());
+            barrier.wait().await;
+        } else {
+            barrier.wait().await;
+            let error = waiter.await.unwrap().unwrap_err();
+            assert_eq!(error.code, ErrorCode::StorageUnavailable);
+            assert_eq!(error.outcome, ErrorOutcome::Unknown);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while f.engine.tasks.available_permits() != 64 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(registry.retained_bytes(), 0);
+        assert_eq!(registry.get(&f.node).unwrap().invalidate_reads().await, 0);
+    }
+}
+
+#[tokio::test]
+async fn slow_list_observation_finishes_once_after_response_deadline() {
+    let mut f = Fixture::new().await;
+    let op = f.create(OperationKind::OpenChannel).await;
+    let grant = f.authorize(&op).await;
+    *f.fake.execute.lock().unwrap() = Script::ReferencedLost;
+    f.confirm(&op, grant).await.unwrap();
+    let barrier = Arc::new(tokio::sync::Barrier::new(2));
+    *f.fake.observation_barrier.lock().unwrap() = Some(barrier.clone());
+    let start = tokio::time::Instant::now();
+    f.engine.observe_list(&f.context, &f.node).await.unwrap();
+    assert!(start.elapsed() >= LIST_RECONCILIATION_DEADLINE);
+    assert!(start.elapsed() < LIST_RECONCILIATION_DEADLINE * 2);
+    assert_eq!(f.fake.counts(), (1, 1));
+    assert!(f.engine.observations.lock().unwrap().contains(&op.id));
+    f.advance_reconciliation(op.id).await;
+    // Even when backoff expires, concurrent lists and status reads must not
+    // allocate another attempt while the reserved observation is still running.
+    f.engine.observe_list(&f.context, &f.node).await.unwrap();
+    let pending = f.engine.observe(&f.context, &f.node, op.id).await.unwrap();
+    assert_eq!(pending.reconciliation.unwrap().attempts, 1);
+    assert_eq!(f.fake.counts(), (1, 1));
+    barrier.wait().await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        while f.engine.tasks.available_permits() != 64 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let observed = storage::load_local(&f.engine, op.id).await.unwrap();
+    assert_eq!(observed.state, OperationState::Succeeded);
+    let reconciliation = observed.reconciliation.unwrap();
+    assert_eq!(reconciliation.attempts, 1);
+    assert_ne!(
+        reconciliation.last_outcome,
+        Some(ReconciliationOutcome::InFlight)
+    );
+    assert!(!reconciliation.exhausted);
+}
+
 struct TestClock(Mutex<DateTime<Utc>>);
 impl Clock for TestClock {
     fn now(&self) -> DateTime<Utc> {
@@ -264,6 +366,7 @@ struct CountingFake {
     scripts: Mutex<VecDeque<Script>>,
     effects: Mutex<HashMap<Uuid, Evidence>>,
     execution_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+    observation_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     prerequisites: Mutex<Option<ReadFacts>>,
 }
 impl CountingFake {
@@ -474,6 +577,10 @@ impl Adapter for CountingFake {
     fn observe_exact(&self, query: ObservationQuery) -> ResponseFuture<'_, Evidence> {
         Box::pin(async move {
             self.observations.fetch_add(1, Ordering::SeqCst);
+            let barrier = self.observation_barrier.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
             let evidence = self
                 .effects
                 .lock()
@@ -717,6 +824,7 @@ impl Fixture {
             scripts: Mutex::new(VecDeque::new()),
             effects: Mutex::new(HashMap::new()),
             execution_barrier: Mutex::new(None),
+            observation_barrier: Mutex::new(None),
             prerequisites: Mutex::new(None),
         });
         let nodes = BTreeMap::from([(
@@ -737,6 +845,7 @@ impl Fixture {
             clock: clock.clone(),
             key: Arc::new(PendingSecretKey::new([91; 32])),
             tasks: Arc::new(tokio::sync::Semaphore::new(64)),
+            observations: Arc::default(),
             faults: Faults::default(),
         };
         Self {
@@ -1603,6 +1712,7 @@ async fn independent_nodes_execute_concurrently_without_a_global_rpc_lock() {
         scripts: Mutex::new(VecDeque::new()),
         effects: Mutex::new(HashMap::new()),
         execution_barrier: Mutex::new(Some(barrier)),
+        observation_barrier: Mutex::new(None),
         prerequisites: Mutex::new(None),
     });
     Arc::make_mut(&mut f.engine.nodes).insert(
@@ -2233,6 +2343,7 @@ async fn all_eight_postcommit_retarget_uses_original_pinned_adapter_and_never_ob
             scripts: Mutex::new(VecDeque::new()),
             effects: Mutex::new(HashMap::new()),
             execution_barrier: Mutex::new(None),
+            observation_barrier: Mutex::new(None),
             prerequisites: Mutex::new(None),
         });
         let new_adapter = replacement.clone();
