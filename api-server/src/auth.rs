@@ -82,6 +82,8 @@ pub enum AuthError {
     Authorization,
     #[error("Operation does not require reauthentication")]
     NotRequired,
+    #[error("Sign in again before changing sign-in methods")]
+    ReauthRequired,
     #[error("Protected authentication storage unavailable")]
     Storage,
 }

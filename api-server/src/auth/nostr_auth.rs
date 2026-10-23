@@ -211,6 +211,21 @@ impl AuthManager {
         if authenticated != matches!(request.purpose.as_str(), "link" | "unlink") {
             return Err(AuthError::Session);
         }
+        // Adding an authenticator needs proof of the method that owns this session: a
+        // stolen live session must not be able to link a key it controls. The operator
+        // re-authenticates (passkey assertion or a linked key's signature), which stamps
+        // `last_authenticated_at` on the rotated session; unlink keeps its own stronger
+        // rule, a fresh signature from the exact identity being removed.
+        if request.purpose == "link" {
+            let window = i64::from(self.limits.authorization_seconds);
+            let fresh = context.last_authenticated_at.is_some_and(|at| {
+                let age = now.signed_duration_since(at).num_seconds();
+                (0..=window).contains(&age)
+            });
+            if !fresh {
+                return Err(AuthError::ReauthRequired);
+            }
+        }
         let target = request
             .pubkey
             .as_deref()

@@ -130,6 +130,7 @@ impl From<AuthError> for ApiError {
             AuthError::AllocationLimited(_) => ErrorCode::RateLimited,
             AuthError::Authorization => ErrorCode::AuthorizationInvalid,
             AuthError::NotRequired => ErrorCode::AuthorizationNotRequired,
+            AuthError::ReauthRequired => ErrorCode::ReauthRequired,
             AuthError::Storage => ErrorCode::StorageUnavailable,
         })
     }

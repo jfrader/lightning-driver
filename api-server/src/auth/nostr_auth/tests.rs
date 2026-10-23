@@ -1062,3 +1062,60 @@ async fn allocation_failure_and_expiry_do_not_consume_enrollment_token() {
     ));
     assert!(manager.journal.enrollment_available(now).await.unwrap());
 }
+
+#[tokio::test]
+async fn linking_a_key_requires_a_session_authenticated_moments_ago() {
+    let (_dir, manager, now) = setup().await;
+    let session = enroll(&manager, now, 1).await;
+    let window = i64::from(Limits::default().authorization_seconds);
+
+    // A live session that has not proved its method recently cannot add an authenticator.
+    let stale = now + Duration::seconds(window + 1);
+    assert!(matches!(
+        manager
+            .start_nostr(
+                &session.context,
+                NostrStart {
+                    purpose: "link".into(),
+                    token: None,
+                    pubkey: None
+                },
+                stale
+            )
+            .await,
+        Err(AuthError::ReauthRequired)
+    ));
+
+    // Signing in with a linked key rotates the session and stamps the fresh proof.
+    let guest_now = guest(&manager, stale).await;
+    let login = start(&manager, &guest_now.context, "login", None, None, stale).await;
+    let NostrOutcome::Session(fresh) = manager
+        .finish_nostr(
+            &guest_now.context,
+            NostrFinish {
+                challenge_id: login.challenge_id,
+                event: sign(&login, 1),
+            },
+            stale,
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("session");
+    };
+    assert_eq!(fresh.context.last_authenticated_at, Some(stale));
+    let challenge = start(&manager, &fresh.context, "link", None, None, stale).await;
+    assert!(matches!(
+        manager
+            .finish_nostr(
+                &fresh.context,
+                NostrFinish {
+                    challenge_id: challenge.challenge_id,
+                    event: sign(&challenge, 2)
+                },
+                stale
+            )
+            .await,
+        Ok(NostrOutcome::Identity(_))
+    ));
+}

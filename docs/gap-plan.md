@@ -29,7 +29,7 @@ artifact, no public edge.
 | --- | --- | --- |
 | P1.1 Real-passkey e2e | Open | Injected Nostr signer today; virtual-authenticator passkey not covered. |
 | P1.2 NIP-46 | Deferred by decision | Fran: for later. NIP-07 only; no copy claims mobile remote signing. |
-| P1.3 Link/Nostr step-up | Open | A stolen session can still link an authenticator. |
+| P1.3 Link/Nostr step-up | Done | Adding an authenticator requires a session authenticated within `api.limits.authorization_seconds`; a stale session gets `reauth_required`, and the UI signs in again with the method that owns it before retrying once. Unlink keeps its own rule (a fresh signature from the identity being removed) and host recovery stays documented. `linking_a_key_requires_a_session_authenticated_moments_ago` and the sign-in-methods UI test cover both sides. |
 | P1.4 Least-privilege credentials | Blocked | Needs Docker and real macaroon/rune provisioning. |
 | P1.5 Read-only and policy on real nodes | Blocked | Needs Docker. |
 | P1.6 Restart/reconnect/recovery drills | Open | Pieces tested; full scripted drill missing. |
