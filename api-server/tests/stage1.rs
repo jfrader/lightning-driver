@@ -340,7 +340,9 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
     let refused = cli(&fixture.config, "recovery", false).await;
     assert!(!refused.status.success());
     assert!(refused.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&refused.stderr).contains("--confirm-reset-authentication"));
+    let failure: Value = serde_json::from_slice(&refused.stderr).unwrap();
+    assert_eq!(failure["event"], "startup_failure");
+    assert_eq!(failure["error_code"], "confirmation_required");
     assert_eq!(
         runtime.state.journal.authentication().await.unwrap(),
         identity
@@ -541,16 +543,23 @@ async fn finite_binary_serve_smoke_and_parallel_host_cli_exit_without_leaking_a_
         .spawn()
         .unwrap();
     let mut lines = BufReader::new(child.stderr.take().unwrap()).lines();
-    let line = tokio::time::timeout(PROCESS_TIMEOUT, lines.next_line())
-        .await
-        .expect("server readiness deadline")
-        .unwrap()
-        .expect("server exited before readiness");
-    let address: SocketAddr = line
-        .strip_prefix("API listening on ")
-        .unwrap()
-        .parse()
-        .unwrap();
+    let startup = tokio::time::timeout(PROCESS_TIMEOUT, async {
+        loop {
+            let line = lines
+                .next_line()
+                .await
+                .unwrap()
+                .expect("server exited before readiness");
+            let event: Value = serde_json::from_str(&line).expect("structured stderr event");
+            assert!(event["level"].is_string());
+            if event["event"] == "startup" {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("server readiness deadline");
+    let address: SocketAddr = startup["bind"].as_str().unwrap().parse().unwrap();
     assert!(address.ip().is_loopback());
     let client = reqwest::Client::builder()
         .no_proxy()

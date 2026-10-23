@@ -24,7 +24,7 @@ impl Journal {
     pub async fn unresolved_counts(&self) -> Result<BTreeMap<String, Decimal>, JournalError> {
         self.run(|connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            expire_reviews(&tx, Utc::now())?;
+            let expired = expire_reviews(&tx, Utc::now())?;
             let counts = {
                 let mut statement = tx.prepare(
                     "SELECT node_id,COUNT(*)
@@ -44,6 +44,7 @@ impl Journal {
                 counts
             };
             tx.commit()?;
+            crate::journal::log_expired(expired);
             Ok(counts)
         })
         .await
@@ -85,7 +86,7 @@ impl Journal {
     ) -> Result<HistoryObservation, JournalError> {
         self.run(move |connection| {
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            expire_reviews(&tx, Utc::now())?;
+            let expired = expire_reviews(&tx, Utc::now())?;
             let scope = scope(&tx, &node)?;
             let mut operations = Vec::new();
             let truncated = {
@@ -130,6 +131,7 @@ impl Journal {
                 truncated
             };
             tx.commit()?;
+            crate::journal::log_expired(expired);
             Ok(HistoryObservation {
                 scope,
                 operations,

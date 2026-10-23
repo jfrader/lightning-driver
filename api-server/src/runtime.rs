@@ -27,6 +27,20 @@ pub enum StartupError {
     Output,
 }
 
+impl StartupError {
+    pub fn log(&self) {
+        let error_code = match self {
+            Self::Configuration => "configuration",
+            Self::Storage => "storage_unavailable",
+            Self::Instance => "instance_lock_unavailable",
+            Self::Confirmation => "confirmation_required",
+            Self::Listener => "listener_unavailable",
+            Self::Output => "output_unavailable",
+        };
+        crate::observability::Event::StartupFailure { error_code }.emit();
+    }
+}
+
 pub struct Runtime {
     pub state: ApplicationState,
     _instance: File,
@@ -37,7 +51,13 @@ impl Runtime {
         settings
             .validate()
             .map_err(|_| StartupError::Configuration)?;
-        let instance = instance_lock(&settings.api.database)?;
+        let instance = instance_lock(&settings.api.database).inspect_err(|_| {
+            crate::observability::Event::InstanceLock { outcome: "failure" }.emit();
+        })?;
+        crate::observability::Event::InstanceLock {
+            outcome: "acquired",
+        }
+        .emit();
         let state = open_application(settings).await?;
         state
             .engine

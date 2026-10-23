@@ -77,14 +77,32 @@ impl ApplicationState {
             .registry
             .get(id)
             .ok_or_else(|| ApiError::new(ErrorCode::NotFound))?;
-        let mut cache = self.read_cache(entry).await?;
+        let mut cache = self.read_cache(entry).await.inspect_err(|error| {
+            crate::observability::Event::ReadFailure {
+                node_id: id,
+                surface: "info",
+                error_code: error.code,
+                stale: false,
+            }
+            .emit();
+        })?;
         let now = Utc::now();
         if cache.checked.is_some_and(|at| {
             now.signed_duration_since(at).num_seconds() < i64::from(self.limits().rpc_seconds)
         }) {
             return Ok(());
         }
-        match self.engine.read_node(id, ReadQuery::Info).await {
+        let result = self.engine.read_node(id, ReadQuery::Info).await;
+        if let Err(error) = &result {
+            crate::observability::Event::ReadFailure {
+                node_id: id,
+                surface: "info",
+                error_code: error.code,
+                stale: error.code != ErrorCode::RateLimited,
+            }
+            .emit();
+        }
+        match result {
             Ok((ReadResult::Info(info), revision)) => {
                 *entry
                     .observation
@@ -117,7 +135,15 @@ impl ApplicationState {
             .registry
             .get(id)
             .ok_or_else(|| ApiError::new(ErrorCode::NotFound))?;
-        let mut cache = self.read_cache(entry).await?;
+        let mut cache = self.read_cache(entry).await.inspect_err(|error| {
+            crate::observability::Event::ReadFailure {
+                node_id: id,
+                surface: resource,
+                error_code: error.code,
+                stale: false,
+            }
+            .emit();
+        })?;
         let now = Utc::now();
         let key = match query {
             ReadQuery::WatchtowerTower(key) => format!("{resource}:{}", hex::encode(key)),
@@ -131,6 +157,25 @@ impl ApplicationState {
             }
         }
         let result = self.engine.read_node(id, query).await;
+        if let Err(error) = &result {
+            let invalidates = (query.is_watchtower()
+                || matches!(query, ReadQuery::Bitcoin | ReadQuery::BitcoinPeers))
+                && matches!(
+                    error.code,
+                    ErrorCode::IdentityChanged | ErrorCode::NetworkMismatch
+                );
+            let stale = error.code != ErrorCode::RateLimited
+                && !invalidates
+                && !matches!(query, ReadQuery::WatchtowerTower(_))
+                && cache.values.contains_key(&key);
+            crate::observability::Event::ReadFailure {
+                node_id: id,
+                surface: resource,
+                error_code: error.code,
+                stale,
+            }
+            .emit();
+        }
         let result = match result {
             Ok((value, _)) => value,
             Err(error) if error.code == ErrorCode::RateLimited => return Err(error),
