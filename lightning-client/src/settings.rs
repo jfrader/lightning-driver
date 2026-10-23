@@ -151,6 +151,8 @@ pub struct NodeSettings {
     pub backend: Backend,
     pub endpoint: Url,
     pub certificate_file: PathBuf,
+    #[serde(default)]
+    pub tls_verification: TlsVerification,
     pub credential_file: PathBuf,
     pub expected_pubkey: String,
     pub network: Network,
@@ -158,6 +160,14 @@ pub struct NodeSettings {
     pub policy: MoneyPolicy,
     #[serde(default)]
     pub peer_policy: PeerPolicy,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsVerification {
+    #[default]
+    Ca,
+    Pinned,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -268,6 +278,10 @@ impl Settings {
                 return Err(SettingsError("Invalid node label"));
             }
             validate_endpoint(&node.endpoint)?;
+            if node.tls_verification == TlsVerification::Pinned && node.backend == Backend::ClnRest
+            {
+                return Err(SettingsError("Pinned TLS requires an LND backend"));
+            }
             let identity = node
                 .expected_pubkey
                 .parse::<bitcoin::secp256k1::PublicKey>()
@@ -587,6 +601,7 @@ mod tests {
             backend: Backend::LndGrpc,
             endpoint: "https://node.example.invalid".parse().unwrap(),
             certificate_file: PathBuf::from("UNUSED_CERT"),
+            tls_verification: TlsVerification::Ca,
             credential_file: PathBuf::from("UNUSED_CREDENTIAL"),
             expected_pubkey: identity,
             network: Network::Regtest,
@@ -602,6 +617,13 @@ mod tests {
         settings.nodes.push(node.clone());
         assert!(settings.validate().is_err());
         settings.nodes.pop();
+        settings.nodes[0].tls_verification = TlsVerification::Pinned;
+        assert!(settings.validate().is_ok());
+        settings.nodes[0].backend = Backend::LndRest;
+        assert!(settings.validate().is_ok());
+        settings.nodes[0].backend = Backend::ClnRest;
+        assert!(settings.validate().is_err());
+        settings.nodes[0] = node.clone();
         settings.nodes[0].network = Network::Unknown;
         assert!(settings.validate().is_err());
         settings.nodes[0] = node.clone();
@@ -617,5 +639,21 @@ mod tests {
         settings.nodes[0] = node;
         settings.nodes[0].policy.send_onchain_sat.min = Decimal::ZERO;
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn tls_verification_is_closed_and_defaults_to_ca() {
+        assert_eq!(TlsVerification::default(), TlsVerification::Ca);
+        assert_eq!(
+            serde_json::from_str::<TlsVerification>("\"ca\"").unwrap(),
+            TlsVerification::Ca
+        );
+        assert_eq!(
+            serde_json::from_str::<TlsVerification>("\"pinned\"").unwrap(),
+            TlsVerification::Pinned
+        );
+        for invalid in ["\"insecure\"", "\"Pinned\"", "null", "true", "{}"] {
+            assert!(serde_json::from_str::<TlsVerification>(invalid).is_err());
+        }
     }
 }

@@ -1,6 +1,7 @@
 use crate::{
     auth::{
-        AuthManager, AuthenticationFinish, ClientIdentity, Context, NewContext, RegistrationFinish,
+        AuthManager, AuthenticationFinish, ClientIdentity, Context, NewContext, NostrFinish,
+        NostrOutcome, NostrStart, RegistrationFinish,
     },
     error::ApiError,
     journal::Journal,
@@ -42,6 +43,8 @@ struct Bootstrap {
     csrf_token: String,
     expires_at: chrono::DateTime<Utc>,
     login_available: bool,
+    passkey_login_available: bool,
+    nostr_login_available: bool,
     enrollment_available: bool,
     public_origin: String,
     rp_id: String,
@@ -214,7 +217,7 @@ impl AuthHttp {
         Ok(identity)
     }
 
-    fn admit_start(&self, request: &HttpRequest) -> Result<(), ApiError> {
+    pub(crate) fn admit_start(&self, request: &HttpRequest) -> Result<(), ApiError> {
         self.manager
             .admit_start(self.identity(request)?, Utc::now())?;
         Ok(())
@@ -260,6 +263,9 @@ pub fn configure(config: &mut web::ServiceConfig) {
         )
         .route("/auth/bootstrap", web::get().to(bootstrap))
         .route("/auth/passkey/start", web::post().to(start_login))
+        .route("/auth/nostr/start", web::post().to(start_nostr))
+        .route("/auth/nostr/finish", web::post().to(finish_nostr))
+        .route("/auth/nostr/identities", web::get().to(nostr_identities))
         .route("/auth/passkey/finish", web::post().to(finish_login))
         .route("/auth/enrollment/start", web::post().to(start_enrollment))
         .route("/auth/enrollment/finish", web::post().to(finish_enrollment))
@@ -291,6 +297,8 @@ async fn bootstrap(
         csrf_token: AuthManager::csrf(&context.context).into(),
         expires_at: context.context.expires_at,
         login_available: state.manager.login_available().await?,
+        passkey_login_available: state.manager.passkey_login_available().await?,
+        nostr_login_available: state.manager.nostr_login_available().await?,
         enrollment_available: application.journal.enrollment_available(Utc::now()).await?,
         public_origin: state.settings.public_origin.origin().ascii_serialization(),
         rp_id: state.settings.rp_id.clone(),
@@ -313,6 +321,61 @@ async fn start_login(
     let context = state.context(&request, false, true).await?;
     state.admit_start(&request)?;
     Ok(HttpResponse::Ok().json(state.manager.start_login(&context, Utc::now()).await?))
+}
+
+async fn start_nostr(
+    request: HttpRequest,
+    application: web::Data<crate::state::ApplicationState>,
+    body: web::Json<NostrStart>,
+) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
+    let authenticated = matches!(body.purpose.as_str(), "link" | "unlink");
+    let context = state.context(&request, authenticated, true).await?;
+    state.admit_start(&request)?;
+    Ok(HttpResponse::Ok().json(
+        state
+            .manager
+            .start_nostr(&context, body.into_inner(), Utc::now())
+            .await?,
+    ))
+}
+
+async fn finish_nostr(
+    request: HttpRequest,
+    application: web::Data<crate::state::ApplicationState>,
+    body: web::Json<NostrFinish>,
+) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
+    state.admit_start(&request)?;
+    // Pick the bound context from the cookie that matches the CSRF token. A stale
+    // preauth cookie must not hide the operator's authenticated context.
+    let context = match state.context(&request, true, true).await {
+        Ok(context) => context,
+        Err(error) if request.cookie(state.cookie_name(false)).is_none() => return Err(error),
+        Err(_) => state.context(&request, false, true).await?,
+    };
+    match state
+        .manager
+        .finish_nostr(&context, body.into_inner(), Utc::now())
+        .await?
+    {
+        NostrOutcome::Session(context) => state.completed(context),
+        NostrOutcome::Identity(identity) => {
+            Ok(HttpResponse::Ok().json(serde_json::json!({"identity":identity})))
+        }
+        NostrOutcome::Removed => Ok(HttpResponse::Ok()
+            .cookie(state.cookie(state.cookie_name(true), String::new(), 0))
+            .json(serde_json::json!({"removed":true}))),
+    }
+}
+
+async fn nostr_identities(
+    request: HttpRequest,
+    application: web::Data<crate::state::ApplicationState>,
+) -> Result<HttpResponse, ApiError> {
+    application.auth.context(&request, true, false).await?;
+    let (passkeys, _) = application.journal.credential_counts().await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({"identities": application.journal.nostr_identities().await?, "passkey_count":passkeys})))
 }
 async fn finish_login(
     request: HttpRequest,

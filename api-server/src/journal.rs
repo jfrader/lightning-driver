@@ -253,6 +253,8 @@ impl Journal {
             if recover {
                 tx.execute("UPDATE auth_meta SET generation=generation+1 WHERE singleton=1",[])?;
                 tx.execute("DELETE FROM credentials",[])?;
+                tx.execute("DELETE FROM nostr_identities",[])?;
+                tx.execute("DELETE FROM nostr_challenges",[])?;
                 tx.execute("DELETE FROM enrollment",[])?;
             }
             tx.execute("DELETE FROM enrollment WHERE expires_at<=?1",[now.timestamp()])?;

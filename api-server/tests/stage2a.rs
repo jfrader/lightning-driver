@@ -336,6 +336,16 @@ async fn sanitized_sorted_registry_snapshot_filters_and_strict_queries() {
             .unwrap()
             .binding_revision
     );
+    changed = settings.clone();
+    changed.nodes[0].tls_verification = lightning_client::settings::TlsVerification::Pinned;
+    assert_ne!(
+        before.get("zeta").unwrap().binding_revision,
+        Registry::new(&changed)
+            .unwrap()
+            .get("zeta")
+            .unwrap()
+            .binding_revision
+    );
 }
 
 #[actix_web::test]

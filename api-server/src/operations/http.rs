@@ -22,6 +22,14 @@ struct AuthorizationFinish {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct NostrAuthorizationFinish {
+    review_digest: String,
+    challenge_id: Uuid,
+    event: crate::nostr::Event,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Confirm {
     review_digest: String,
     #[serde(deserialize_with = "required_authorization")]
@@ -35,6 +43,14 @@ fn required_authorization<'de, D: serde::Deserializer<'de>>(
 
 pub(crate) fn configure(config: &mut web::ServiceConfig) {
     config
+        .route(
+            "/nodes/{node_id}/operations/{operation_id}/authorize/nostr",
+            web::post().to(authorize_nostr),
+        )
+        .route(
+            "/nodes/{node_id}/operations/{operation_id}/authorize/nostr/finish",
+            web::post().to(finish_nostr),
+        )
         .route(
             "/nodes/{node_id}/operations/{operation_id}/authorize",
             web::post().to(authorize),
@@ -122,6 +138,69 @@ async fn authorize(
             .start_authorization(&context, &node, id, &body.review_digest)
             .await?,
     ))
+}
+
+async fn authorize_nostr(
+    request: HttpRequest,
+    state: web::Data<ApplicationState>,
+    body: web::Json<ReviewDigest>,
+) -> std::result::Result<HttpResponse, ApiError> {
+    let context = state.auth.context(&request, true, true).await?;
+    state.auth.admit_start(&request)?;
+    let (node, id) = target(&request, &body.review_digest)?;
+    let operation = state
+        .engine
+        .reviewable(&context, &node, id, &body.review_digest)
+        .await?;
+    let response = state
+        .auth
+        .manager
+        .start_nostr_authorization(&context, &operation, state.engine.clock.now())
+        .await?;
+    state
+        .engine
+        .reviewable(&context, &node, id, &body.review_digest)
+        .await?;
+    Ok(HttpResponse::Ok().json(response))
+}
+
+async fn finish_nostr(
+    request: HttpRequest,
+    state: web::Data<ApplicationState>,
+    body: web::Json<NostrAuthorizationFinish>,
+) -> std::result::Result<HttpResponse, ApiError> {
+    state.auth.admit_start(&request)?;
+    let context = state.auth.context(&request, true, true).await?;
+    let (node, id) = target(&request, &body.review_digest)?;
+    // Reject invalid challenges before the engine's write-transaction review gate too.
+    state
+        .auth
+        .manager
+        .preflight_nostr(&context, body.challenge_id, state.engine.clock.now())
+        .await?;
+    let operation = state
+        .engine
+        .reviewable(&context, &node, id, &body.review_digest)
+        .await?;
+    let body = body.into_inner();
+    let response = state
+        .auth
+        .manager
+        .finish_nostr_authorization(
+            &context,
+            &operation,
+            crate::auth::NostrFinish {
+                challenge_id: body.challenge_id,
+                event: body.event,
+            },
+            state.engine.clock.now(),
+        )
+        .await?;
+    state
+        .engine
+        .reviewable(&context, &node, id, &body.review_digest)
+        .await?;
+    Ok(HttpResponse::Ok().json(response))
 }
 
 async fn finish(

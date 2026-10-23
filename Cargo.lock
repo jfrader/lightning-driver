@@ -314,6 +314,7 @@ version = "0.1.0"
 dependencies = [
  "actix-web",
  "base64 0.21.7",
+ "bech32",
  "bitcoin",
  "chacha20poly1305",
  "chrono",
@@ -329,6 +330,9 @@ dependencies = [
  "reqwest",
  "rusqlite",
  "rustix 1.1.2",
+ "rustls 0.21.12",
+ "rustls-pemfile",
+ "secp256k1",
  "serde",
  "serde_json",
  "sha2",
@@ -343,6 +347,7 @@ dependencies = [
  "uuid",
  "webauthn-authenticator-rs",
  "webauthn-rs",
+ "x509-parser",
  "zeroize",
 ]
 

@@ -160,7 +160,7 @@ fn method(backend: Backend, kind: OperationKind) -> &'static str {
     }
 }
 async fn journey(backend: Backend, kind: OperationKind) {
-    let f = Journey::new(backend, false).await;
+    let mut f = Journey::new(backend, false).await;
     let mut browser = login(&f.state, None).await;
     let (status, op) = f.create(&browser, kind).await;
     assert_eq!(status, StatusCode::CREATED, "{backend:?} {kind:?}: {op}");
@@ -192,11 +192,16 @@ async fn journey(backend: Backend, kind: OperationKind) {
     if kind == OperationKind::OpenChannel {
         assert_eq!(result["state"], "pending");
     }
+    let clock = Arc::new(TestClock(Mutex::new(Utc::now())));
+    f.state.engine.clock = clock.clone();
     for _ in 0..4 {
         if result["state"] == "succeeded" {
             break;
         }
         result = f.observe(&browser, &op).await;
+        if let Some(next) = result["reconciliation"]["next_attempt_at"].as_str() {
+            *clock.0.lock().unwrap() = next.parse().unwrap();
+        }
     }
     assert_eq!(
         result["state"], "succeeded",
@@ -227,7 +232,13 @@ async fn journey(backend: Backend, kind: OperationKind) {
         assert_eq!(args["label"], format!("ld-{}", op["id"].as_str().unwrap()));
     }
     if kind == OperationKind::CloseChannel && backend == Backend::ClnRest {
-        assert_eq!(args["unilateraltimeout"], 0);
+        // CLN `close` rejects an outpoint; the durable target is the channel id.
+        assert_eq!(
+            args["id"],
+            "2222222222222222222222222222222222222222222222222222222222222222"
+        );
+        // `unilateraltimeout: 0` means force close now; a cooperative close omits it.
+        assert!(args.get("unilateraltimeout").is_none());
     }
     if kind == OperationKind::CloseChannel && backend == Backend::LndGrpc {
         assert_eq!(args["force"], false);
@@ -464,5 +475,37 @@ async fn lost_address_response_remains_unknown_across_restart_without_redispatch
         assert_eq!(script.calls(method), 1);
         assert_eq!(script.effects(method), 1);
         script.assert_no_unexpected_calls();
+    }
+}
+
+#[actix_web::test]
+async fn a_denied_macaroon_permission_refuses_the_review_before_dispatch() {
+    for backend in [Backend::LndRest, Backend::LndGrpc] {
+        let f = Journey::new(backend, false).await;
+        let browser = login(&f.state, None).await;
+        // LND answers the permission check with InvalidArgument rather than valid=false.
+        // Review creation asks the node for facts twice; a real denied macaroon refuses both.
+        {
+            let mut script = f.harness.scenario.lock().unwrap();
+            script.fault("CheckMacaroonPermissions", Fault::Reject);
+            script.fault("CheckMacaroonPermissions", Fault::Reject);
+        }
+        let (status, value, _) = call(
+            &f.state,
+            authenticated(post("/api/v1/nodes/synthetic/operations"), &browser)
+                .insert_header(("Idempotency-Key", Uuid::new_v4().to_string()))
+                .set_json(f.request(OperationKind::CreateInvoice)),
+            "ErrorResponse",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{backend:?} {value}"
+        );
+        assert_eq!(value["error"]["code"], "node_auth_error", "{backend:?}");
+        let script = f.harness.scenario.lock().unwrap();
+        assert_eq!(script.calls("AddInvoice"), 0, "{backend:?}");
+        assert_eq!(script.effects("AddInvoice"), 0, "{backend:?}");
     }
 }

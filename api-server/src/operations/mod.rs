@@ -35,6 +35,36 @@ use uuid::Uuid;
 type Result<T> = std::result::Result<T, EngineError>;
 type ResponseFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+const RECONCILIATION_LIFETIME_ATTEMPTS: u32 = 96;
+const RECONCILIATION_BASE_INTERVAL_SECONDS: i64 = 5;
+const RECONCILIATION_MAX_INTERVAL_SECONDS: i64 = 30 * 60;
+
+fn reconciliation_interval_seconds(attempts: u32) -> i64 {
+    RECONCILIATION_BASE_INTERVAL_SECONDS
+        .saturating_mul(i64::from(2_u32.saturating_pow(attempts.saturating_sub(1))))
+        .min(RECONCILIATION_MAX_INTERVAL_SECONDS)
+}
+/// What an operator reads from an operation, without the reconciliation bookkeeping that
+/// every status read touches.
+fn node_view(
+    operation: &lightning_client::model::Operation,
+) -> (
+    OperationState,
+    OperationStage,
+    Option<serde_json::Value>,
+    Option<serde_json::Value>,
+) {
+    (
+        operation.state,
+        operation.stage,
+        serde_json::to_value(&operation.result).ok(),
+        serde_json::to_value(&operation.error).ok(),
+    )
+}
+
+const LIST_RECONCILIATION_CAP: usize = 2;
+const LIST_RECONCILIATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug)]
 pub(crate) struct EngineError {
     code: ErrorCode,
@@ -49,6 +79,9 @@ fn failure(code: ErrorCode) -> EngineError {
     }
 }
 impl EngineError {
+    pub(super) fn code(&self) -> ErrorCode {
+        self.code
+    }
     fn claimed(mut self, id: Uuid) -> Self {
         self.operation_id = Some(id);
         self.outcome = ErrorOutcome::Unknown;
@@ -229,6 +262,9 @@ impl Faults {
 #[derive(Clone)]
 pub(crate) struct Engine {
     journal: Journal,
+    /// The node read cache, attached once the state that owns it exists. Unit fixtures
+    /// build an engine without one, where invalidation is a no-op.
+    reads: Option<Arc<crate::registry::Registry>>,
     auth: AuthManager,
     nodes: Arc<BTreeMap<String, NodeGate>>,
     unavailable: Arc<BTreeMap<String, (bool, ErrorCode)>>,
@@ -393,7 +429,26 @@ impl Engine {
             .map(|(operation, _)| operation)
     }
 
+    /// Confirms once; a claim that reached the node also drops that node's cached reads,
+    /// because the node may have accepted the mutation before any later observation.
     async fn confirm_once_outcome(
+        &self,
+        context: &Context,
+        node: &str,
+        id: Uuid,
+        digest: &str,
+        authorization: Option<Uuid>,
+    ) -> Result<(Operation, bool)> {
+        let outcome = self
+            .dispatch_once(context, node, id, digest, authorization)
+            .await?;
+        if outcome.1 {
+            self.invalidate_reads(node).await;
+        }
+        Ok(outcome)
+    }
+
+    async fn dispatch_once(
         &self,
         context: &Context,
         node: &str,
@@ -513,12 +568,58 @@ impl Engine {
             return Ok(operation);
         }
         let Some(query) = storage::observation_query(self, id, &pinned.config).await? else {
-            return Ok(operation);
+            return storage::status(self, context, node, id).await;
         };
+        let before = node_view(&operation);
         let evidence = pinned.adapter.observe_exact(query).await;
-        storage::apply(self, id, evidence, true)
+        let observed = storage::apply(self, id, evidence, true)
             .await
-            .map_err(|e| e.claimed(id))
+            .map_err(|e| e.claimed(id))?;
+        // A new state, stage, result or error means the node did something this operation
+        // observed: whatever the read cache held for that node may predate it.
+        if node_view(&observed) != before {
+            self.invalidate_reads(node).await;
+        }
+        Ok(observed)
+    }
+
+    pub(crate) fn attach_reads(&mut self, reads: Arc<crate::registry::Registry>) {
+        self.reads = Some(reads);
+    }
+
+    /// Drops this node's cached reads after a committed change and frees their bytes.
+    async fn invalidate_reads(&self, node: &str) {
+        if let Some(reads) = &self.reads {
+            reads.invalidate_reads(node).await;
+        }
+    }
+
+    pub(crate) async fn observe_list(&self, context: &Context, node: &str) -> Result<()> {
+        self.live(context).await?;
+        let Ok(pinned) = self.pinned(node) else {
+            return Ok(());
+        };
+        let ids = storage::observation_candidates(self, &pinned.config).await?;
+        // Sequential, node-scoped work with a total deadline; each adapter also
+        // enforces its transport deadline. Cancellation never refunds an attempt.
+        if let Ok(result) = tokio::time::timeout(LIST_RECONCILIATION_DEADLINE, async {
+            for id in ids {
+                match self.observe(context, node, id).await {
+                    // Unverifiable node evidence cannot make durable history
+                    // unavailable or release its claims.
+                    Err(error) if error.code == ErrorCode::UpstreamInvalidResponse => {}
+                    result => {
+                        result?;
+                    }
+                }
+            }
+            Ok::<_, EngineError>(())
+        })
+        .await
+        {
+            result?;
+        }
+        Ok(())
     }
 }
 

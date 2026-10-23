@@ -327,6 +327,7 @@ impl ReviewedIntent {
                 created_at: now,
                 updated_at: now,
                 last_reconciled_at: None,
+                reconciliation: None,
             },
         };
         if !intent.operation.review.sensitive {
