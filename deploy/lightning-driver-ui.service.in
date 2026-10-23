@@ -1,0 +1,14 @@
+[Unit]
+Description=Lightning Driver UI
+After=lightning-driver-api.service
+
+[Service]
+Type=simple
+Environment=DIST=@PREFIX@/share/lightning-driver/dist
+Environment=PORT=@PORT@
+ExecStart=/usr/bin/env node @PREFIX@/lib/lightning-driver/server.mjs
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

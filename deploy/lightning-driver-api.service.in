@@ -1,0 +1,13 @@
+[Unit]
+Description=Lightning Driver API
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@STATE@
+ExecStart=@PREFIX@/lib/lightning-driver/api-server serve --config @STATE@/config.toml
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -69,6 +69,30 @@ Both the bind address and public origin must be loopback when the development ex
 
 The Rust checkpoint does not serve frontend assets or a registration page. The frontend must use the same origin and the frozen JSON API; WebAuthn registration needs an authenticator, not a password or a curl-only login.
 
+### Running an instance
+
+`deploy/install.sh` installs the API and a static-plus-proxy server for the built UI as user-level systemd services. Build the UI first (`npm run build` in `lightning-driver-ui`), then:
+
+```sh
+deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist
+```
+
+It writes `~/.local/lib/lightning-driver/{api-server,server.mjs}`, the UI assets under `~/.local/share/lightning-driver/dist`, and two units into `~/.config/systemd/user/`, then enables and restarts them. The state directory defaults to `~/.local/state/lightning-driver` and must hold `config.toml` before the first install; for a loopback instance:
+
+```toml
+[api]
+bind = "127.0.0.1:8080"
+public_origin = "http://localhost:4400"
+rp_id = "localhost"
+database = "manager.sqlite"
+invoice_key_file = "pending-invoice.key"
+allow_insecure_loopback = true
+```
+
+`--port` must match the port in `api.public_origin`. Enroll the first sign-in method from the host with `~/.local/lib/lightning-driver/api-server auth enrollment --config ~/.local/state/lightning-driver/config.toml`, open the URL, and register a passkey.
+
+Re-running the script after `cargo build --release -p api-server` and a UI build upgrades both artifacts and restarts the services; the state directory is never rewritten. `--no-restart` installs without restarting, and `--binary PATH` installs an existing binary instead of building.
+
 ## Host enrollment and recovery
 
 Issue an enrollment token from a trusted host terminal:
