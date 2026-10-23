@@ -116,6 +116,7 @@ impl HttpFixture {
             Arc::new(Mutex::new(Some(PinnedNode {
                 config,
                 adapter: self.fake.clone(),
+                reads: self.fake.clone(),
             }))),
         );
     }

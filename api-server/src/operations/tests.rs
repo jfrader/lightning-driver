@@ -428,6 +428,8 @@ impl CountingFake {
         evidence
     }
 }
+impl Reads for CountingFake {}
+
 impl Adapter for CountingFake {
     fn prepare<'a>(&'a self, _: &'a OperationRequest) -> ResponseFuture<'a, Result<ReadFacts>> {
         self.preparations.fetch_add(1, Ordering::SeqCst);
@@ -722,6 +724,7 @@ impl Fixture {
             Arc::new(Mutex::new(Some(PinnedNode {
                 config,
                 adapter: fake.clone(),
+                reads: fake.clone(),
             }))),
         )]);
         let engine = Engine {
@@ -1606,6 +1609,7 @@ async fn independent_nodes_execute_concurrently_without_a_global_rpc_lock() {
         Arc::new(Mutex::new(Some(PinnedNode {
             config,
             adapter: other.clone(),
+            reads: other.clone(),
         }))),
     );
     let first = f.create(OperationKind::SendOnchain).await;
@@ -2237,6 +2241,7 @@ async fn all_eight_postcommit_retarget_uses_original_pinned_adapter_and_never_ob
                     *gate.lock().unwrap() = Some(PinnedNode {
                         config: config.clone(),
                         adapter: new_adapter.clone(),
+                        reads: new_adapter.clone(),
                     });
                 }
                 false

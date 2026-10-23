@@ -35,7 +35,7 @@ impl Engine {
             .tasks
             .try_acquire()
             .map_err(|_| ApiError::new(ErrorCode::RateLimited))?;
-        let result = pinned.adapter.read(query).await?;
+        let result = pinned.reads.read(query).await?;
         let current = self.pinned(id)?;
         if current.config.generation != pinned.config.generation {
             return Err(ApiError::new(ErrorCode::IdentityChanged));
@@ -44,7 +44,7 @@ impl Engine {
     }
     pub(crate) async fn from_settings(
         settings: &Settings,
-        registry: &Registry,
+        registry: &mut Registry,
         journal: Journal,
         auth: AuthManager,
     ) -> std::result::Result<Self, ApiError> {
@@ -67,6 +67,7 @@ impl Engine {
             let result = construct(node, &settings.api, entry).await;
             match result {
                 Ok(pinned) => {
+                    registry.register_availability(&node.id, pinned.reads.availability().await);
                     nodes.insert(node.id.clone(), Arc::new(Mutex::new(Some(pinned))));
                 }
                 Err(error) => {
@@ -161,7 +162,11 @@ async fn construct(
     if material_revision(node, &entry.binding_revision)? != revision {
         return Err(failure(ErrorCode::NotConfigured));
     }
-    Ok(PinnedNode { config, adapter })
+    Ok(PinnedNode {
+        config,
+        reads: adapter.clone(),
+        adapter,
+    })
 }
 
 fn load_key(path: &Path, pending: bool) -> std::result::Result<PendingSecretKey, ApiError> {
@@ -226,6 +231,36 @@ fn load_key(path: &Path, pending: bool) -> std::result::Result<PendingSecretKey,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn read_only_adapter_can_override_registration_availability() {
+        struct ReadOnly;
+        impl Reads for ReadOnly {
+            fn availability(&self) -> ResponseFuture<'_, ReadAvailability> {
+                Box::pin(async {
+                    ReadAvailability {
+                        watchtower_client: Capability {
+                            enabled: false,
+                            reason: Some(CapabilityReason::PermissionDenied),
+                        },
+                        ..ReadAvailability::lightning()
+                    }
+                })
+            }
+        }
+        let reads: Arc<dyn Reads> = Arc::new(ReadOnly);
+        let availability = reads.availability().await;
+        assert!(!availability.watchtower_client.enabled);
+        assert_eq!(
+            availability.watchtower_client.reason,
+            Some(CapabilityReason::PermissionDenied)
+        );
+        assert!(availability.peers.enabled);
+        assert_eq!(
+            reads.read(ReadQuery::Peers).await.err().unwrap().code(),
+            ErrorCode::Unsupported
+        );
+    }
 
     fn directory() -> tempfile::TempDir {
         tempfile::Builder::new()
@@ -306,6 +341,23 @@ mod tests {
         .unwrap();
         assert_eq!(state.engine.nodes.len(), 3);
         assert!(state.engine.unavailable.is_empty());
+        for (_, entry) in state.registry.entries() {
+            assert_eq!(
+                serde_json::to_value(
+                    entry
+                        .summary(Utc::now(), lightning_client::money::Decimal::ZERO)
+                        .read_availability
+                )
+                .unwrap(),
+                serde_json::to_value(ReadAvailability::lightning()).unwrap()
+            );
+        }
+        let mut without_policy = settings.clone();
+        without_policy.nodes[0].policy = None;
+        assert!(matches!(
+            Registry::new(&without_policy),
+            Err(crate::registry::RegistryError::LightningPolicyRequired)
+        ));
         tokio::task::yield_now().await;
         assert_eq!(
             listener.accept().unwrap_err().kind(),

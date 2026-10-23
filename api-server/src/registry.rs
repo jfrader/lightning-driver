@@ -19,6 +19,7 @@ pub struct Registry {
 }
 
 pub struct Entry {
+    read_availability: ReadAvailability,
     pub policy: NodePolicy,
     pub binding_revision: String,
     label: String,
@@ -58,15 +59,28 @@ fn fingerprint(value: &impl Serialize) -> Result<String, serde_json::Error> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(value)?)))
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    #[error("This runtime requires a Lightning node policy")]
+    LightningPolicyRequired,
+    #[error("Cannot fingerprint node configuration")]
+    InvalidConfiguration,
+}
+
+impl From<serde_json::Error> for RegistryError {
+    fn from(_: serde_json::Error) -> Self {
+        Self::InvalidConfiguration
+    }
+}
+
 impl Registry {
-    pub fn new(settings: &Settings) -> Result<Self, serde_json::Error> {
+    pub fn new(settings: &Settings) -> Result<Self, RegistryError> {
         let mut nodes = BTreeMap::new();
         for node in &settings.nodes {
-            let limits = node.policy.as_ref().ok_or_else(|| {
-                <serde_json::Error as serde::ser::Error>::custom(
-                    "This runtime requires a Lightning node policy; Bitcoin runtime support is not implemented",
-                )
-            })?;
+            let limits = node
+                .policy
+                .as_ref()
+                .ok_or(RegistryError::LightningPolicyRequired)?;
             let binding_revision = binding(node)?;
             let revision = fingerprint(&(
                 "policy-v1",
@@ -83,6 +97,7 @@ impl Registry {
             nodes.insert(
                 node.id.clone(),
                 Entry {
+                    read_availability: ReadAvailability::lightning(),
                     binding_revision,
                     label: node.label.clone(),
                     backend: node.backend,
@@ -136,6 +151,11 @@ impl Registry {
             entry.unavailable = Some(code);
         }
     }
+    pub(crate) fn register_availability(&mut self, id: &str, availability: ReadAvailability) {
+        if let Some(entry) = self.nodes.get_mut(id) {
+            entry.read_availability = availability;
+        }
+    }
     pub fn entries(&self) -> impl Iterator<Item = (&String, &Entry)> {
         self.nodes.iter()
     }
@@ -174,7 +194,7 @@ impl Entry {
         let mut summary = NodeSummary {
             id: self.policy.node_id.clone(),
             kind: NodeKind::Lightning,
-            read_availability: ReadAvailability::lightning(),
+            read_availability: self.read_availability.clone(),
             label: self.label.clone(),
             backend: self.backend,
             network: Network::Unknown,
@@ -311,6 +331,7 @@ mod tests {
             },
         };
         Entry {
+            read_availability: ReadAvailability::lightning(),
             policy,
             binding_revision: "synthetic-binding".into(),
             label: "Synthetic".into(),
@@ -357,6 +378,35 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn registered_availability_is_independent_of_node_health() {
+        let now = Utc::now();
+        let entry = observed_entry(now, Backend::LndGrpc, false);
+        let id = entry.policy.node_id.clone();
+        let mut registry = Registry {
+            nodes: BTreeMap::from([(id.clone(), entry)]),
+            ..Registry::default()
+        };
+        let mut availability = ReadAvailability::lightning();
+        availability.watchtower_client = Capability {
+            enabled: false,
+            reason: Some(CapabilityReason::PermissionDenied),
+        };
+        availability.watchtower_server = Capability {
+            enabled: true,
+            reason: None,
+        };
+        registry.register_availability(&id, availability.clone());
+        let entry = registry.get(&id).unwrap();
+        *entry.last_error.lock().unwrap() = Some((now, ErrorCode::NodeOffline));
+        let summary = entry.summary(now, Decimal::ZERO);
+        assert!(summary.status.stale);
+        assert_eq!(
+            serde_json::to_value(summary.read_availability).unwrap(),
+            serde_json::to_value(availability).unwrap()
+        );
     }
 
     #[test]

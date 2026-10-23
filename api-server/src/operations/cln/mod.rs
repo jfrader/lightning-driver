@@ -434,7 +434,7 @@ impl ClnAdapter {
         }
     }
 }
-impl Adapter for ClnAdapter {
+impl Reads for ClnAdapter {
     fn read(&self, query: ReadQuery) -> ResponseFuture<'_, Result<ReadResult>> {
         Box::pin(async move {
             tokio::time::timeout(self.transport.deadline(), self.read_inner(query))
@@ -442,6 +442,9 @@ impl Adapter for ClnAdapter {
                 .map_err(|_| failure(ErrorCode::NodeOffline))?
         })
     }
+}
+
+impl Adapter for ClnAdapter {
     fn prepare<'a>(
         &'a self,
         request: &'a OperationRequest,

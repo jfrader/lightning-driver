@@ -529,7 +529,7 @@ impl<T: Wire> LndAdapter<T> {
         })
     }
 }
-impl<T: Wire> Adapter for LndAdapter<T> {
+impl<T: Wire> Reads for LndAdapter<T> {
     fn read(&self, q: ReadQuery) -> ResponseFuture<'_, Result<ReadResult>> {
         Box::pin(async move {
             tokio::time::timeout(self.transport.deadline(), self.read_inner(q))
@@ -537,6 +537,9 @@ impl<T: Wire> Adapter for LndAdapter<T> {
                 .map_err(|_| failure(ErrorCode::NodeOffline))?
         })
     }
+}
+
+impl<T: Wire> Adapter for LndAdapter<T> {
     fn prepare<'a>(&'a self, r: &'a OperationRequest) -> ResponseFuture<'a, Result<ReadFacts>> {
         Box::pin(async move {
             tokio::time::timeout(self.transport.deadline(), self.prepare_inner(r))

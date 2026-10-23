@@ -160,12 +160,14 @@ struct ReadFacts {
 
 struct PinnedNode {
     config: NodeConfig,
+    reads: Arc<dyn Reads>,
     adapter: Arc<dyn Adapter>,
 }
 impl Clone for PinnedNode {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
+            reads: self.reads.clone(),
             adapter: self.adapter.clone(),
         }
     }
@@ -173,10 +175,16 @@ impl Clone for PinnedNode {
 type NodeGate = Arc<Mutex<Option<PinnedNode>>>;
 
 // There is no arbitrary RPC, continuation, cleanup or retry entry point.
-trait Adapter: Send + Sync {
+trait Reads: Send + Sync {
     fn read(&self, _query: ReadQuery) -> ResponseFuture<'_, Result<ReadResult>> {
         Box::pin(async { Err(failure(ErrorCode::Unsupported)) })
     }
+    fn availability(&self) -> ResponseFuture<'_, ReadAvailability> {
+        Box::pin(async { ReadAvailability::lightning() })
+    }
+}
+
+trait Adapter: Reads {
     fn prepare<'a>(
         &'a self,
         request: &'a OperationRequest,

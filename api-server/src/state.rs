@@ -22,9 +22,13 @@ impl ApplicationState {
         let auth = AuthHttp::new(settings.api.clone(), journal.clone())?;
         let mut registry = crate::registry::Registry::new(settings)
             .map_err(|_| ApiError::new(ErrorCode::NotConfigured))?;
-        let mut engine =
-            Engine::from_settings(settings, &registry, journal.clone(), auth.manager.clone())
-                .await?;
+        let mut engine = Engine::from_settings(
+            settings,
+            &mut registry,
+            journal.clone(),
+            auth.manager.clone(),
+        )
+        .await?;
         for node in &settings.nodes {
             if let Some(code) = engine.unavailable(&node.id) {
                 registry.mark_unavailable(&node.id, code);

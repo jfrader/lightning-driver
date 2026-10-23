@@ -116,34 +116,18 @@ impl ApplicationState {
             .ok_or_else(|| ApiError::new(ErrorCode::NotFound))?;
         let mut cache = self.read_cache(entry).await?;
         let now = Utc::now();
-        let status = entry
-            .summary(now, lightning_client::money::Decimal::ZERO)
-            .status;
         if let Some(value) = cache.values.get(resource) {
-            if !status.stale
-                && now.signed_duration_since(value.at).num_seconds()
-                    < i64::from(self.limits().rpc_seconds)
+            if now.signed_duration_since(value.at).num_seconds()
+                < i64::from(self.limits().rpc_seconds)
             {
                 return Ok(value.clone());
             }
-        }
-        if status.stale {
-            return cache
-                .values
-                .get(resource)
-                .cloned()
-                .map(|mut value| {
-                    value.stale = true;
-                    value
-                })
-                .ok_or_else(|| ApiError::new(ErrorCode::NodeOffline));
         }
         let result = self.engine.read_node(id, query).await;
         let result = match result {
             Ok((value, _)) => value,
             Err(error) if error.code == ErrorCode::RateLimited => return Err(error),
             Err(error) => {
-                record_error(entry, &error, Utc::now())?;
                 return cache
                     .values
                     .get(resource)
