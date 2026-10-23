@@ -2,6 +2,7 @@ mod grpc;
 mod reads;
 #[cfg(test)]
 mod tests;
+mod tls;
 mod transport;
 
 use super::*;
@@ -196,14 +197,29 @@ impl<T: Wire> LndAdapter<T> {
         let mut b = self.transport.byte_budget();
         let info = self.info(&mut b).await?;
         let rpc = mutation_rpc(request);
-        let permission=self.call(Rpc::CheckPermissions,json!({"macaroon":base64::engine::general_purpose::STANDARD.encode(zeroize::Zeroizing::new(hex::decode(self.transport.macaroon()).map_err(|_|failure(ErrorCode::NotConfigured))?)),"permissions":rpc.permissions(),"full_method":rpc.method()}),&mut b).await?;
+        // LND answers `InvalidArgument: permission denied` (or PermissionDenied/Unauthenticated)
+        // when the macaroon lacks the checked permission instead of returning `valid:false`.
+        // Both are a refusal of this mutation, not a transport failure.
+        let permission = match self
+            .call(
+                Rpc::CheckPermissions,
+                json!({"macaroon":base64::engine::general_purpose::STANDARD.encode(zeroize::Zeroizing::new(hex::decode(self.transport.macaroon()).map_err(|_|failure(ErrorCode::NotConfigured))?)),"permissions":rpc.permissions(),"full_method":rpc.method()}),
+                &mut b,
+            )
+            .await
+        {
+            Ok(value) => reads::boolean(&value, "valid")?.ok_or_else(reads::invalid)?,
+            // `InvalidArgument` here is LND's refusal for the checked permission.
+            Err(error) if error.code() == ErrorCode::UpstreamRejected => false,
+            Err(error) => return Err(error),
+        };
         let mut facts = ReadFacts {
             binding: self.config.binding.clone(),
             generation: self.config.generation,
             observed_at: info.status.checked_at,
             connection: NodeConnection::Online,
             sync_usable: info.status.synced_to_chain == Some(true),
-            permission: reads::boolean(&permission, "valid")?.ok_or_else(reads::invalid)?,
+            permission,
             peer_connected: false,
             close_target: None,
             close_peer: None,

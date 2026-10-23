@@ -30,7 +30,7 @@
     "connect":{"id":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","host":"peer.invalid","port":9735},
     "disconnect":{"id":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798"},
     "fundchannel":{"id":"0279be667ef9dcbbac55a06295ce870b07029bfcdb2dce28d959f2815b16f81798","amount":100000,"feerate":"1000perkb","announce":false},
-    "close":{"id":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f:1","unilateraltimeout":0},
+    "close":{"id":"000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f:1"},
     "newaddr":{"addresstype":"bech32"},
     "withdraw":{"destination":"REPLACED_ADDRESS","satoshi":10000,"feerate":"1000perkb"}
   },

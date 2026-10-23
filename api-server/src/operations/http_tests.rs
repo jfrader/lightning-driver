@@ -10,6 +10,8 @@ use serde_json::{json, Value};
 
 #[path = "journey_tests.rs"]
 mod journeys;
+#[path = "nostr_http_tests.rs"]
+mod nostr;
 
 const HOST: &str = "manager.example.invalid";
 const ORIGIN: &str = "https://manager.example.invalid";
@@ -295,6 +297,57 @@ async fn create(f: &HttpFixture, browser: &Browser, kind: OperationKind, key: Uu
     assert_eq!(status, StatusCode::CREATED, "{operation}");
     operation
 }
+
+#[actix_web::test]
+async fn one_list_request_observes_only_the_node_cap_and_cursor_never_observes() {
+    let f = HttpFixture::new().await;
+    let browser = login(&f.state, None).await;
+    *f.fake.execute.lock().unwrap() = Script::Lost;
+    for index in 0..LIST_RECONCILIATION_CAP + 2 {
+        let mut input = request(OperationKind::CreateInvoice, Utc::now());
+        if let OperationRequest::CreateInvoice(params) = &mut input {
+            params.description = format!("list invoice {index}");
+        }
+        let (status, op, _) = call(
+            &f.state,
+            authenticated(post("/api/v1/nodes/synthetic/operations"), &browser)
+                .insert_header(("Idempotency-Key", Uuid::new_v4().to_string()))
+                .set_json(input),
+            "Operation",
+        )
+        .await;
+        assert_eq!(status, StatusCode::CREATED, "{op}");
+        confirm(&f.state, &browser, &op, Value::Null).await;
+    }
+    let (status, page, _) = call(
+        &f.state,
+        authenticated(get("/api/v1/nodes/synthetic/operations?limit=1"), &browser),
+        "OperationsPage",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(
+        f.fake.counts(),
+        (LIST_RECONCILIATION_CAP + 2, LIST_RECONCILIATION_CAP)
+    );
+    let cursor = page["next_cursor"].as_str().unwrap();
+    let url = url::Url::parse_with_params(
+        "https://manager.example.invalid/api/v1/nodes/synthetic/operations",
+        [("limit", "1"), ("cursor", cursor)],
+    )
+    .unwrap();
+    let (status, page, _) = call(
+        &f.state,
+        authenticated(
+            get(&format!("{}?{}", url.path(), url.query().unwrap())),
+            &browser,
+        ),
+        "OperationsPage",
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(f.fake.counts().1, LIST_RECONCILIATION_CAP);
+}
 async fn grant(state: &ApplicationState, browser: &mut Browser, operation: &Value) -> Value {
     let digest = &operation["review"]["digest"];
     let (status, start, _) = call(
@@ -331,6 +384,25 @@ async fn confirm(
     )
     .await;
     (status, value)
+}
+
+#[actix_web::test]
+async fn a_claim_that_reaches_the_node_drops_its_cached_reads() {
+    let f = HttpFixture::new().await;
+    let browser = login(&f.state, None).await;
+    assert_eq!(
+        f.state.registry.seed_read_for_test("synthetic", 64).await,
+        64
+    );
+
+    let operation = create(&f, &browser, OperationKind::NewAddress, Uuid::new_v4()).await;
+    let (status, confirmed) = confirm(&f.state, &browser, &operation, Value::Null).await;
+    assert_eq!(status, StatusCode::OK, "{confirmed}");
+    assert_eq!(
+        f.state.registry.retained_bytes(),
+        0,
+        "a claim that reached the node drops that node's cached reads"
+    );
 }
 
 #[actix_web::test]
@@ -439,7 +511,7 @@ async fn unknown_restart_removed_node_and_revoked_session_never_redispatch() {
         confirm(&f.state, &browser, &operation, Value::Null).await.0,
         StatusCode::OK
     );
-    f.fake.script(Script::Absent);
+    f.fake.script(Script::Lost);
     let (status, observed, _) = call(
         &f.state,
         authenticated(get(&path(&operation, "")), &browser),

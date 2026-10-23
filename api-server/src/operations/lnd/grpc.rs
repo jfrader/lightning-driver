@@ -105,13 +105,50 @@ impl Grpc {
         limits: &lightning_client::settings::Limits,
     ) -> Result<Self> {
         let c = Credentials::load(settings, limits)?;
-        let channel = Endpoint::from_shared(c.endpoint.to_string())
+        let mut endpoint_url = c.endpoint.clone();
+        let pinned =
+            settings.tls_verification == lightning_client::settings::TlsVerification::Pinned;
+        // Tonic must not perform a second TLS handshake over the custom connector.
+        if pinned {
+            endpoint_url
+                .set_scheme("http")
+                .map_err(|_| failure(ErrorCode::NotConfigured))?;
+        }
+        let endpoint = Endpoint::from_shared(endpoint_url.to_string())
             .map_err(|_| failure(ErrorCode::NotConfigured))?
             .connect_timeout(c.deadline)
-            .timeout(c.deadline)
-            .tls_config(ClientTlsConfig::new().ca_certificate(Certificate::from_pem(c.certificate)))
-            .map_err(|_| failure(ErrorCode::NotConfigured))?
-            .connect_lazy();
+            .timeout(c.deadline);
+        let channel = if pinned {
+            let mut config = super::tls::pinned_config(&c.certificate)?;
+            config.alpn_protocols = vec![b"h2".to_vec()];
+            let host = c
+                .endpoint
+                .host()
+                .ok_or_else(|| failure(ErrorCode::NotConfigured))?
+                .to_string();
+            let host = host
+                .trim_start_matches('[')
+                .trim_end_matches(']')
+                .to_owned();
+            let name = rustls::ServerName::try_from(host.as_str())
+                .map_err(|_| failure(ErrorCode::NotConfigured))?;
+            endpoint.connect_with_connector_lazy(super::tls::Connector {
+                config: Arc::new(config),
+                host,
+                port: c
+                    .endpoint
+                    .port_or_known_default()
+                    .ok_or_else(|| failure(ErrorCode::NotConfigured))?,
+                name,
+            })
+        } else {
+            endpoint
+                .tls_config(
+                    ClientTlsConfig::new().ca_certificate(Certificate::from_pem(c.certificate)),
+                )
+                .map_err(|_| failure(ErrorCode::NotConfigured))?
+                .connect_lazy()
+        };
         Ok(Self {
             channel,
             macaroon: c.macaroon,

@@ -87,7 +87,20 @@ INSERT OR IGNORE INTO paid_hashes(node_id,payment_hash,operation_id)
  AND json_extract(body,'$.review.payment_hash') IS NOT NULL;
 ";
 
-const MIGRATIONS: &[&str] = &[BASELINE, METADATA, ENGINE];
+const NOSTR: &str = "
+CREATE TABLE nostr_identities (
+ pubkey TEXT PRIMARY KEY CHECK(length(pubkey)=64 AND pubkey NOT GLOB '*[^0-9a-f]*'),
+ npub TEXT NOT NULL, label TEXT, created_at INTEGER NOT NULL, last_used_at INTEGER
+);
+CREATE TABLE nostr_challenges (
+ id TEXT PRIMARY KEY, owner TEXT NOT NULL, generation INTEGER NOT NULL,
+ nonce_hash BLOB NOT NULL, binding TEXT NOT NULL, expires_at INTEGER NOT NULL,
+ attempts INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE nostr_replays (event_id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
+";
+
+const MIGRATIONS: &[&str] = &[BASELINE, METADATA, ENGINE, NOSTR];
 
 pub(crate) fn register_functions(connection: &Connection) -> Result<(), JournalError> {
     connection.create_scalar_function(
@@ -192,7 +205,7 @@ mod tests {
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
                 .unwrap(),
-            3
+            i64::try_from(MIGRATIONS.len()).unwrap()
         );
         let row: (String, Vec<u8>, bool) = connection
             .query_row(
@@ -297,7 +310,7 @@ mod tests {
         let journal = crate::journal::Journal::open(path.clone()).await.unwrap();
         assert_eq!(journal.authentication().await.unwrap(), (Uuid::nil(), 7));
         journal.run(move |connection| {
-            assert_eq!(connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?, 3);
+            assert_eq!(connection.pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))?, i64::try_from(MIGRATIONS.len()).unwrap());
             for (operation, body) in expected {
                 let (stored, created, updated, kind, state, terminal, sensitive, dispatched): (String,i64,i64,String,String,bool,bool,bool) = connection.query_row("SELECT body,created_at_ns,updated_at_ns,kind,state,terminal,sensitivity,dispatched FROM operations WHERE id=?1", [operation.id.to_string()], |row| Ok((row.get(0)?,row.get(1)?,row.get(2)?,row.get(3)?,row.get(4)?,row.get(5)?,row.get(6)?,row.get(7)?)))?;
                 assert_eq!(stored, body);

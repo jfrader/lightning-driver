@@ -439,7 +439,7 @@ async fn observation_cache_bytes_are_bounded_without_disabling_a_healthy_node() 
     );
     let (_, info) = read(&f, &browser, "info", "NodeInfo").await;
     assert_eq!(info["node"]["capabilities"]["pay_invoice"]["enabled"], true);
-    assert_eq!(*f.state.observation_bytes.lock().unwrap(), 0);
+    assert_eq!(f.state.registry.retained_bytes(), 0);
     f.harness.stop().await;
 }
 

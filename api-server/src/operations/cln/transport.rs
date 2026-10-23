@@ -67,6 +67,11 @@ impl CallError {
             Self::Rpc {
                 status: 401 | 403, ..
             } => ErrorCode::NodeAuthError,
+            // A rune refused the method: checkrune answers 500 with CLN's not-permitted code.
+            Self::Rpc {
+                code: Some(1501..=1503),
+                ..
+            } => ErrorCode::NodeAuthError,
             Self::Rpc {
                 status: 404,
                 code: Some(-32601),

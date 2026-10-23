@@ -13,8 +13,8 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 ROOT = Path(__file__).resolve().parents[1]
 FROZEN = {
-    "api-server/openapi.json": "a92d6ceb9066d7b174972d279b1fc480adc26b866671305413ad1689ab32b50a",
-    "api-server/tests/fixtures/api-examples.json": "13adce818576f64d24303f99c0c86c54ee26d69ade4719142780ae2171f5ec66",
+    "api-server/openapi.json": "efad6a2fbe32c88aab8854fb49c6ca6a1c11b19bc269a6a38687a1f553149c9e",
+    "api-server/tests/fixtures/api-examples.json": "889dce55d785b4ee02cc26ad2b36ffe988dcc41dfbac36c9052ec2be96b58d35",
 }
 KINDS = {
     "create_invoice", "pay_invoice", "connect_peer", "disconnect_peer",

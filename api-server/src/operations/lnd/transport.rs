@@ -251,17 +251,23 @@ pub(super) struct Rest {
 impl Rest {
     pub fn connect(settings: &NodeSettings, limits: &Limits) -> Result<Self> {
         let c = Credentials::load(settings, limits)?;
-        let cert = reqwest::Certificate::from_pem(&c.certificate)
-            .map_err(|_| failure(ErrorCode::NotConfigured))?;
         let client = reqwest::Client::builder()
             .redirect(Policy::none())
             .no_proxy()
             .timeout(c.deadline)
             .https_only(true)
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(cert)
-            .build()
-            .map_err(|_| failure(ErrorCode::NotConfigured))?;
+            .tls_built_in_root_certs(false);
+        let client = match settings.tls_verification {
+            lightning_client::settings::TlsVerification::Ca => client.add_root_certificate(
+                reqwest::Certificate::from_pem(&c.certificate)
+                    .map_err(|_| failure(ErrorCode::NotConfigured))?,
+            ),
+            lightning_client::settings::TlsVerification::Pinned => {
+                client.use_preconfigured_tls(super::tls::pinned_config(&c.certificate)?)
+            }
+        }
+        .build()
+        .map_err(|_| failure(ErrorCode::NotConfigured))?;
         Ok(Self {
             client,
             endpoint: c.endpoint,
@@ -307,6 +313,12 @@ impl Rest {
         if let Some(obj) = p.as_object_mut() {
             if rpc == Rpc::Disconnect {
                 obj.remove("pub_key");
+            }
+            // LND's REST gateway accepts the protobuf JSON name for this field only.
+            if rpc == Rpc::CheckPermissions {
+                if let Some(value) = obj.remove("full_method") {
+                    obj.insert("fullMethod".into(), value);
+                }
             }
             for key in [
                 "channel_point",

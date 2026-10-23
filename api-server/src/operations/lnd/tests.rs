@@ -192,6 +192,7 @@ fn settings(dir: &std::path::Path, endpoint: url::Url, backend: Backend) -> Node
         backend,
         endpoint,
         certificate_file: cert,
+        tls_verification: lightning_client::settings::TlsVerification::Ca,
         credential_file: mac,
         expected_pubkey: peer(),
         network: Network::Regtest,
@@ -264,6 +265,15 @@ struct Server {
 }
 impl Server {
     async fn start(grpc: bool, steps: Vec<Step>) -> Self {
+        Self::with_certificate(
+            grpc,
+            steps,
+            include_bytes!("../../../tests/fixtures/cln-v25.02/synthetic-cert.der").to_vec(),
+            include_bytes!("../../../tests/fixtures/cln-v25.02/synthetic-key.der").to_vec(),
+        )
+        .await
+    }
+    async fn with_certificate(grpc: bool, steps: Vec<Step>, cert: Vec<u8>, key: Vec<u8>) -> Self {
         use tokio_rustls::{
             rustls::{Certificate, PrivateKey, ServerConfig},
             TlsAcceptor,
@@ -271,15 +281,7 @@ impl Server {
         let mut cfg = ServerConfig::builder()
             .with_safe_defaults()
             .with_no_client_auth()
-            .with_single_cert(
-                vec![Certificate(
-                    include_bytes!("../../../tests/fixtures/cln-v25.02/synthetic-cert.der")
-                        .to_vec(),
-                )],
-                PrivateKey(
-                    include_bytes!("../../../tests/fixtures/cln-v25.02/synthetic-key.der").to_vec(),
-                ),
-            )
+            .with_single_cert(vec![Certificate(cert)], PrivateKey(key))
             .unwrap();
         cfg.alpn_protocols = if grpc {
             vec![b"h2".to_vec()]
@@ -742,6 +744,137 @@ async fn verified_tls_and_binary_file_credentials_on_both_transports() {
         assert_eq!(error.code, ErrorCode::NodeOffline);
         server.stop(0).await;
     }
+}
+
+fn stock_lnd_certificate(san: &str) -> (tempfile::TempDir, Vec<u8>, Vec<u8>) {
+    let dir = tempfile::tempdir_in("/tmp/opencode").unwrap();
+    for args in [
+        vec![
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-keyout",
+            "key.pem",
+            "-out",
+            "tls.cert",
+            "-days",
+            "1",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "basicConstraints=critical,CA:TRUE",
+            "-addext",
+            san,
+        ],
+        vec![
+            "x509", "-in", "tls.cert", "-outform", "DER", "-out", "cert.der",
+        ],
+        vec![
+            "pkcs8", "-topk8", "-nocrypt", "-in", "key.pem", "-outform", "DER", "-out", "key.der",
+        ],
+    ] {
+        let output = std::process::Command::new("openssl")
+            .args(args)
+            .current_dir(dir.path())
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let cert = std::fs::read(dir.path().join("cert.der")).unwrap();
+    let key = std::fs::read(dir.path().join("key.der")).unwrap();
+    (dir, cert, key)
+}
+
+async fn pinned_tls_case(ip: bool, rotate: bool, wrong_san: bool, ca: bool) {
+    let (cert_dir, cert, key) = stock_lnd_certificate(if wrong_san {
+        "subjectAltName=DNS:other.example.invalid"
+    } else {
+        "subjectAltName=DNS:localhost,IP:127.0.0.1"
+    });
+    for grpc in [false, true] {
+        let accepted = !rotate && !wrong_san && !ca;
+        let steps = if !accepted {
+            vec![]
+        } else if grpc {
+            vec![Step::grpc(Rpc::Info, vec![grpc_frame(rpc_info())])]
+        } else {
+            vec![Step::rest("GET", "/v1/getinfo", fixture()["info"].clone())]
+        };
+        let server = Server::with_certificate(grpc, steps, cert.clone(), key.clone()).await;
+        let dir = tempfile::tempdir_in("/tmp/opencode").unwrap();
+        let backend = if grpc {
+            Backend::LndGrpc
+        } else {
+            Backend::LndRest
+        };
+        let mut endpoint = server.endpoint.clone();
+        if ip {
+            endpoint.set_host(Some("127.0.0.1")).unwrap();
+        }
+        let mut s = settings(dir.path(), endpoint, backend);
+        s.tls_verification = if ca {
+            lightning_client::settings::TlsVerification::Ca
+        } else {
+            lightning_client::settings::TlsVerification::Pinned
+        };
+        if rotate {
+            let (other, _, _) = stock_lnd_certificate("subjectAltName=DNS:localhost,IP:127.0.0.1");
+            std::fs::copy(other.path().join("tls.cert"), &s.certificate_file).unwrap();
+        } else {
+            std::fs::copy(cert_dir.path().join("tls.cert"), &s.certificate_file).unwrap();
+        }
+        let output = if grpc {
+            LndGrpcAdapter::connect(&s, &Limits::default(), config(backend))
+                .await
+                .unwrap()
+                .read(ReadQuery::Info)
+                .await
+        } else {
+            LndRestAdapter::connect(&s, &Limits::default(), config(backend))
+                .await
+                .unwrap()
+                .read(ReadQuery::Info)
+                .await
+        };
+        if accepted {
+            assert!(output.is_ok(), "grpc={grpc}: {:?}", output.err());
+        } else {
+            let error = output.err().unwrap();
+            assert_eq!(error.code, ErrorCode::NodeOffline, "grpc={grpc}");
+            let rendered = format!("{error:?}");
+            assert!(!rendered.contains("tls.cert"));
+            assert!(!rendered.contains("BEGIN CERTIFICATE"));
+            assert!(!rendered.contains(dir.path().to_str().unwrap()));
+        }
+        server.stop(usize::from(accepted)).await;
+    }
+}
+
+#[tokio::test]
+async fn pinned_tls_accepts_stock_lnd_on_both_transports() {
+    pinned_tls_case(false, false, false, false).await;
+}
+#[tokio::test]
+async fn pinned_tls_accepts_ip_san_on_both_transports() {
+    pinned_tls_case(true, false, false, false).await;
+}
+#[tokio::test]
+async fn pinned_tls_rejects_rotated_certificate_on_both_transports() {
+    pinned_tls_case(false, true, false, false).await;
+}
+#[tokio::test]
+async fn pinned_tls_rejects_wrong_san_on_both_transports() {
+    pinned_tls_case(false, false, true, false).await;
+}
+#[tokio::test]
+async fn ca_tls_still_rejects_stock_lnd_ca_as_leaf_on_both_transports() {
+    pinned_tls_case(false, false, false, true).await;
 }
 
 #[tokio::test]
@@ -1520,11 +1653,25 @@ async fn permission_preparation_is_read_only_and_checks_tagged_method_permission
             } else {
                 let p: Value = serde_json::from_slice(&cap[1].body).unwrap();
                 assert_eq!(reads::bytes(&p, "macaroon").unwrap(), MAC);
-                assert_eq!(p["full_method"], rpc.method());
+                assert_eq!(p["fullMethod"], rpc.method());
                 assert_eq!(p["permissions"], json!(rpc.permissions()));
             }
         }
     }
+}
+
+#[test]
+fn rest_decimal_strings_for_64_bit_integers_are_accepted_but_not_leading_zeros() {
+    assert_eq!(
+        reads::small(&json!({"n": "6"}), "n").unwrap(),
+        Some(Decimal::new(6).unwrap())
+    );
+    assert_eq!(
+        reads::small(&json!({"n": 6}), "n").unwrap(),
+        Some(Decimal::new(6).unwrap())
+    );
+    assert!(reads::small(&json!({"n": "06"}), "n").is_err());
+    assert!(reads::small(&json!({"n": "-1"}), "n").is_err());
 }
 
 #[tokio::test]
