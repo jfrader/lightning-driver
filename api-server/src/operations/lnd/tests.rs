@@ -1478,6 +1478,9 @@ fn read_steps(i: usize, grpc: bool) -> Vec<Step> {
 }
 fn read_projection(result: ReadResult) -> Value {
     match result {
+        ReadResult::Bitcoin(_) | ReadResult::BitcoinPeers(_) => {
+            panic!("Unexpected Bitcoin result from LND")
+        }
         ReadResult::Info(info) => {
             assert_eq!(info.identity_pubkey, peer());
             assert_eq!(info.status.synced_to_chain, Some(true));

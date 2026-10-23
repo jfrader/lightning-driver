@@ -5,7 +5,7 @@ mod cln;
 mod evidence;
 pub(crate) mod http;
 mod intent;
-mod lnd;
+pub(crate) mod lnd;
 mod runtime;
 mod storage;
 #[cfg(test)]
@@ -32,8 +32,8 @@ use std::{
 };
 use uuid::Uuid;
 
-type Result<T> = std::result::Result<T, EngineError>;
-type ResponseFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+pub(crate) type Result<T> = std::result::Result<T, EngineError>;
+pub(crate) type ResponseFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const RECONCILIATION_LIFETIME_ATTEMPTS: u32 = 96;
 const RECONCILIATION_BASE_INTERVAL_SECONDS: i64 = 5;
@@ -71,7 +71,7 @@ pub(crate) struct EngineError {
     operation_id: Option<Uuid>,
     outcome: ErrorOutcome,
 }
-fn failure(code: ErrorCode) -> EngineError {
+pub(crate) fn failure(code: ErrorCode) -> EngineError {
     EngineError {
         code,
         operation_id: None,
@@ -174,8 +174,13 @@ impl Clone for PinnedNode {
 }
 type NodeGate = Arc<Mutex<Option<PinnedNode>>>;
 
+struct MonitorNode {
+    reads: Arc<dyn Reads>,
+    revision: String,
+}
+
 // There is no arbitrary RPC, continuation, cleanup or retry entry point.
-trait Reads: Send + Sync {
+pub(crate) trait Reads: Send + Sync {
     fn read(&self, _query: ReadQuery) -> ResponseFuture<'_, Result<ReadResult>> {
         Box::pin(async { Err(failure(ErrorCode::Unsupported)) })
     }
@@ -275,6 +280,7 @@ pub(crate) struct Engine {
     reads: Option<Arc<crate::registry::Registry>>,
     auth: AuthManager,
     nodes: Arc<BTreeMap<String, NodeGate>>,
+    monitors: Arc<BTreeMap<String, MonitorNode>>,
     unavailable: Arc<BTreeMap<String, (bool, ErrorCode)>>,
     clock: Arc<dyn Clock>,
     key: Arc<PendingSecretKey>,
@@ -298,6 +304,9 @@ impl Engine {
         Ok(())
     }
     fn node(&self, id: &str) -> Result<NodeGate> {
+        if self.monitors.contains_key(id) {
+            return Err(failure(ErrorCode::Unsupported));
+        }
         if let Some((read_only, code)) = self.unavailable.get(id) {
             return Err(failure(if *read_only {
                 ErrorCode::ReadOnly

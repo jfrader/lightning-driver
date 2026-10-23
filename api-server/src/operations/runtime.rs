@@ -30,6 +30,13 @@ impl Engine {
         if let Some((_, code)) = self.unavailable.get(id) {
             return Err(ApiError::new(*code));
         }
+        if let Some(monitor) = self.monitors.get(id) {
+            let _permit = self
+                .tasks
+                .try_acquire()
+                .map_err(|_| ApiError::new(ErrorCode::RateLimited))?;
+            return Ok((monitor.reads.read(query).await?, monitor.revision.clone()));
+        }
         let pinned = self.pinned(id)?;
         let _permit = self
             .tasks
@@ -60,10 +67,28 @@ impl Engine {
         let key = load_key(&settings.api.invoice_key_file, pending)?;
         let mut nodes = BTreeMap::new();
         let mut unavailable = BTreeMap::new();
+        let mut monitors = BTreeMap::new();
         for node in &settings.nodes {
             let entry = registry
                 .get(&node.id)
                 .ok_or_else(|| failure(ErrorCode::NotConfigured))?;
+            if node.kind() == NodeKind::Bitcoin {
+                match crate::bitcoin::BitcoinReads::connect(node, &settings.api.limits).await {
+                    Ok(reads) => {
+                        monitors.insert(
+                            node.id.clone(),
+                            MonitorNode {
+                                reads: Arc::new(reads),
+                                revision: entry.binding_revision.clone(),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        unavailable.insert(node.id.clone(), (true, error.code()));
+                    }
+                }
+                continue;
+            }
             let result = construct(node, &settings.api, entry).await;
             match result {
                 Ok(pinned) => {
@@ -83,6 +108,7 @@ impl Engine {
             reads: None,
             auth,
             nodes: Arc::new(nodes),
+            monitors: Arc::new(monitors),
             unavailable: Arc::new(unavailable),
             clock: Arc::new(WallClock),
             key: Arc::new(key),
@@ -141,7 +167,10 @@ async fn construct(
                 .map_err(|_| failure(ErrorCode::InternalError))?,
         ),
         backend: node.backend,
-        policy: entry.policy.clone(),
+        policy: entry
+            .policy
+            .clone()
+            .ok_or_else(|| failure(ErrorCode::NotConfigured))?,
         peer_policy: node
             .peer_policy
             .clone()

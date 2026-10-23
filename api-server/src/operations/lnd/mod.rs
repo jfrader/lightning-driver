@@ -2,7 +2,7 @@ mod grpc;
 mod reads;
 #[cfg(test)]
 mod tests;
-mod tls;
+pub(crate) mod tls;
 mod transport;
 
 use super::*;
@@ -191,6 +191,9 @@ impl<T: Wire> LndAdapter<T> {
             )?),
             // Confirmation targets are unresolved in the approved specification.
             ReadQuery::Fees => ReadResult::Fees(reads::fees(node, now)),
+            ReadQuery::Bitcoin | ReadQuery::BitcoinPeers => {
+                return Err(failure(ErrorCode::Unsupported))
+            }
         })
     }
     async fn prepare_inner(&self, request: &OperationRequest) -> Result<ReadFacts> {

@@ -10,6 +10,8 @@ pub(crate) enum ReadQuery {
     Channels,
     Transactions,
     Fees,
+    Bitcoin,
+    BitcoinPeers,
 }
 #[derive(Clone)]
 pub(crate) struct Collection<T> {
@@ -35,4 +37,6 @@ pub(crate) enum ReadResult {
     Channels(Collection<Channel>),
     Transactions(Collection<Transaction>),
     Fees(FeeEstimates),
+    Bitcoin(BitcoinNodeInfo),
+    BitcoinPeers(Collection<BitcoinPeer>),
 }

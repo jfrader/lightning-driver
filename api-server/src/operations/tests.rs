@@ -732,6 +732,7 @@ impl Fixture {
             reads: None,
             auth,
             nodes: Arc::new(nodes),
+            monitors: Arc::new(BTreeMap::new()),
             unavailable: Arc::new(BTreeMap::new()),
             clock: clock.clone(),
             key: Arc::new(PendingSecretKey::new([91; 32])),

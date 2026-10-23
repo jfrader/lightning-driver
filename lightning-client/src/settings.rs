@@ -339,9 +339,20 @@ impl Settings {
             if node.label.is_empty() || node.label.chars().count() > 120 {
                 return Err(SettingsError("Invalid node label"));
             }
-            validate_endpoint(&node.endpoint)?;
+            if node.kind() == NodeKind::Bitcoin && node.endpoint.scheme() == "http" {
+                let mut secure = node.endpoint.clone();
+                secure
+                    .set_scheme("https")
+                    .map_err(|_| SettingsError("Invalid Bitcoin endpoint"))?;
+                validate_endpoint(&secure)?;
+            } else {
+                validate_endpoint(&node.endpoint)?;
+            }
             if node.tls_verification == TlsVerification::Pinned
-                && !matches!(node.backend, Backend::LndGrpc | Backend::LndRest)
+                && !matches!(
+                    node.backend,
+                    Backend::LndGrpc | Backend::LndRest | Backend::BitcoinRpc
+                )
             {
                 return Err(SettingsError("Pinned TLS requires an LND backend"));
             }

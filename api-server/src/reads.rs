@@ -20,6 +20,8 @@ pub fn configure(config: &mut web::ServiceConfig) {
         .route("/nodes/{node_id}", web::get().to(node))
         .route("/nodes/{node_id}/status", web::get().to(status))
         .route("/nodes/{node_id}/info", web::get().to(info))
+        .route("/nodes/{node_id}/bitcoin", web::get().to(bitcoin))
+        .route("/nodes/{node_id}/bitcoin/peers", web::get().to(collection))
         .route("/nodes/{node_id}/{collection:balances|invoices|payments|peers|channels|transactions|fee-estimates}", web::get().to(collection))
         .route("/nodes/{node_id}/policy", web::get().to(policy))
         .route("/nodes/{node_id}/decode", web::post().to(decode))
@@ -160,7 +162,11 @@ async fn policy(
         .registry
         .get(&id)
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound))?;
-    Ok(HttpResponse::Ok().json(&entry.policy))
+    let policy = entry
+        .policy
+        .as_ref()
+        .ok_or_else(|| ApiError::new(ErrorCode::Unsupported))?;
+    Ok(HttpResponse::Ok().json(policy))
 }
 
 async fn info(
@@ -211,6 +217,9 @@ async fn collection(
         .get(&id)
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound))?;
     let (resource, read, filter) = match request.match_info().get("collection") {
+        None if request.path().ends_with("/bitcoin/peers") => {
+            ("bitcoin-peers", ReadQuery::BitcoinPeers, None)
+        }
         Some("balances") => ("balances", ReadQuery::Balances, None),
         Some("fee-estimates") => ("fee-estimates", ReadQuery::Fees, None),
         Some("invoices") => ("invoices", ReadQuery::Invoices, Some("status")),
@@ -220,6 +229,9 @@ async fn collection(
         Some("transactions") => ("transactions", ReadQuery::Transactions, None),
         _ => return Err(ApiError::new(ErrorCode::NotFound)),
     };
+    if resource == "bitcoin-peers" {
+        require_surface(&entry.read_availability.bitcoin_peers)?;
+    }
     if matches!(resource, "balances" | "fee-estimates") {
         no_query(&request)?;
         let observed = auth.observed(&id, resource, read).await?;
@@ -290,6 +302,37 @@ async fn collection(
         )?,
         auth.limits().max_response_bytes,
     )
+}
+fn require_surface(capability: &lightning_client::model::Capability) -> Result<(), ApiError> {
+    if capability.enabled {
+        Ok(())
+    } else {
+        Err(ApiError::unsupported(capability.reason))
+    }
+}
+async fn bitcoin(
+    request: HttpRequest,
+    auth: web::Data<ApplicationState>,
+) -> Result<HttpResponse, ApiError> {
+    auth.auth.context(&request, true, false).await?;
+    no_query(&request)?;
+    let id = node_id(&request)?;
+    let entry = auth
+        .registry
+        .get(&id)
+        .ok_or_else(|| ApiError::new(ErrorCode::NotFound))?;
+    require_surface(&entry.read_availability.bitcoin)?;
+    let observed = auth
+        .observed(&id, "bitcoin", crate::operations::ReadQuery::Bitcoin)
+        .await?;
+    let mut value = observed.value;
+    value["stale"] = observed.stale.into();
+    Ok(HttpResponse::Ok()
+        .content_type("application/json")
+        .body(crate::pagination::bounded_json(
+            &value,
+            auth.limits().max_response_bytes,
+        )?))
 }
 async fn operations(
     request: HttpRequest,

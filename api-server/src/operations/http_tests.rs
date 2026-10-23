@@ -8,6 +8,8 @@ use actix_web::{
 use lightning_client::settings::{NodeSettings, Settings};
 use serde_json::{json, Value};
 
+#[path = "../bitcoin/http_tests.rs"]
+mod bitcoin;
 #[path = "journey_tests.rs"]
 mod journeys;
 #[path = "nostr_http_tests.rs"]
@@ -79,7 +81,13 @@ impl HttpFixture {
             },
             generation: Uuid::new_v4(),
             backend: Backend::LndRest,
-            policy: state.registry.get("synthetic").unwrap().policy.clone(),
+            policy: state
+                .registry
+                .get("synthetic")
+                .unwrap()
+                .policy
+                .clone()
+                .unwrap(),
             peer_policy: settings.nodes[0].peer_policy.clone().unwrap(),
             reauth_mode: ReauthMode::EveryOperation,
             capabilities: Capabilities::uniform(None),
@@ -109,7 +117,14 @@ impl HttpFixture {
     }
     fn inject(&mut self) {
         let mut config = self.fake.config.clone();
-        config.policy = self.state.registry.get("synthetic").unwrap().policy.clone();
+        config.policy = self
+            .state
+            .registry
+            .get("synthetic")
+            .unwrap()
+            .policy
+            .clone()
+            .unwrap();
         Arc::make_mut(&mut self.state.engine.unavailable).remove("synthetic");
         Arc::make_mut(&mut self.state.engine.nodes).insert(
             "synthetic".into(),

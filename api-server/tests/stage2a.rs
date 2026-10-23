@@ -318,12 +318,20 @@ async fn sanitized_sorted_registry_snapshot_filters_and_strict_queries() {
     changed.api.reauth.recent_auth_seconds = Some(120);
     changed.api.reauth.mode = lightning_client::model::ReauthMode::Recent;
     assert_ne!(
-        before.get("alpha").unwrap().policy.revision,
+        before
+            .get("alpha")
+            .unwrap()
+            .policy
+            .as_ref()
+            .unwrap()
+            .revision,
         Registry::new(&changed)
             .unwrap()
             .get("alpha")
             .unwrap()
             .policy
+            .as_ref()
+            .unwrap()
             .revision
     );
     changed = settings.clone();

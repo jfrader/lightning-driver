@@ -109,7 +109,9 @@ impl ApplicationState {
         resource: &'static str,
         query: ReadQuery,
     ) -> Result<Observed, ApiError> {
-        self.refresh_node(id).await?;
+        if !matches!(query, ReadQuery::Bitcoin | ReadQuery::BitcoinPeers) {
+            self.refresh_node(id).await?;
+        }
         let entry = self
             .registry
             .get(id)
@@ -127,6 +129,18 @@ impl ApplicationState {
         let result = match result {
             Ok((value, _)) => value,
             Err(error) if error.code == ErrorCode::RateLimited => return Err(error),
+            Err(error)
+                if matches!(query, ReadQuery::Bitcoin | ReadQuery::BitcoinPeers)
+                    && matches!(
+                        error.code,
+                        ErrorCode::IdentityChanged | ErrorCode::NetworkMismatch
+                    ) =>
+            {
+                let released = cache.invalidate();
+                self.registry
+                    .set_retained_bytes(self.registry.retained_bytes().saturating_sub(released));
+                return Err(error);
+            }
             Err(error) => {
                 return cache
                     .values
@@ -142,6 +156,8 @@ impl ApplicationState {
         let (value, truncated) = match result {
             ReadResult::Balances(value) => (serde_json::to_value(value), false),
             ReadResult::Fees(value) => (serde_json::to_value(value), false),
+            ReadResult::Bitcoin(value) => (serde_json::to_value(value), false),
+            ReadResult::BitcoinPeers(value) => (serde_json::to_value(value.items), value.truncated),
             ReadResult::Invoices(value) => (serde_json::to_value(value.items), value.truncated),
             ReadResult::Payments(value) => (serde_json::to_value(value.items), value.truncated),
             ReadResult::Peers(value) => (serde_json::to_value(value.items), value.truncated),
