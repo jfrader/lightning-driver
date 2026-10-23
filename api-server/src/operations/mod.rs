@@ -79,6 +79,9 @@ fn failure(code: ErrorCode) -> EngineError {
     }
 }
 impl EngineError {
+    pub(super) fn code(&self) -> ErrorCode {
+        self.code
+    }
     fn claimed(mut self, id: Uuid) -> Self {
         self.operation_id = Some(id);
         self.outcome = ErrorOutcome::Unknown;

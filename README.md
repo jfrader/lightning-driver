@@ -17,6 +17,10 @@ Copy `config.example.toml` into that directory and replace the example public ho
 
 The example has `nodes = []`. No node credentials, certificates or real nodes are required to start the API. `invoice_key_file` is required: on first start it is created with mode `0600` when absent and no pending ciphertext exists; a missing, wrong, truncated or unsafe key with pending ciphertext fails startup closed. No money limits are inferred from this example.
 
+### LND macaroon permissions
+
+Reads need `info:read`, `invoices:read`, `peers:read`, `offchain:read` and `onchain:read`. Each mutation is checked with `CheckMacaroonPermissions` before it is dispatched, so the macaroon must also carry `macaroon:read`; without it the preflight itself is denied. Mutations need `invoices:write` (invoice), `offchain:write` (payment), `peers:write` (connect/disconnect), `onchain:write` (send) or both `onchain:write` and `offchain:write` (open/close a channel). An unrestricted admin macaroon satisfies all of them. CLN is checked with `checkrune` against the rune before dispatch.
+
 ### LND TLS certificates
 
 For CA-signed LND certificates, omit `tls_verification` or set it to `"ca"` and point `certificate_file` at the issuing CA certificate.

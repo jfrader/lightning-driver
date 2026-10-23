@@ -477,3 +477,35 @@ async fn lost_address_response_remains_unknown_across_restart_without_redispatch
         script.assert_no_unexpected_calls();
     }
 }
+
+#[actix_web::test]
+async fn a_denied_macaroon_permission_refuses_the_review_before_dispatch() {
+    for backend in [Backend::LndRest, Backend::LndGrpc] {
+        let f = Journey::new(backend, false).await;
+        let browser = login(&f.state, None).await;
+        // LND answers the permission check with InvalidArgument rather than valid=false.
+        // Review creation asks the node for facts twice; a real denied macaroon refuses both.
+        {
+            let mut script = f.harness.scenario.lock().unwrap();
+            script.fault("CheckMacaroonPermissions", Fault::Reject);
+            script.fault("CheckMacaroonPermissions", Fault::Reject);
+        }
+        let (status, value, _) = call(
+            &f.state,
+            authenticated(post("/api/v1/nodes/synthetic/operations"), &browser)
+                .insert_header(("Idempotency-Key", Uuid::new_v4().to_string()))
+                .set_json(f.request(OperationKind::CreateInvoice)),
+            "ErrorResponse",
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "{backend:?} {value}"
+        );
+        assert_eq!(value["error"]["code"], "node_auth_error", "{backend:?}");
+        let script = f.harness.scenario.lock().unwrap();
+        assert_eq!(script.calls("AddInvoice"), 0, "{backend:?}");
+        assert_eq!(script.effects("AddInvoice"), 0, "{backend:?}");
+    }
+}

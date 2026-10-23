@@ -1604,3 +1604,32 @@ async fn observed_unilateral_transaction_reaches_truthful_terminal_engine_failur
     );
     emit("cln-unilateral-closed", "Operation", completed.operation);
 }
+
+#[test]
+fn a_rune_denial_reads_as_an_auth_error() {
+    for code in 1501..=1503 {
+        let error = super::transport::CallError::Rpc {
+            status: 500,
+            code: Some(code),
+        };
+        assert_eq!(error.read_code(), ErrorCode::NodeAuthError);
+    }
+    // A dispatched mutation with a denied rune is refused with 401, which is a rejection.
+    assert!(matches!(
+        super::transport::CallError::Rpc {
+            status: 401,
+            code: Some(1502)
+        }
+        .mutation_class(Rpc::Invoice),
+        Class::Rejected(Rejection::Auth)
+    ));
+    // Any other server error keeps the conservative read mapping.
+    assert_eq!(
+        super::transport::CallError::Rpc {
+            status: 500,
+            code: Some(-32603)
+        }
+        .read_code(),
+        ErrorCode::NodeOffline
+    );
+}
