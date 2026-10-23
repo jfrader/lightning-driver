@@ -45,7 +45,7 @@ impl ServerCertVerifier for PinnedCertificate {
     }
 }
 
-pub(super) fn pinned_config(pem: &[u8]) -> Result<ClientConfig> {
+pub(crate) fn pinned_config(pem: &[u8]) -> Result<ClientConfig> {
     let certificates = rustls_pemfile::certs(&mut std::io::Cursor::new(pem))
         .map_err(|_| failure(ErrorCode::NotConfigured))?;
     let [der] = certificates.as_slice() else {

@@ -19,7 +19,10 @@ pub struct Registry {
 }
 
 pub struct Entry {
-    pub policy: NodePolicy,
+    pub(crate) read_availability: ReadAvailability,
+    pub policy: Option<NodePolicy>,
+    id: String,
+    configured_network: Network,
     pub binding_revision: String,
     label: String,
     backend: lightning_client::model::Backend,
@@ -58,15 +61,27 @@ fn fingerprint(value: &impl Serialize) -> Result<String, serde_json::Error> {
     Ok(hex::encode(Sha256::digest(serde_json::to_vec(value)?)))
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum RegistryError {
+    #[error("This runtime requires a Lightning node policy")]
+    LightningPolicyRequired,
+    #[error("Cannot fingerprint node configuration")]
+    InvalidConfiguration,
+}
+
+impl From<serde_json::Error> for RegistryError {
+    fn from(_: serde_json::Error) -> Self {
+        Self::InvalidConfiguration
+    }
+}
+
 impl Registry {
-    pub fn new(settings: &Settings) -> Result<Self, serde_json::Error> {
+    pub fn new(settings: &Settings) -> Result<Self, RegistryError> {
         let mut nodes = BTreeMap::new();
         for node in &settings.nodes {
-            let limits = node.policy.as_ref().ok_or_else(|| {
-                <serde_json::Error as serde::ser::Error>::custom(
-                    "This runtime requires a Lightning node policy; Bitcoin runtime support is not implemented",
-                )
-            })?;
+            if node.kind() == NodeKind::Lightning && node.policy.is_none() {
+                return Err(RegistryError::LightningPolicyRequired);
+            }
             let binding_revision = binding(node)?;
             let revision = fingerprint(&(
                 "policy-v1",
@@ -83,6 +98,13 @@ impl Registry {
             nodes.insert(
                 node.id.clone(),
                 Entry {
+                    id: node.id.clone(),
+                    configured_network: node.network,
+                    read_availability: if node.kind() == NodeKind::Bitcoin {
+                        ReadAvailability::bitcoin()
+                    } else {
+                        ReadAvailability::lightning()
+                    },
                     binding_revision,
                     label: node.label.clone(),
                     backend: node.backend,
@@ -91,12 +113,12 @@ impl Registry {
                     observation: std::sync::Mutex::new(None),
                     reads: tokio::sync::Mutex::new(crate::live::Cache::default()),
                     last_error: std::sync::Mutex::new(None),
-                    policy: NodePolicy {
+                    policy: node.policy.as_ref().map(|limits| NodePolicy {
                         node_id: node.id.clone(),
                         revision,
                         read_only: node.read_only.unwrap_or(true),
                         limits: limits.clone(),
-                    },
+                    }),
                 },
             );
         }
@@ -136,6 +158,11 @@ impl Registry {
             entry.unavailable = Some(code);
         }
     }
+    pub(crate) fn register_availability(&mut self, id: &str, availability: ReadAvailability) {
+        if let Some(entry) = self.nodes.get_mut(id) {
+            entry.read_availability = availability;
+        }
+    }
     pub fn entries(&self) -> impl Iterator<Item = (&String, &Entry)> {
         self.nodes.iter()
     }
@@ -144,7 +171,9 @@ impl Registry {
         for (id, entry) in &self.nodes {
             hash.update(id.as_bytes());
             hash.update(entry.binding_revision.as_bytes());
-            hash.update(entry.policy.revision.as_bytes());
+            if let Some(policy) = &entry.policy {
+                hash.update(policy.revision.as_bytes());
+            }
         }
         hex::encode(hash.finalize())
     }
@@ -161,6 +190,9 @@ fn binding(node: &NodeSettings) -> Result<String, serde_json::Error> {
         &node.certificate_file,
         &node.credential_file,
     ))?;
+    if node.kind() == NodeKind::Bitcoin {
+        return fingerprint(&(ca_binding, &node.expected_genesis, node.tls_verification));
+    }
     match node.tls_verification {
         lightning_client::settings::TlsVerification::Ca => Ok(ca_binding),
         lightning_client::settings::TlsVerification::Pinned => {
@@ -171,18 +203,19 @@ fn binding(node: &NodeSettings) -> Result<String, serde_json::Error> {
 
 impl Entry {
     pub fn summary(&self, now: DateTime<Utc>, unresolved: Decimal) -> NodeSummary {
+        let read_only = self.policy.as_ref().is_none_or(|policy| policy.read_only);
         let mut summary = NodeSummary {
-            id: self.policy.node_id.clone(),
-            kind: NodeKind::Lightning,
-            read_availability: ReadAvailability::lightning(),
+            id: self.id.clone(),
+            kind: self.backend.kind(),
+            read_availability: self.read_availability.clone(),
             label: self.label.clone(),
             backend: self.backend,
             network: Network::Unknown,
             identity_pubkey: None,
             identity_revision: None,
-            read_only: self.policy.read_only,
+            read_only,
             status: NodeStatus {
-                node_id: self.policy.node_id.clone(),
+                node_id: self.id.clone(),
                 status: match self.unavailable {
                     Some(ErrorCode::NotConfigured) => NodeConnection::ConfigError,
                     _ => NodeConnection::Unsupported,
@@ -195,7 +228,7 @@ impl Entry {
                 stale: true,
                 error_code: Some(self.unavailable.unwrap_or(ErrorCode::NodeUnverified)),
             },
-            capabilities: Capabilities::uniform(Some(if self.policy.read_only {
+            capabilities: Capabilities::uniform(Some(if read_only {
                 CapabilityReason::ReadOnly
             } else {
                 self.unavailable
@@ -213,7 +246,7 @@ impl Entry {
                 summary.status.stale |= info.status.observed_at.is_none_or(|at| {
                     now.signed_duration_since(at).num_seconds() >= i64::from(self.freshness_seconds)
                 });
-                let reason = if self.policy.read_only {
+                let reason = if read_only {
                     Some(CapabilityReason::ReadOnly)
                 } else if let Some(code) = info.status.error_code {
                     Some(capability_reason(code))
@@ -251,12 +284,16 @@ impl Entry {
                     ErrorCode::Unsupported => NodeConnection::Unsupported,
                     _ => NodeConnection::Offline,
                 };
-                summary.capabilities = Capabilities::uniform(Some(if self.policy.read_only {
+                summary.capabilities = Capabilities::uniform(Some(if read_only {
                     CapabilityReason::ReadOnly
                 } else {
                     capability_reason(code)
                 }));
             }
+        }
+        if summary.kind == NodeKind::Bitcoin {
+            summary.capabilities = Capabilities::uniform(Some(CapabilityReason::MonitorOnly));
+            summary.identity_pubkey = None;
         }
         summary
     }
@@ -265,7 +302,11 @@ impl Entry {
             .lock()
             .ok()
             .and_then(|guard| guard.as_ref().map(|(info, _)| info.network))
-            .unwrap_or(Network::Unknown)
+            .unwrap_or(if self.backend.kind() == NodeKind::Bitcoin {
+                self.configured_network
+            } else {
+                Network::Unknown
+            })
     }
 }
 
@@ -311,7 +352,10 @@ mod tests {
             },
         };
         Entry {
-            policy,
+            id: policy.node_id.clone(),
+            configured_network: Network::Regtest,
+            read_availability: ReadAvailability::lightning(),
+            policy: Some(policy),
             binding_revision: "synthetic-binding".into(),
             label: "Synthetic".into(),
             backend,
@@ -357,6 +401,35 @@ mod tests {
                 "{kind}"
             );
         }
+    }
+
+    #[test]
+    fn registered_availability_is_independent_of_node_health() {
+        let now = Utc::now();
+        let entry = observed_entry(now, Backend::LndGrpc, false);
+        let id = entry.id.clone();
+        let mut registry = Registry {
+            nodes: BTreeMap::from([(id.clone(), entry)]),
+            ..Registry::default()
+        };
+        let mut availability = ReadAvailability::lightning();
+        availability.watchtower_client = Capability {
+            enabled: false,
+            reason: Some(CapabilityReason::PermissionDenied),
+        };
+        availability.watchtower_server = Capability {
+            enabled: true,
+            reason: None,
+        };
+        registry.register_availability(&id, availability.clone());
+        let entry = registry.get(&id).unwrap();
+        *entry.last_error.lock().unwrap() = Some((now, ErrorCode::NodeOffline));
+        let summary = entry.summary(now, Decimal::ZERO);
+        assert!(summary.status.stale);
+        assert_eq!(
+            serde_json::to_value(summary.read_availability).unwrap(),
+            serde_json::to_value(availability).unwrap()
+        );
     }
 
     #[test]

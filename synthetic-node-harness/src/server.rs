@@ -241,6 +241,11 @@ fn certificates(d: &Path) -> io::Result<()> {
 fn route(method: &Method, path: &str) -> Option<&'static str> {
     Some(match (method, path) {
         (&Method::GET, "/v1/getinfo") => "GetInfo",
+        (&Method::GET, "/v2/watchtower/server") => "TowerGetInfo",
+        (&Method::GET, "/v2/watchtower/client/stats") => "Stats",
+        (&Method::GET, "/v2/watchtower/client/policy") => "Policy",
+        (&Method::GET, "/v2/watchtower/client") => "ListTowers",
+        (&Method::GET, p) if p.starts_with("/v2/watchtower/client/info/") => "GetTowerInfo",
         (&Method::GET, "/v1/balance/blockchain") => "WalletBalance",
         (&Method::GET, "/v1/balance/channels") => "ChannelBalance",
         (&Method::GET, "/v1/invoices") => "ListInvoices",
@@ -290,7 +295,11 @@ async fn serve(
     }
     let path = request.uri().path().to_owned();
     let method = if grpc {
-        path.rsplit('/').next()
+        if path == "/watchtowerrpc.Watchtower/GetInfo" {
+            Some("TowerGetInfo")
+        } else {
+            path.rsplit('/').next()
+        }
     } else if cln && request.method() == Method::POST {
         path.strip_prefix("/v1/")
     } else {
@@ -320,6 +329,23 @@ async fn serve(
         return Ok(error(grpc, cln, 3));
     };
     if !grpc && !cln {
+        if path.starts_with("/v2/watchtower/") {
+            for (key, value) in
+                url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+            {
+                params[key.as_ref()] =
+                    serde_json::from_str(&value).unwrap_or_else(|_| json!(value));
+            }
+            if method == "GetTowerInfo" {
+                let Some(key) = path
+                    .strip_prefix("/v2/watchtower/client/info/")
+                    .and_then(|s| URL_SAFE.decode(s).ok())
+                else {
+                    return Ok(error(false, false, 3));
+                };
+                params["pubkey"] = json!(base64::engine::general_purpose::STANDARD.encode(key));
+            }
+        }
         if method == "LookupInvoice" {
             params["r_hash_str"] = json!(path.strip_prefix("/v1/invoice/").unwrap_or_default());
         }
@@ -350,6 +376,13 @@ async fn serve(
         }
     }
     let fault = state.lock().expect("scenario mutex").begin(method);
+    if let Some((code, message)) = state
+        .lock()
+        .expect("scenario mutex")
+        .watchtower_error(method, &params)
+    {
+        return Ok(message_error(grpc, code, message));
+    }
     match fault {
         Some(Fault::TimeoutBeforeEffect) => {
             tokio::time::sleep(LOST_RESPONSE_DELAY).await;
@@ -460,4 +493,22 @@ fn error(grpc: bool, cln: bool, code: i32) -> Response<Body> {
             json!({"code":code,"message":"Synthetic rejection"}).to_string(),
         ))
         .expect("error response")
+}
+fn message_error(grpc: bool, code: i32, message: &str) -> Response<Body> {
+    if grpc {
+        Response::builder()
+            .header("content-type", "application/grpc")
+            .header("grpc-status", code.to_string())
+            .header("grpc-message", message)
+            .body(Body::empty())
+            .expect("gRPC rejection")
+    } else {
+        Response::builder()
+            .status(StatusCode::INTERNAL_SERVER_ERROR)
+            .header("content-type", "application/json")
+            .body(Body::from(
+                json!({"code":code,"message":message}).to_string(),
+            ))
+            .expect("REST rejection")
+    }
 }

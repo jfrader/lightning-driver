@@ -30,12 +30,19 @@ impl Engine {
         if let Some((_, code)) = self.unavailable.get(id) {
             return Err(ApiError::new(*code));
         }
+        if let Some(monitor) = self.monitors.get(id) {
+            let _permit = self
+                .tasks
+                .try_acquire()
+                .map_err(|_| ApiError::new(ErrorCode::RateLimited))?;
+            return Ok((monitor.reads.read(query).await?, monitor.revision.clone()));
+        }
         let pinned = self.pinned(id)?;
         let _permit = self
             .tasks
             .try_acquire()
             .map_err(|_| ApiError::new(ErrorCode::RateLimited))?;
-        let result = pinned.adapter.read(query).await?;
+        let result = pinned.reads.read(query).await?;
         let current = self.pinned(id)?;
         if current.config.generation != pinned.config.generation {
             return Err(ApiError::new(ErrorCode::IdentityChanged));
@@ -44,7 +51,7 @@ impl Engine {
     }
     pub(crate) async fn from_settings(
         settings: &Settings,
-        registry: &Registry,
+        registry: &mut Registry,
         journal: Journal,
         auth: AuthManager,
     ) -> std::result::Result<Self, ApiError> {
@@ -60,13 +67,32 @@ impl Engine {
         let key = load_key(&settings.api.invoice_key_file, pending)?;
         let mut nodes = BTreeMap::new();
         let mut unavailable = BTreeMap::new();
+        let mut monitors = BTreeMap::new();
         for node in &settings.nodes {
             let entry = registry
                 .get(&node.id)
                 .ok_or_else(|| failure(ErrorCode::NotConfigured))?;
+            if node.kind() == NodeKind::Bitcoin {
+                match crate::bitcoin::BitcoinReads::connect(node, &settings.api.limits).await {
+                    Ok(reads) => {
+                        monitors.insert(
+                            node.id.clone(),
+                            MonitorNode {
+                                reads: Arc::new(reads),
+                                revision: entry.binding_revision.clone(),
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        unavailable.insert(node.id.clone(), (true, error.code()));
+                    }
+                }
+                continue;
+            }
             let result = construct(node, &settings.api, entry).await;
             match result {
                 Ok(pinned) => {
+                    registry.register_availability(&node.id, pinned.reads.availability().await);
                     nodes.insert(node.id.clone(), Arc::new(Mutex::new(Some(pinned))));
                 }
                 Err(error) => {
@@ -82,6 +108,7 @@ impl Engine {
             reads: None,
             auth,
             nodes: Arc::new(nodes),
+            monitors: Arc::new(monitors),
             unavailable: Arc::new(unavailable),
             clock: Arc::new(WallClock),
             key: Arc::new(key),
@@ -140,7 +167,10 @@ async fn construct(
                 .map_err(|_| failure(ErrorCode::InternalError))?,
         ),
         backend: node.backend,
-        policy: entry.policy.clone(),
+        policy: entry
+            .policy
+            .clone()
+            .ok_or_else(|| failure(ErrorCode::NotConfigured))?,
         peer_policy: node
             .peer_policy
             .clone()
@@ -161,7 +191,11 @@ async fn construct(
     if material_revision(node, &entry.binding_revision)? != revision {
         return Err(failure(ErrorCode::NotConfigured));
     }
-    Ok(PinnedNode { config, adapter })
+    Ok(PinnedNode {
+        config,
+        reads: adapter.clone(),
+        adapter,
+    })
 }
 
 fn load_key(path: &Path, pending: bool) -> std::result::Result<PendingSecretKey, ApiError> {
@@ -227,6 +261,36 @@ fn load_key(path: &Path, pending: bool) -> std::result::Result<PendingSecretKey,
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn read_only_adapter_can_override_registration_availability() {
+        struct ReadOnly;
+        impl Reads for ReadOnly {
+            fn availability(&self) -> ResponseFuture<'_, ReadAvailability> {
+                Box::pin(async {
+                    ReadAvailability {
+                        watchtower_client: Capability {
+                            enabled: false,
+                            reason: Some(CapabilityReason::PermissionDenied),
+                        },
+                        ..ReadAvailability::lightning()
+                    }
+                })
+            }
+        }
+        let reads: Arc<dyn Reads> = Arc::new(ReadOnly);
+        let availability = reads.availability().await;
+        assert!(!availability.watchtower_client.enabled);
+        assert_eq!(
+            availability.watchtower_client.reason,
+            Some(CapabilityReason::PermissionDenied)
+        );
+        assert!(availability.peers.enabled);
+        assert_eq!(
+            reads.read(ReadQuery::Peers).await.err().unwrap().code(),
+            ErrorCode::Unsupported
+        );
+    }
+
     fn directory() -> tempfile::TempDir {
         tempfile::Builder::new()
             .permissions(std::fs::Permissions::from_mode(0o700))
@@ -258,7 +322,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn production_state_constructs_all_three_adapters_without_network_contact() {
+    async fn production_state_registers_all_adapters_despite_failed_lnd_surface_probes() {
         let directory = directory();
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         listener.set_nonblocking(true).unwrap();
@@ -294,7 +358,10 @@ mod tests {
                 allow_insecure_loopback: false,
                 client_identity: Default::default(),
                 reauth: Default::default(),
-                limits: Default::default(),
+                limits: lightning_client::settings::Limits {
+                    rpc_seconds: 1,
+                    ..Default::default()
+                },
             },
             nodes,
         };
@@ -306,10 +373,36 @@ mod tests {
         .unwrap();
         assert_eq!(state.engine.nodes.len(), 3);
         assert!(state.engine.unavailable.is_empty());
+        for (id, entry) in state.registry.entries() {
+            let mut expected = ReadAvailability::lightning();
+            if id != "synthetic-2" {
+                let unavailable = Capability {
+                    enabled: false,
+                    reason: Some(CapabilityReason::NotConfigured),
+                };
+                expected.watchtower_server = unavailable.clone();
+                expected.watchtower_client = unavailable;
+            }
+            assert_eq!(
+                serde_json::to_value(
+                    entry
+                        .summary(Utc::now(), lightning_client::money::Decimal::ZERO)
+                        .read_availability
+                )
+                .unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
+        let mut without_policy = settings.clone();
+        without_policy.nodes[0].policy = None;
+        assert!(matches!(
+            Registry::new(&without_policy),
+            Err(crate::registry::RegistryError::LightningPolicyRequired)
+        ));
         tokio::task::yield_now().await;
-        assert_eq!(
-            listener.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
+        assert!(
+            listener.accept().is_ok(),
+            "LND registration probes contact the configured endpoint"
         );
     }
 }

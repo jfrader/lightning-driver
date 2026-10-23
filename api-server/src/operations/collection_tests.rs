@@ -22,6 +22,90 @@ async fn expire(f: &Journey) {
 }
 
 #[actix_web::test]
+async fn failing_collection_read_preserves_node_status_and_other_cached_reads() {
+    for backend in [Backend::LndGrpc, Backend::LndRest, Backend::ClnRest] {
+        let f = Journey::new(backend, false).await;
+        let browser = login(&f.state, None).await;
+        let (_, peers) = read(&f, &browser, "peers", "PeersPage").await;
+        let (_, status) = read(&f, &browser, "status", "NodeStatus").await;
+        let bytes = f.state.registry.retained_bytes();
+        let (channels_rpc, peers_rpc) = if backend == Backend::ClnRest {
+            ("listpeerchannels", "listpeers")
+        } else {
+            ("ListChannels", "ListPeers")
+        };
+        let calls = f.harness.scenario.lock().unwrap().calls(peers_rpc);
+        f.harness
+            .scenario
+            .lock()
+            .unwrap()
+            .fault(channels_rpc, Fault::PermissionDenied);
+        let (code, error) = read(&f, &browser, "channels", "ErrorResponse").await;
+        assert_ne!(code, StatusCode::OK, "{error}");
+        assert_eq!(read(&f, &browser, "status", "NodeStatus").await.1, status);
+        assert_eq!(read(&f, &browser, "peers", "PeersPage").await.1, peers);
+        assert_eq!(f.harness.scenario.lock().unwrap().calls(peers_rpc), calls);
+        assert_eq!(f.state.registry.retained_bytes(), bytes);
+        assert!(f
+            .state
+            .registry
+            .get("synthetic")
+            .unwrap()
+            .last_error
+            .lock()
+            .unwrap()
+            .is_none());
+        assert_eq!(
+            read(&f, &browser, "invoices", "InvoicesPage").await.0,
+            StatusCode::OK
+        );
+        f.harness.stop().await;
+    }
+}
+
+#[actix_web::test]
+async fn stale_node_observation_does_not_block_an_unrelated_read() {
+    for backend in [Backend::LndGrpc, Backend::LndRest, Backend::ClnRest] {
+        let f = Journey::new(backend, false).await;
+        let browser = login(&f.state, None).await;
+        read(&f, &browser, "info", "NodeInfo").await;
+        let entry = f.state.registry.get("synthetic").unwrap();
+        entry
+            .observation
+            .lock()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .0
+            .status
+            .observed_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        assert!(
+            entry
+                .summary(Utc::now(), lightning_client::money::Decimal::ZERO)
+                .status
+                .stale
+        );
+        let rpc = if backend == Backend::ClnRest {
+            "listpeers"
+        } else {
+            "ListPeers"
+        };
+        let before = f.harness.scenario.lock().unwrap().calls(rpc);
+        let (status, peers) = read(&f, &browser, "peers", "PeersPage").await;
+        assert_eq!(status, StatusCode::OK, "{peers}");
+        assert_eq!(peers["stale"], false);
+        assert_eq!(f.harness.scenario.lock().unwrap().calls(rpc), before + 1);
+        assert!(
+            entry
+                .summary(Utc::now(), lightning_client::money::Decimal::ZERO)
+                .status
+                .stale
+        );
+        f.harness.stop().await;
+    }
+}
+
+#[actix_web::test]
 async fn live_info_requires_graph_sync_only_for_routing_payments() {
     for backend in [Backend::LndGrpc, Backend::LndRest, Backend::ClnRest] {
         for read_only in [false, true] {
@@ -177,7 +261,7 @@ async fn failed_observation_keeps_last_good_data_and_disables_capabilities() {
     let (status, stale) = read(&f, &browser, "balances", "Balances").await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(stale["observed_at"], first["observed_at"]);
-    assert_eq!(stale["stale"], true);
+    assert_eq!(stale["stale"], false);
     let (_, stale_info) = read(&f, &browser, "info", "NodeInfo").await;
     assert_eq!(stale_info["observed_at"], info["observed_at"]);
     assert_eq!(
@@ -185,8 +269,8 @@ async fn failed_observation_keeps_last_good_data_and_disables_capabilities() {
         false
     );
     assert_eq!(
-        read(&f, &browser, "payments", "Error").await.0,
-        StatusCode::SERVICE_UNAVAILABLE
+        read(&f, &browser, "payments", "PaymentsPage").await.0,
+        StatusCode::OK
     );
     expire(&f).await;
     let (_, recovered) = read(&f, &browser, "info", "NodeInfo").await;
@@ -210,7 +294,11 @@ async fn no_initial_observation_and_identity_mismatch_are_not_empty_success() {
         ] {
             assert_eq!(
                 read(&f, &browser, route, schema).await.0,
-                StatusCode::SERVICE_UNAVAILABLE
+                if route == "info" {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::CONFLICT
+                }
             );
         }
         let (_, status) = read(&f, &browser, "status", "NodeStatus").await;
@@ -319,7 +407,7 @@ async fn cursor_snapshot_is_immutable_and_bound_to_session_limit_and_node() {
     );
     assert_eq!(
         read(&f, &browser, "channels", "ErrorResponse").await.0,
-        StatusCode::SERVICE_UNAVAILABLE
+        StatusCode::CONFLICT
     );
     f.settings.nodes.clear();
     f.restart().await;
@@ -384,8 +472,8 @@ async fn syncing_network_mismatch_and_offline_observations_fail_closed() {
         assert_eq!(status["status"], "offline");
         assert_eq!(status["stale"], true);
         assert_eq!(
-            read(&f, &browser, "peers", "ErrorResponse").await.0,
-            StatusCode::SERVICE_UNAVAILABLE
+            read(&f, &browser, "peers", "PeersPage").await.0,
+            StatusCode::OK
         );
         f.harness.stop().await;
     }
@@ -397,6 +485,11 @@ async fn initial_offline_is_503_and_collection_snapshots_keep_their_own_expiry_a
     f.settings.api.limits.pagination.snapshot_max_items = 1;
     f.restart().await;
     let browser = login(&f.state, None).await;
+    f.harness
+        .scenario
+        .lock()
+        .unwrap()
+        .fault("getinfo", Fault::TimeoutBeforeEffect);
     f.harness
         .scenario
         .lock()

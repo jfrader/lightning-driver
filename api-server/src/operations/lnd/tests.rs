@@ -393,6 +393,7 @@ impl Server {
 }
 fn rest_adapter(transport: Rest, c: NodeConfig) -> LndRestAdapter {
     LndAdapter {
+        watchtower: tokio::sync::OnceCell::new(),
         transport,
         config: c,
         max_items: 100,
@@ -400,6 +401,7 @@ fn rest_adapter(transport: Rest, c: NodeConfig) -> LndRestAdapter {
 }
 fn grpc_adapter(transport: grpc::Grpc, c: NodeConfig) -> LndGrpcAdapter {
     LndAdapter {
+        watchtower: tokio::sync::OnceCell::new(),
         transport,
         config: c,
         max_items: 100,
@@ -1478,6 +1480,14 @@ fn read_steps(i: usize, grpc: bool) -> Vec<Step> {
 }
 fn read_projection(result: ReadResult) -> Value {
     match result {
+        ReadResult::Bitcoin(_)
+        | ReadResult::BitcoinPeers(_)
+        | ReadResult::WatchtowerServer(_)
+        | ReadResult::WatchtowerClient(_)
+        | ReadResult::WatchtowerTowers(_)
+        | ReadResult::WatchtowerTower(_) => {
+            panic!("Unexpected result from Lightning collection test")
+        }
         ReadResult::Info(info) => {
             assert_eq!(info.identity_pubkey, peer());
             assert_eq!(info.status.synced_to_chain, Some(true));

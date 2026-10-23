@@ -2,8 +2,9 @@ mod grpc;
 mod reads;
 #[cfg(test)]
 mod tests;
-mod tls;
+pub(crate) mod tls;
 mod transport;
+mod watchtower;
 
 use super::*;
 use base64::Engine as _;
@@ -19,6 +20,7 @@ struct LndAdapter<T: Wire> {
     transport: T,
     config: NodeConfig,
     max_items: usize,
+    watchtower: tokio::sync::OnceCell<watchtower::Probe>,
 }
 pub(super) async fn connect_grpc(
     settings: &lightning_client::settings::NodeSettings,
@@ -89,6 +91,7 @@ impl<T: Wire> LndAdapter<T> {
             transport,
             config,
             max_items,
+            watchtower: tokio::sync::OnceCell::new(),
         };
         Ok(adapter)
     }
@@ -138,6 +141,9 @@ impl<T: Wire> LndAdapter<T> {
         ))
     }
     async fn read_inner(&self, q: ReadQuery) -> Result<ReadResult> {
+        if q.is_watchtower() {
+            return self.read_watchtower(q).await;
+        }
         let mut b = self.transport.byte_budget();
         let info = self.info(&mut b).await?;
         let now = Utc::now();
@@ -191,6 +197,15 @@ impl<T: Wire> LndAdapter<T> {
             )?),
             // Confirmation targets are unresolved in the approved specification.
             ReadQuery::Fees => ReadResult::Fees(reads::fees(node, now)),
+            ReadQuery::Bitcoin | ReadQuery::BitcoinPeers => {
+                return Err(failure(ErrorCode::Unsupported))
+            }
+            ReadQuery::WatchtowerServer
+            | ReadQuery::WatchtowerClient
+            | ReadQuery::WatchtowerTowers
+            | ReadQuery::WatchtowerTower(_) => {
+                unreachable!("watchtower reads have their own surface")
+            }
         })
     }
     async fn prepare_inner(&self, request: &OperationRequest) -> Result<ReadFacts> {
@@ -529,7 +544,10 @@ impl<T: Wire> LndAdapter<T> {
         })
     }
 }
-impl<T: Wire> Adapter for LndAdapter<T> {
+impl<T: Wire> Reads for LndAdapter<T> {
+    fn availability(&self) -> ResponseFuture<'_, ReadAvailability> {
+        Box::pin(async { self.watchtower_probe().await.availability.clone() })
+    }
     fn read(&self, q: ReadQuery) -> ResponseFuture<'_, Result<ReadResult>> {
         Box::pin(async move {
             tokio::time::timeout(self.transport.deadline(), self.read_inner(q))
@@ -537,6 +555,9 @@ impl<T: Wire> Adapter for LndAdapter<T> {
                 .map_err(|_| failure(ErrorCode::NodeOffline))?
         })
     }
+}
+
+impl<T: Wire> Adapter for LndAdapter<T> {
     fn prepare<'a>(&'a self, r: &'a OperationRequest) -> ResponseFuture<'a, Result<ReadFacts>> {
         Box::pin(async move {
             tokio::time::timeout(self.transport.deadline(), self.prepare_inner(r))

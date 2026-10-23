@@ -1,5 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use lnd_grpc_rust::{lnrpc as ln, prost::Message, routerrpc as router, walletrpc as wallet};
+use lnd_grpc_rust::{watchtowerrpc as tower, wtclientrpc as wt};
 use serde_json::{json, Value};
 
 pub(crate) fn decode(method: &str, bytes: &[u8]) -> Option<Value> {
@@ -11,6 +12,18 @@ pub(crate) fn decode(method: &str, bytes: &[u8]) -> Option<Value> {
     }
     let bytes = &bytes[5..];
     Some(match method {
+        "Policy" => {
+            let p = wt::PolicyRequest::decode(bytes).ok()?;
+            json!({"policy_type":p.policy_type})
+        }
+        "ListTowers" => {
+            let p = wt::ListTowersRequest::decode(bytes).ok()?;
+            json!({"include_sessions":p.include_sessions,"exclude_exhausted_sessions":p.exclude_exhausted_sessions})
+        }
+        "GetTowerInfo" => {
+            let p = wt::GetTowerInfoRequest::decode(bytes).ok()?;
+            json!({"pubkey":STANDARD.encode(p.pubkey),"include_sessions":p.include_sessions,"exclude_exhausted_sessions":p.exclude_exhausted_sessions})
+        }
         "AddInvoice" => {
             let p = ln::Invoice::decode(bytes).ok()?;
             json!({"r_preimage":STANDARD.encode(p.r_preimage),"value_msat":p.value_msat.to_string(),"memo":p.memo,"expiry":p.expiry.to_string()})
@@ -123,6 +136,30 @@ fn payment(v: &Value) -> Option<ln::Payment> {
 
 pub(crate) fn encode(method: &str, v: &Value) -> Option<Vec<u8>> {
     Some(match method {
+        "TowerGetInfo" => frame(tower::GetInfoResponse {
+            pubkey: b(v, "pubkey")?,
+            listeners: strings(v, "listeners")?,
+            uris: strings(v, "uris")?,
+        }),
+        "Stats" => frame(wt::StatsResponse {
+            num_backups: n(v, "num_backups")?,
+            num_pending_backups: n(v, "num_pending_backups")?,
+            num_failed_backups: n(v, "num_failed_backups")?,
+            num_sessions_acquired: n(v, "num_sessions_acquired")?,
+            num_sessions_exhausted: n(v, "num_sessions_exhausted")?,
+        }),
+        "Policy" => frame(wt::PolicyResponse {
+            max_updates: n(v, "max_updates")?,
+            sweep_sat_per_vbyte: n(v, "sweep_sat_per_vbyte")?,
+            ..Default::default()
+        }),
+        "ListTowers" => frame(wt::ListTowersResponse {
+            towers: rows(v, "towers")?
+                .iter()
+                .map(tower)
+                .collect::<Option<_>>()?,
+        }),
+        "GetTowerInfo" => frame(tower(v)?),
         "GetInfo" => frame(ln::GetInfoResponse {
             identity_pubkey: s(v, "identity_pubkey")?.into(),
             alias: s(v, "alias")?.into(),
@@ -295,5 +332,49 @@ pub(crate) fn encode(method: &str, v: &Value) -> Option<Vec<u8>> {
             txid: s(v, "txid")?.into(),
         }),
         _ => return None,
+    })
+}
+fn n(v: &Value, key: &str) -> Option<u32> {
+    v[key].as_u64()?.try_into().ok()
+}
+fn strings(v: &Value, key: &str) -> Option<Vec<String>> {
+    rows(v, key)?
+        .iter()
+        .map(|s| s.as_str().map(str::to_owned))
+        .collect()
+}
+fn tower(v: &Value) -> Option<wt::Tower> {
+    Some(wt::Tower {
+        pubkey: b(v, "pubkey")?,
+        addresses: strings(v, "addresses")?,
+        session_info: rows(v, "session_info")?
+            .iter()
+            .map(|i| {
+                Some(wt::TowerSessionInfo {
+                    active_session_candidate: i["active_session_candidate"].as_bool()?,
+                    num_sessions: n(i, "num_sessions")?,
+                    policy_type: match s(i, "policy_type")? {
+                        "ANCHOR" => 1,
+                        "TAPROOT" => 2,
+                        "LEGACY" => 0,
+                        _ => return None,
+                    },
+                    sessions: rows(i, "sessions")?
+                        .iter()
+                        .map(|s| {
+                            Some(wt::TowerSession {
+                                id: b(s, "id")?,
+                                num_backups: n(s, "num_backups")?,
+                                num_pending_backups: n(s, "num_pending_backups")?,
+                                max_backups: n(s, "max_backups")?,
+                                sweep_sat_per_vbyte: n(s, "sweep_sat_per_vbyte")?,
+                                ..Default::default()
+                            })
+                        })
+                        .collect::<Option<_>>()?,
+                })
+            })
+            .collect::<Option<_>>()?,
+        ..Default::default()
     })
 }

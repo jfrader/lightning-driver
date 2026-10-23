@@ -2928,6 +2928,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-rustls 0.24.1",
+ "url",
 ]
 
 [[package]]

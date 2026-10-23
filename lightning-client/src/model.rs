@@ -361,6 +361,30 @@ fn read_capability<'de, D: serde::Deserializer<'de>>(
 }
 
 impl ReadAvailability {
+    pub fn bitcoin() -> Self {
+        let unsupported = Capability {
+            enabled: false,
+            reason: Some(CapabilityReason::Unsupported),
+        };
+        Self {
+            payments: unsupported.clone(),
+            invoices: unsupported.clone(),
+            onchain: unsupported.clone(),
+            channels: unsupported.clone(),
+            peers: unsupported.clone(),
+            operations: unsupported.clone(),
+            watchtower_server: unsupported.clone(),
+            watchtower_client: unsupported,
+            bitcoin: Capability {
+                enabled: true,
+                reason: None,
+            },
+            bitcoin_peers: Capability {
+                enabled: true,
+                reason: None,
+            },
+        }
+    }
     pub fn lightning() -> Self {
         let supported = Capability {
             enabled: true,

@@ -1,6 +1,7 @@
 pub mod app;
 pub mod auth;
 pub mod auth_http;
+mod bitcoin;
 pub mod cli;
 pub mod error;
 pub mod history;

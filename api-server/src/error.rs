@@ -11,6 +11,7 @@ pub struct ApiError {
     pub operation_id: Option<Uuid>,
     pub outcome: ErrorOutcome,
     retry_after: Option<u64>,
+    availability_reason: Option<lightning_client::model::CapabilityReason>,
 }
 
 #[derive(Serialize)]
@@ -25,9 +26,17 @@ impl ApiError {
             operation_id: None,
             outcome: ErrorOutcome::NotDispatched,
             retry_after: None,
+            availability_reason: None,
         }
     }
     fn message(&self) -> &'static str {
+        if let Some(reason) = self.availability_reason {
+            return match reason {
+                lightning_client::model::CapabilityReason::PermissionDenied => "permission_denied",
+                lightning_client::model::CapabilityReason::NotConfigured => "not_configured",
+                _ => "unsupported",
+            };
+        }
         match self.code {
             ErrorCode::SessionRequired => "Sign in required.",
             ErrorCode::Csrf => "Reload the session.",
@@ -56,6 +65,15 @@ impl ApiError {
             ErrorCode::ReviewExpired => "Review expired. Start again.",
             ErrorCode::OperationNotReviewable => "This operation cannot be confirmed.",
             _ => "Request could not be completed. Check its status before taking another action.",
+        }
+    }
+}
+
+impl ApiError {
+    pub(crate) fn unsupported(reason: Option<lightning_client::model::CapabilityReason>) -> Self {
+        Self {
+            availability_reason: reason,
+            ..Self::new(ErrorCode::Unsupported)
         }
     }
 }
@@ -156,6 +174,7 @@ impl From<JournalError> for ApiError {
             operation_id: id,
             outcome: ErrorOutcome::NotDispatched,
             retry_after: None,
+            availability_reason: None,
         }
     }
 }

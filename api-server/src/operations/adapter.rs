@@ -10,6 +10,23 @@ pub(crate) enum ReadQuery {
     Channels,
     Transactions,
     Fees,
+    Bitcoin,
+    BitcoinPeers,
+    WatchtowerServer,
+    WatchtowerClient,
+    WatchtowerTowers,
+    WatchtowerTower([u8; 33]),
+}
+impl ReadQuery {
+    pub(crate) fn is_watchtower(self) -> bool {
+        matches!(
+            self,
+            Self::WatchtowerServer
+                | Self::WatchtowerClient
+                | Self::WatchtowerTowers
+                | Self::WatchtowerTower(_)
+        )
+    }
 }
 #[derive(Clone)]
 pub(crate) struct Collection<T> {
@@ -35,4 +52,10 @@ pub(crate) enum ReadResult {
     Channels(Collection<Channel>),
     Transactions(Collection<Transaction>),
     Fees(FeeEstimates),
+    Bitcoin(BitcoinNodeInfo),
+    BitcoinPeers(Collection<BitcoinPeer>),
+    WatchtowerServer(WatchtowerServerInfo),
+    WatchtowerClient(WatchtowerClientInfo),
+    WatchtowerTowers(Collection<WatchtowerTower>),
+    WatchtowerTower(WatchtowerTowerDetail),
 }
