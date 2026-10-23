@@ -45,7 +45,7 @@ impl Registry {
             .lock()
             .await
             .seed_for_test("channels", bytes);
-        self.set_retained_bytes(cached);
+        assert!(self.replace_retained_bytes(0, cached, usize::MAX));
         cached
     }
 }
@@ -128,17 +128,37 @@ impl Registry {
         })
     }
     /// Bytes currently held by every cached node read, across all nodes.
+    #[cfg(test)]
     pub(crate) fn retained_bytes(&self) -> usize {
         *self
             .retained
             .lock()
             .unwrap_or_else(|error| error.into_inner())
     }
-    pub(crate) fn set_retained_bytes(&self, bytes: usize) {
-        *self
+    pub(crate) fn replace_retained_bytes(
+        &self,
+        replaced: usize,
+        bytes: usize,
+        limit: usize,
+    ) -> bool {
+        let mut retained = self
             .retained
             .lock()
-            .unwrap_or_else(|error| error.into_inner()) = bytes;
+            .unwrap_or_else(|error| error.into_inner());
+        let remaining = retained.saturating_sub(replaced);
+        if bytes > limit.saturating_sub(remaining) || remaining > limit {
+            return false;
+        }
+        *retained = remaining + bytes;
+        true
+    }
+    pub(crate) fn release_retained_bytes(&self, bytes: usize) -> usize {
+        let mut retained = self
+            .retained
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        *retained = retained.saturating_sub(bytes);
+        *retained
     }
     /// Drops one node's cached reads after a committed change and releases their bytes.
     pub(crate) async fn invalidate_reads(&self, id: &str) -> usize {
@@ -146,9 +166,7 @@ impl Registry {
             return 0;
         };
         let released = entry.invalidate_reads().await;
-        let remaining = self.retained_bytes().saturating_sub(released);
-        self.set_retained_bytes(remaining);
-        remaining
+        self.release_retained_bytes(released)
     }
     pub fn get(&self, id: &str) -> Option<&Entry> {
         self.nodes.get(id)
@@ -334,6 +352,65 @@ mod tests {
     use super::*;
     use crate::operations::InfoObservation;
     use lightning_client::model::Backend;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_node_cache_reservations_preserve_total_and_budget() {
+        let registry = std::sync::Arc::new(Registry {
+            nodes: ["first", "second"]
+                .into_iter()
+                .map(|id| {
+                    (
+                        id.into(),
+                        observed_entry(Utc::now(), Backend::LndGrpc, false),
+                    )
+                })
+                .collect(),
+            ..Registry::default()
+        });
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut tasks = Vec::new();
+        for id in ["first", "second"] {
+            let registry = registry.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut cache = registry.get(id).unwrap().reads.lock().await;
+                let mut consistent = true;
+                for round in 0..4096 {
+                    barrier.wait();
+                    let reserved = registry.replace_retained_bytes(0, 64, 128);
+                    consistent &= reserved;
+                    if reserved {
+                        cache.seed_for_test("channels", 64);
+                    }
+                    barrier.wait();
+                    consistent &= registry.retained_bytes() == 128;
+                    consistent &= !registry.replace_retained_bytes(64, 65, 128);
+                    consistent &= registry.retained_bytes() == 128;
+                    barrier.wait();
+                    if round != 4095 {
+                        registry.release_retained_bytes(cache.invalidate());
+                    }
+                    barrier.wait();
+                }
+                assert!(
+                    consistent,
+                    "concurrent cache reservations lost bytes or exceeded the budget"
+                );
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let mut sum = 0;
+        for (_, entry) in registry.entries() {
+            sum += entry.reads.lock().await.invalidate();
+        }
+        assert_eq!(registry.retained_bytes(), sum);
+        assert_eq!(sum, 128);
+        assert_eq!(registry.release_retained_bytes(sum), 0);
+        assert!(registry.replace_retained_bytes(0, 128, 128));
+        assert!(!registry.replace_retained_bytes(0, 1, 128));
+    }
 
     fn observed_entry(now: DateTime<Utc>, backend: Backend, read_only: bool) -> Entry {
         let fixture: serde_json::Value =

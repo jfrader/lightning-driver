@@ -143,8 +143,7 @@ impl ApplicationState {
                     ) =>
             {
                 let released = cache.invalidate();
-                self.registry
-                    .set_retained_bytes(self.registry.retained_bytes().saturating_sub(released));
+                self.registry.release_retained_bytes(released);
                 return Err(error);
             }
             Err(error) => {
@@ -192,11 +191,13 @@ impl ApplicationState {
             bytes,
         };
         let replaced = cache.values.get(&key).map_or(0, |value| value.bytes);
-        let remaining = self.registry.retained_bytes().saturating_sub(replaced);
-        if bytes > self.limits().snapshot_cache_bytes.saturating_sub(remaining) {
+        if !self.registry.replace_retained_bytes(
+            replaced,
+            bytes,
+            self.limits().snapshot_cache_bytes,
+        ) {
             return Err(ApiError::new(ErrorCode::RateLimited));
         }
-        self.registry.set_retained_bytes(remaining + bytes);
         cache.values.insert(key, observed.clone());
         Ok(observed)
     }
