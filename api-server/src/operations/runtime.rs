@@ -70,7 +70,10 @@ impl Engine {
                     nodes.insert(node.id.clone(), Arc::new(Mutex::new(Some(pinned))));
                 }
                 Err(error) => {
-                    unavailable.insert(node.id.clone(), (node.read_only, error.code));
+                    unavailable.insert(
+                        node.id.clone(),
+                        (node.read_only.unwrap_or(true), error.code),
+                    );
                 }
             }
         }
@@ -116,6 +119,7 @@ async fn construct(
     let network = match node.network {
         Network::Mainnet => VerifiedNetwork::Mainnet,
         Network::Testnet => VerifiedNetwork::Testnet,
+        Network::Testnet4 => VerifiedNetwork::Testnet4,
         Network::Signet => VerifiedNetwork::Signet,
         Network::Regtest => VerifiedNetwork::Regtest,
         Network::Unknown => return Err(failure(ErrorCode::NotConfigured)),
@@ -124,7 +128,10 @@ async fn construct(
         binding: NodeBinding {
             node_id: node.id.clone(),
             network,
-            identity_pubkey: node.expected_pubkey.clone(),
+            identity_pubkey: node
+                .expected_pubkey
+                .clone()
+                .ok_or_else(|| failure(ErrorCode::NotConfigured))?,
             identity_revision: hex::encode(revision),
         },
         generation: Uuid::from_bytes(
@@ -134,7 +141,10 @@ async fn construct(
         ),
         backend: node.backend,
         policy: entry.policy.clone(),
-        peer_policy: node.peer_policy.clone(),
+        peer_policy: node
+            .peer_policy
+            .clone()
+            .ok_or_else(|| failure(ErrorCode::NotConfigured))?,
         reauth_mode: api.reauth.mode,
         capabilities: Capabilities::uniform(None),
         review_seconds: api.limits.review_ttl_seconds,
@@ -146,6 +156,7 @@ async fn construct(
         Backend::ClnRest => {
             Arc::new(cln::ClnAdapter::connect(node, &api.limits, config.clone()).await?)
         }
+        Backend::BitcoinRpc => return Err(failure(ErrorCode::Unsupported)),
     };
     if material_revision(node, &entry.binding_revision)? != revision {
         return Err(failure(ErrorCode::NotConfigured));
@@ -270,7 +281,7 @@ mod tests {
                 "endpoint":format!("https://localhost:{}/",listener.local_addr().unwrap().port()),
                 "certificate_file":certificate,"credential_file":credential,
                 "expected_pubkey":"02c6047f9441ed7d6d3045406e95c07cd85c778e4b8cef3ca7abac09b95c709ee5",
-                "network":"regtest","read_only":false,"policy":policy.limits
+                "network":"regtest","read_only":false,"policy":policy.limits,"peer_policy":{"allowed_hosts":[],"allowed_ports":[]}
             })).unwrap()
         }).collect();
         let settings = Settings {

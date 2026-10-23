@@ -34,7 +34,7 @@ fn configured(id: &str, readonly: bool) -> NodeSettings {
         bitcoin::secp256k1::PublicKey::from_secret_key(&bitcoin::secp256k1::Secp256k1::new(), &key);
     serde_json::from_value(json!({"id":id,"label":id,"backend":"lnd_rest","endpoint":"https://never-contact.example.invalid",
         "certificate_file":"SYNTHETIC_CERT_NEVER_OPENED","credential_file":"SYNTHETIC_CREDENTIAL_NEVER_OPENED",
-        "expected_pubkey":public.to_string(),"network":"regtest","read_only":readonly,"policy":policy.limits})).unwrap()
+        "expected_pubkey":public.to_string(),"network":"regtest","read_only":readonly,"policy":policy.limits,"peer_policy":{"allowed_hosts":[],"allowed_ports":[]}})).unwrap()
 }
 
 async fn setup() -> (tempfile::TempDir, Settings, ApplicationState) {

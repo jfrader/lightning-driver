@@ -25,6 +25,7 @@ pub(super) fn network(binding: &NodeBinding) -> Network {
     match binding.network {
         VerifiedNetwork::Mainnet => Network::Mainnet,
         VerifiedNetwork::Testnet => Network::Testnet,
+        VerifiedNetwork::Testnet4 => Network::Testnet4,
         VerifiedNetwork::Signet => Network::Signet,
         VerifiedNetwork::Regtest => Network::Regtest,
     }
@@ -34,6 +35,7 @@ pub(super) fn address(text: &str, binding: &NodeBinding) -> Result<Address> {
     let expected = match binding.network {
         VerifiedNetwork::Mainnet => bitcoin::Network::Bitcoin,
         VerifiedNetwork::Testnet => bitcoin::Network::Testnet,
+        VerifiedNetwork::Testnet4 => bitcoin::Network::Testnet4,
         VerifiedNetwork::Signet => bitcoin::Network::Signet,
         VerifiedNetwork::Regtest => bitcoin::Network::Regtest,
     };

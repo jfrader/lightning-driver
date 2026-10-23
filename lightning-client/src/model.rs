@@ -16,6 +16,7 @@ macro_rules! wire_enum {
 wire_enum!(Network {
     Mainnet,
     Testnet,
+    Testnet4,
     Signet,
     Regtest,
     Unknown
@@ -23,6 +24,7 @@ wire_enum!(Network {
 wire_enum!(VerifiedNetwork {
     Mainnet,
     Testnet,
+    Testnet4,
     Signet,
     Regtest
 });
@@ -37,6 +39,7 @@ impl TryFrom<Network> for VerifiedNetwork {
         match network {
             Network::Mainnet => Ok(Self::Mainnet),
             Network::Testnet => Ok(Self::Testnet),
+            Network::Testnet4 => Ok(Self::Testnet4),
             Network::Signet => Ok(Self::Signet),
             Network::Regtest => Ok(Self::Regtest),
             Network::Unknown => Err(UnverifiedNetwork),
@@ -46,8 +49,32 @@ impl TryFrom<Network> for VerifiedNetwork {
 wire_enum!(Backend {
     LndGrpc,
     LndRest,
-    ClnRest
+    ClnRest,
+    BitcoinRpc
 });
+wire_enum!(NodeKind { Lightning, Bitcoin });
+impl Backend {
+    pub fn kind(self) -> NodeKind {
+        match self {
+            Self::BitcoinRpc => NodeKind::Bitcoin,
+            Self::LndGrpc | Self::LndRest | Self::ClnRest => NodeKind::Lightning,
+        }
+    }
+}
+wire_enum!(PeerTransport {
+    Ipv4,
+    Ipv6,
+    Onion,
+    I2p,
+    Cjdns,
+    Notreachable
+});
+wire_enum!(WatchtowerPolicyType {
+    Legacy,
+    Anchor,
+    Taproot
+});
+wire_enum!(WatchtowerStatsScope { SinceStartup });
 wire_enum!(NodeConnection {
     Connecting,
     Online,
@@ -59,6 +86,7 @@ wire_enum!(NodeConnection {
 });
 wire_enum!(CapabilityReason {
     ReadOnly,
+    MonitorOnly,
     Unsupported,
     NodeOffline,
     Unverified,
@@ -216,8 +244,10 @@ pub struct ErrorDetail {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Capability {
     pub enabled: bool,
+    #[serde(deserialize_with = "required_optional")]
     pub reason: Option<CapabilityReason>,
 }
 
@@ -268,6 +298,7 @@ pub struct NodeStatus {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct NodeSummary {
     pub id: String,
+    pub kind: NodeKind,
     pub label: String,
     pub backend: Backend,
     pub network: Network,
@@ -276,7 +307,237 @@ pub struct NodeSummary {
     pub read_only: bool,
     pub status: NodeStatus,
     pub capabilities: Capabilities,
+    pub read_availability: ReadAvailability,
     pub unresolved_operation_count: Decimal,
+}
+
+/// Support and permission only, never connection health or freshness.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadAvailability {
+    #[serde(deserialize_with = "read_capability")]
+    pub payments: Capability,
+    #[serde(deserialize_with = "read_capability")]
+    pub invoices: Capability,
+    #[serde(deserialize_with = "read_capability")]
+    pub onchain: Capability,
+    #[serde(deserialize_with = "read_capability")]
+    pub channels: Capability,
+    #[serde(deserialize_with = "read_capability")]
+    pub peers: Capability,
+    #[serde(deserialize_with = "read_capability")]
+    pub operations: Capability,
+    #[serde(deserialize_with = "read_capability")]
+    pub bitcoin: Capability,
+    #[serde(deserialize_with = "read_capability")]
+    pub bitcoin_peers: Capability,
+    #[serde(deserialize_with = "read_capability")]
+    pub watchtower_server: Capability,
+    #[serde(deserialize_with = "read_capability")]
+    pub watchtower_client: Capability,
+}
+
+fn read_capability<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Capability, D::Error> {
+    let capability = Capability::deserialize(deserializer)?;
+    if !matches!(
+        (capability.enabled, capability.reason),
+        (true, None)
+            | (
+                false,
+                Some(
+                    CapabilityReason::Unsupported
+                        | CapabilityReason::NotConfigured
+                        | CapabilityReason::PermissionDenied
+                )
+            )
+    ) {
+        return Err(serde::de::Error::custom(
+            "Read availability describes support and permission only",
+        ));
+    }
+    Ok(capability)
+}
+
+impl ReadAvailability {
+    pub fn lightning() -> Self {
+        let supported = Capability {
+            enabled: true,
+            reason: None,
+        };
+        let unsupported = Capability {
+            enabled: false,
+            reason: Some(CapabilityReason::Unsupported),
+        };
+        Self {
+            payments: supported.clone(),
+            invoices: supported.clone(),
+            onchain: supported.clone(),
+            channels: supported.clone(),
+            peers: supported.clone(),
+            operations: supported,
+            bitcoin: unsupported.clone(),
+            bitcoin_peers: unsupported.clone(),
+            watchtower_server: unsupported.clone(),
+            watchtower_client: unsupported,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BitcoinMempool {
+    pub transactions: Decimal,
+    pub vsize: Decimal,
+    pub usage: Decimal,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BitcoinNodeInfo {
+    pub node_id: String,
+    pub chain: String,
+    pub network: Network,
+    pub blocks: Decimal,
+    pub headers: Decimal,
+    pub best_block_hash: String,
+    #[serde(deserialize_with = "verification_progress")]
+    pub verification_progress_bp: Decimal,
+    pub initial_block_download: bool,
+    pub pruned: bool,
+    #[serde(deserialize_with = "required_optional")]
+    pub prune_height: Option<Decimal>,
+    pub connections: Decimal,
+    #[serde(deserialize_with = "required_optional")]
+    pub connections_in: Option<Decimal>,
+    #[serde(deserialize_with = "required_optional")]
+    pub connections_out: Option<Decimal>,
+    pub mempool: BitcoinMempool,
+    pub size_on_disk: Decimal,
+    pub version: Decimal,
+    pub subversion: String,
+    pub uptime_seconds: Decimal,
+    pub warnings: Vec<String>,
+    pub observed_at: Timestamp,
+    pub stale: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BitcoinPeer {
+    pub id: Decimal,
+    pub addr: String,
+    pub network: PeerTransport,
+    pub inbound: bool,
+    pub connection_type: String,
+    pub version: Decimal,
+    pub subversion: String,
+    #[serde(deserialize_with = "required_optional")]
+    pub ping_ms: Option<Decimal>,
+    pub connected_at: Timestamp,
+    pub bytes_sent: Decimal,
+    pub bytes_received: Decimal,
+    #[serde(deserialize_with = "required_optional")]
+    pub synced_headers: Option<Decimal>,
+    #[serde(deserialize_with = "required_optional")]
+    pub synced_blocks: Option<Decimal>,
+}
+
+fn verification_progress<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Decimal, D::Error> {
+    let value = Decimal::deserialize(deserializer)?;
+    if value.get() > 10000 {
+        return Err(serde::de::Error::custom(
+            "Verification progress must be 0..10000 basis points",
+        ));
+    }
+    Ok(value)
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchtowerServerInfo {
+    pub node_id: String,
+    pub pubkey: String,
+    pub listeners: Vec<String>,
+    pub uris: Vec<String>,
+    pub observed_at: Timestamp,
+    pub stale: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchtowerStats {
+    pub num_backups: Decimal,
+    pub num_pending_backups: Decimal,
+    pub num_ineligible_backups: Decimal,
+    pub num_sessions_acquired: Decimal,
+    pub num_sessions_exhausted: Decimal,
+    pub scope: WatchtowerStatsScope,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchtowerPolicy {
+    pub policy_type: WatchtowerPolicyType,
+    pub max_updates: Decimal,
+    pub sweep_sat_per_vbyte: Decimal,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchtowerClientInfo {
+    pub node_id: String,
+    pub stats: WatchtowerStats,
+    pub policies: Vec<WatchtowerPolicy>,
+    pub observed_at: Timestamp,
+    pub stale: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchtowerSessionInfo {
+    pub policy_type: WatchtowerPolicyType,
+    pub active_session_candidate: bool,
+    pub num_sessions: Decimal,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchtowerTower {
+    pub pubkey: String,
+    pub addresses: Vec<String>,
+    pub session_info: Vec<WatchtowerSessionInfo>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchtowerSession {
+    pub id: String,
+    pub num_backups: Decimal,
+    pub num_pending_backups: Decimal,
+    pub max_backups: Decimal,
+    pub sweep_sat_per_vbyte: Decimal,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchtowerSessionInfoDetail {
+    pub policy_type: WatchtowerPolicyType,
+    pub active_session_candidate: bool,
+    pub num_sessions: Decimal,
+    pub sessions_truncated: bool,
+    pub sessions: Vec<WatchtowerSession>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WatchtowerTowerDetail {
+    pub pubkey: String,
+    pub addresses: Vec<String>,
+    pub session_info: Vec<WatchtowerSessionInfoDetail>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -687,10 +948,21 @@ mod tests {
             "../../api-server/tests/fixtures/api-examples.json"
         ))
         .unwrap();
-        for name in ["node_lnd", "node_lnd_rest_readonly_offline", "node_cln"] {
+        for name in [
+            "node_lnd",
+            "node_lnd_rest_readonly_offline",
+            "node_cln",
+            "node_bitcoin",
+        ] {
             roundtrip::<NodeSummary>(&fixtures, name);
         }
         roundtrip::<NodeInfo>(&fixtures, "node_info");
+        roundtrip::<BitcoinNodeInfo>(&fixtures, "bitcoin_info");
+        roundtrip::<Page<BitcoinPeer>>(&fixtures, "bitcoin_peers_page");
+        roundtrip::<WatchtowerServerInfo>(&fixtures, "watchtower_server");
+        roundtrip::<WatchtowerClientInfo>(&fixtures, "watchtower_client");
+        roundtrip::<Page<WatchtowerTower>>(&fixtures, "watchtower_towers_page");
+        roundtrip::<WatchtowerTowerDetail>(&fixtures, "watchtower_tower_detail");
         roundtrip::<NodeStatus>(&fixtures, "node_status");
         roundtrip::<FeeEstimates>(&fixtures, "fee_estimates");
         roundtrip::<DecodedInvoice>(&fixtures, "decode");
@@ -725,6 +997,49 @@ mod tests {
         );
         assert!(serde_json::from_str::<VerifiedNetwork>("\"unknown\"").is_err());
         assert!(VerifiedNetwork::try_from(Network::Unknown).is_err());
+        assert_eq!(
+            VerifiedNetwork::try_from(Network::Testnet4).unwrap(),
+            VerifiedNetwork::Testnet4
+        );
+    }
+
+    #[test]
+    fn monitoring_boundaries_reject_invalid_progress_availability_and_omitted_nulls() {
+        let fixtures: Value = serde_json::from_str(include_str!(
+            "../../api-server/tests/fixtures/api-examples.json"
+        ))
+        .unwrap();
+        for progress in [
+            serde_json::json!(10000),
+            serde_json::json!("10001"),
+            serde_json::json!("1.5"),
+        ] {
+            let mut info = fixtures["fixtures"]["bitcoin_info"]["value"].clone();
+            info["verification_progress_bp"] = progress;
+            assert!(serde_json::from_value::<BitcoinNodeInfo>(info).is_err());
+        }
+        for field in ["prune_height", "connections_in", "connections_out"] {
+            let mut info = fixtures["fixtures"]["bitcoin_info"]["value"].clone();
+            info.as_object_mut().unwrap().remove(field);
+            assert!(serde_json::from_value::<BitcoinNodeInfo>(info).is_err());
+        }
+        let availability = &fixtures["fixtures"]["node_bitcoin"]["value"]["read_availability"];
+        for key in availability.as_object().unwrap().keys() {
+            let mut value = availability.clone();
+            value.as_object_mut().unwrap().remove(key);
+            assert!(serde_json::from_value::<ReadAvailability>(value).is_err());
+        }
+        for capability in [
+            serde_json::json!({"enabled":false,"reason":"node_offline"}),
+            serde_json::json!({"enabled":false,"reason":"monitor_only"}),
+            serde_json::json!({"enabled":false,"reason":null}),
+            serde_json::json!({"enabled":true,"reason":"permission_denied"}),
+            serde_json::json!({"enabled":true}),
+        ] {
+            let mut value = availability.clone();
+            value["bitcoin"] = capability;
+            assert!(serde_json::from_value::<ReadAvailability>(value).is_err());
+        }
     }
 
     #[test]

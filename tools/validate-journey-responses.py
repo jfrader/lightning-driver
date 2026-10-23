@@ -4,6 +4,7 @@
 Requires jsonschema (Draft 2020-12 with format checking); no schema fallback.
 """
 import argparse
+from copy import deepcopy
 from collections import Counter
 import hashlib
 import json
@@ -13,8 +14,8 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 ROOT = Path(__file__).resolve().parents[1]
 FROZEN = {
-    "api-server/openapi.json": "efad6a2fbe32c88aab8854fb49c6ca6a1c11b19bc269a6a38687a1f553149c9e",
-    "api-server/tests/fixtures/api-examples.json": "889dce55d785b4ee02cc26ad2b36ffe988dcc41dfbac36c9052ec2be96b58d35",
+    "api-server/openapi.json": "a9aa7112084ec1a0cc8ca84157e4f9b750eb1cb3a2a96133cc494fa597327717",
+    "api-server/tests/fixtures/api-examples.json": "e5af66a0b8ba6f390eb86a247a763800cd173034fd166ae8f2c0b0ae7c5c86f9",
 }
 KINDS = {
     "create_invoice", "pay_invoice", "connect_peer", "disconnect_peer",
@@ -22,13 +23,63 @@ KINDS = {
 }
 
 
+def validator(contract, name):
+    reference = name if name.startswith("#/") else f"#/components/schemas/{name}"
+    return Draft202012Validator(
+        {"$ref": reference, "components": contract["components"]},
+        format_checker=FormatChecker(),
+    )
+
+
+def validate_examples(contract):
+    fixtures = json.loads((ROOT / "api-server/tests/fixtures/api-examples.json").read_text())["fixtures"]
+    for name, fixture in fixtures.items():
+        errors = list(validator(contract, fixture["schema"]).iter_errors(fixture["value"]))
+        assert not errors, (name, [error.message for error in errors])
+
+    def reject(name, mutate):
+        fixture = fixtures[name]
+        value = deepcopy(fixture["value"])
+        mutate(value)
+        assert not validator(contract, fixture["schema"]).is_valid(value), (name, value)
+
+    for key in fixtures["node_bitcoin"]["value"]["read_availability"]:
+        reject("node_bitcoin", lambda value, key=key: value["read_availability"].pop(key))
+    for reason in ["node_offline", "syncing", "unverified", "monitor_only", "read_only"]:
+        reject("node_bitcoin", lambda value, reason=reason: value["read_availability"].update(
+            bitcoin={"enabled": False, "reason": reason}))
+    for capability in [{"enabled": True, "reason": "unsupported"}, {"enabled": False, "reason": None}]:
+        reject("node_bitcoin", lambda value, capability=capability: value["read_availability"].update(bitcoin=capability))
+    for progress in [10000, 0.5, "10001", "-1", "01", "1.0"]:
+        reject("bitcoin_info", lambda value, progress=progress: value.update(verification_progress_bp=progress))
+    for key in ["prune_height", "connections_in", "connections_out"]:
+        reject("bitcoin_info", lambda value, key=key: value.pop(key))
+    for transport in ["tor", "unknown"]:
+        reject("bitcoin_peers_page", lambda value, transport=transport: value["items"][0].update(network=transport))
+    for session_id in ["", "A" * 43, "A" * 45, "!" * 44]:
+        reject("watchtower_tower_detail", lambda value, session_id=session_id: value["session_info"][0]["sessions"][0].update(id=session_id))
+    reject("watchtower_server", lambda value: value.update(active=True))
+    reject("watchtower_client", lambda value: value["stats"].update(scope="lifetime"))
+    for name in ["bitcoin_info", "bitcoin_peers_page", "watchtower_server", "watchtower_client", "watchtower_towers_page", "watchtower_tower_detail"]:
+        reject(name, lambda value: value.update(unexpected=True))
+    print(f"Validated {len(fixtures)} contract examples and monitoring boundary rejections")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("evidence", type=Path)
+    parser.add_argument("evidence", type=Path, nargs="?")
+    parser.add_argument("--examples-only", action="store_true")
     args = parser.parse_args()
+    if not args.examples_only and args.evidence is None:
+        parser.error("evidence is required unless --examples-only is specified")
     for relative, expected in FROZEN.items():
         assert hashlib.sha256((ROOT / relative).read_bytes()).hexdigest() == expected, relative
     contract = json.loads((ROOT / "api-server/openapi.json").read_text())
+    for schema in contract["components"]["schemas"].values():
+        Draft202012Validator.check_schema(schema)
+    validate_examples(contract)
+    if args.examples_only:
+        return
     files = sorted(args.evidence.glob("*.json"))
     assert files, "No actual journey responses; use a fresh evidence directory"
     schemas = Counter()
@@ -37,11 +88,7 @@ def main():
     for path in files:
         fixture = json.loads(path.read_text())
         name, value = fixture["schema"], fixture["value"]
-        reference = name if name.startswith("#/") else f"#/components/schemas/{name}"
-        Draft202012Validator(
-            {"$ref": reference, "components": contract["components"]},
-            format_checker=FormatChecker(),
-        ).validate(value)
+        validator(contract, name).validate(value)
         schemas[name] += 1
         if name == "Operation":
             states[value["state"]] += 1

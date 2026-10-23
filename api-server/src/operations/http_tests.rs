@@ -80,7 +80,7 @@ impl HttpFixture {
             generation: Uuid::new_v4(),
             backend: Backend::LndRest,
             policy: state.registry.get("synthetic").unwrap().policy.clone(),
-            peer_policy: settings.nodes[0].peer_policy.clone(),
+            peer_policy: settings.nodes[0].peer_policy.clone().unwrap(),
             reauth_mode: ReauthMode::EveryOperation,
             capabilities: Capabilities::uniform(None),
             review_seconds: 300,
@@ -675,7 +675,7 @@ async fn read_only_and_wire_boundaries_deny_before_mutation() {
         StatusCode::NOT_FOUND
     );
     assert_eq!(f.fake.counts().0, 0);
-    f.settings.nodes[0].read_only = true;
+    f.settings.nodes[0].read_only = Some(true);
     f.state = ApplicationState::new(&f.settings, f.state.journal.clone())
         .await
         .unwrap();
