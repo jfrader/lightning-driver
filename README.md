@@ -1,42 +1,39 @@
 # Lightning Driver backend
 
-The Rust API server behind [lightning-driver-ui](https://github.com/jfrader/lightning-driver-ui):
-one operator, several server-configured nodes — LND over gRPC, LND over REST, Core Lightning over
-REST, and Bitcoin Core over RPC.
+Backend for [lightning-driver-ui](https://github.com/jfrader/lightning-driver-ui).
 
-The server owns every node credential, enforces the per-node policy, journals every operation and
-talks to the daemons. The browser only calls `/api/v1` on its own origin.
+It manages LND (gRPC or REST), Core Lightning (REST) and Bitcoin Core (RPC) nodes from one
+`config.toml`. The server holds the node credentials, enforces each node's policy and journals every
+mutation before it reaches a daemon. The browser only calls `/api/v1` on the same origin.
 
-The versioned wire contract is [`api-server/openapi.json`](api-server/openapi.json). The UI keeps a
-pinned copy of it.
+The API contract is [`api-server/openapi.json`](api-server/openapi.json); the UI pins a copy.
 
 ## What it does
 
-- Passkey (WebAuthn) sign-in, optionally linked to a NIP-07 Nostr key. Enrollment tokens are issued
-  from the host and are single-use.
-- Reads: balances, invoices, payments, peers, channels, transactions, fee estimates, node info,
-  Bitcoin Core chain/mempool/peers and LND watchtower state.
-- Eight mutations: create invoice, pay invoice, connect or disconnect a peer, open or close a
-  channel, new address, send on-chain. Each one is reviewed against policy and authorized before it
-  is dispatched.
-- A durable SQLite journal: a restart never re-sends an action, and unresolved operations reconcile
-  from the node's own state.
-- Local BOLT11 decoding, without contacting a node.
+- Sign in with a passkey (WebAuthn). You can link a Nostr key (NIP-07). Enrollment tokens are printed
+  on the host and work once.
+- Read balances, invoices, payments, peers, channels, transactions and fee estimates, plus node
+  info, Bitcoin Core chain/mempool/peers and LND watchtower state.
+- Create and pay invoices, connect or disconnect a peer, open or close a channel, generate an
+  address, or send on-chain. Each one is checked against the policy and authorized before it runs.
+- Operations are journaled in SQLite: a restart does not send anything twice, and unresolved
+  operations are checked against the node later.
+- Decode BOLT11 invoices locally.
 
 ## Layout
 
-- `api-server` — HTTP API, auth, operation engine, CLN/LND/Bitcoin adapters, SQLite journal.
-- `lightning-client` — shared model, money, settings and validation types.
-- `synthetic-node-harness` — disposable loopback nodes for development and tests.
-- `deploy` — user-systemd install, API unit, UI static-plus-proxy service.
+- `api-server`: HTTP API, auth, operation engine, CLN/LND/Bitcoin adapters, SQLite journal.
+- `lightning-client`: shared model, money, settings and validation types.
+- `synthetic-node-harness`: disposable loopback nodes for development and tests.
+- `deploy`: systemd units, the installer and the UI static server.
 
 ## Requirements
 
-- Rust 1.93.1 and Cargo, plus a C build toolchain, `pkg-config`, OpenSSL headers and `protoc` for
-  the LND gRPC bindings. SQLite is bundled.
+- Rust 1.93.1 and Cargo, a C build toolchain, `pkg-config`, OpenSSL headers and `protoc` for the LND
+  gRPC bindings. SQLite is bundled.
 - A state directory owned by the service user with mode `0700`, on local disk.
-- One `serve` process per database; it holds an exclusive lock. Bind it privately behind a TLS
-  reverse proxy that preserves the original `Host` header.
+- One `serve` process per database. It holds an exclusive lock, so bind it privately behind a TLS
+  reverse proxy that preserves the `Host` header.
 
 ## Setup
 
@@ -142,8 +139,8 @@ cargo run -p synthetic-node-harness --features synthetic-dev -- --acknowledge-sy
 
 Run the printed commands in separate terminals, then `npm run dev` in the UI repo. Its proxy sends
 `/api` to `http://127.0.0.1:8080` and keeps the browser's `Host` and `Origin`. Omit `--public-port`
-for API-only work on port 8080. Stop the API before Ctrl-C on the harness; its keys, journal and
-configuration are deleted. Nothing in that directory is real state.
+for API-only work on port 8080. Stop the API before Ctrl-C on the harness; it deletes its keys,
+journal and configuration.
 
 ## Checks
 
@@ -168,4 +165,4 @@ not a compatibility certification for a real daemon.
 
 - The API serves no frontend assets. `deploy/install.sh` installs the UI build behind a separate
   static-plus-proxy service on the same origin, routing `/api/v1/*` here.
-- No password or other login fallback.
+- There is no password or other login fallback.
