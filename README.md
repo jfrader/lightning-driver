@@ -1,227 +1,170 @@
-# Lightning node-manager backend
+# Lightning Driver backend
 
-This workspace runs the **passkey and Nostr authentication API, configured-node registry, durable operation journal, the operation engine with its create/authorize/confirm routes, local invoice decoding, and typed CLN REST, LND REST and LND gRPC adapters**, plus the live collection read routes (`balances`, `invoices`, `payments`, `peers`, `channels`, `transactions`, `fee-estimates`, `info`). Frontend asset serving is still pending, so `/` returns JSON 404. Adapters are proven against the loopback synthetic harness only; no real daemon has been contacted, and nothing here is a real-node or production readiness claim.
+The Rust API server behind [lightning-driver-ui](https://github.com/jfrader/lightning-driver-ui):
+one operator, several server-configured nodes — LND over gRPC, LND over REST, Core Lightning over
+REST, and Bitcoin Core over RPC.
 
-The versioned wire contract is [`api-server/openapi.json`](api-server/openapi.json). The frozen contract includes later-stage endpoints; their presence in that file is not an implementation claim.
+The server owns every node credential, enforces the per-node policy, journals every operation and
+talks to the daemons. The browser only calls `/api/v1` on its own origin.
 
-`lightning-client` owns the shared `model`, `money`, `settings` and `validation` modules. The legacy single-node `LightningClient` interface, configuration factory and transport wrappers are removed; CLN and LND adapters live in `api-server` without client-crate feature flags.
+The versioned wire contract is [`api-server/openapi.json`](api-server/openapi.json). The UI keeps a
+pinned copy of it.
 
-## Requirements and configuration
+## What it does
 
-- Rust/Cargo 1.93.1; workspace edition remains 2021.
-- A C build toolchain, `pkg-config`, OpenSSL development headers and `protoc` for the existing gRPC binding. SQLite is bundled by rusqlite.
-- One API process per database, persistent local storage, and a public HTTPS origin behind a TLS reverse proxy. Bind the backend privately and preserve the original `Host` header. Forwarded identity/host/scheme headers are not trusted.
-- Use a state directory owned by the service operator with mode `0700`. The database and instance-lock file are created with mode `0600`; existing unsafe file modes or symlinks are rejected. Do not share a SQLite database over a network filesystem.
+- Passkey (WebAuthn) sign-in, optionally linked to a NIP-07 Nostr key. Enrollment tokens are issued
+  from the host and are single-use.
+- Reads: balances, invoices, payments, peers, channels, transactions, fee estimates, node info,
+  Bitcoin Core chain/mempool/peers and LND watchtower state.
+- Eight mutations: create invoice, pay invoice, connect or disconnect a peer, open or close a
+  channel, new address, send on-chain. Each one is reviewed against policy and authorized before it
+  is dispatched.
+- A durable SQLite journal: a restart never re-sends an action, and unresolved operations reconcile
+  from the node's own state.
+- Local BOLT11 decoding, without contacting a node.
 
-Copy `config.example.toml` into that directory and replace the example public hostname and RP ID with the exact intended hostname **before enrolling authenticators**. Relative database/key/certificate references resolve against the configuration file's directory, not the command's working directory.
+## Layout
 
-The example has `nodes = []`. No node credentials, certificates or real nodes are required to start the API. `invoice_key_file` is required: on first start it is created with mode `0600` when absent and no pending ciphertext exists; a missing, wrong, truncated or unsafe key with pending ciphertext fails startup closed. No money limits are inferred from this example.
+- `api-server` — HTTP API, auth, operation engine, CLN/LND/Bitcoin adapters, SQLite journal.
+- `lightning-client` — shared model, money, settings and validation types.
+- `synthetic-node-harness` — disposable loopback nodes for development and tests.
+- `deploy` — user-systemd install, API unit, UI static-plus-proxy service.
 
-### LND macaroon permissions
+## Requirements
 
-Reads need `info:read`, `invoices:read`, `peers:read`, `offchain:read` and `onchain:read`. Each mutation is checked with `CheckMacaroonPermissions` before it is dispatched, so the macaroon must also carry `macaroon:read`; without it the preflight itself is denied. Mutations need `invoices:write` (invoice), `offchain:write` (payment), `peers:write` (connect/disconnect), `onchain:write` (send) or both `onchain:write` and `offchain:write` (open/close a channel). An unrestricted admin macaroon satisfies all of them. CLN is checked with `checkrune` against the rune before dispatch.
+- Rust 1.93.1 and Cargo, plus a C build toolchain, `pkg-config`, OpenSSL headers and `protoc` for
+  the LND gRPC bindings. SQLite is bundled.
+- A state directory owned by the service user with mode `0700`, on local disk.
+- One `serve` process per database; it holds an exclusive lock. Bind it privately behind a TLS
+  reverse proxy that preserves the original `Host` header.
 
-### LND TLS certificates
+## Setup
 
-For CA-signed LND certificates, omit `tls_verification` or set it to `"ca"` and point `certificate_file` at the issuing CA certificate.
+Copy `config.example.toml` into the state directory and set `public_origin` and `rp_id` to the exact
+public hostname. Relative paths resolve against that directory, not the working directory.
 
-For stock LND's autogenerated, self-signed `tls.cert`, set these fields in the existing `[[nodes]]` entry (REST or gRPC):
-
-```toml
-endpoint = "https://127.0.0.1:10009/" # gRPC; use the REST port for lnd_rest
-certificate_file = "/protected/lnd/tls.cert"
-tls_verification = "pinned"
-```
-
-`pinned` requires exactly one PEM certificate in the file and accepts only that exact certificate's DER bytes. The certificate must be within its validity period and its DNS or IP SAN must match the endpoint host. A different certificate, including a newly generated LND certificate, is refused. After an intended rotation, replace the protected certificate file and restart the API. Do not use `pinned` for CLN.
-
-Run the API:
-
-```sh
-CARGO_BUILD_JOBS=2 cargo run -p api-server -- serve --config /absolute/state-directory/config.toml
-```
-
-`serve` holds an exclusive instance lock. Host authentication commands can use the same configuration/database while it runs. Starting a second API instance against that database fails without resetting authentication or journal state. The listener uses two HTTP workers. The startup line on stderr reports the bound API address, not any Lightning endpoint.
-
-### Explicit loopback-only development
-
-For local browser work, use a **separate synthetic state directory**, for example `/tmp/lightning-driver/lightning-auth-stage1`, with this configuration:
+A Lightning node entry:
 
 ```toml
-nodes = []
+[[nodes]]
+id = "lnd"
+label = "LND"
+backend = "lnd_grpc"                    # lnd_grpc | lnd_rest | cln_rest | bitcoin_rpc
+endpoint = "https://127.0.0.1:10009/"   # HTTPS origin, no path
+certificate_file = "lnd/tls.cert"
+credential_file = "lnd/admin.macaroon"  # LND macaroon, CLN rune, Bitcoin Core cookie
+expected_pubkey = "<compressed hex pubkey>"
+network = "mainnet"                     # mainnet | testnet | testnet4 | signet | regtest
+read_only = false
 
-[api]
-bind = "127.0.0.1:8080"
-public_origin = "http://localhost:8080"
-rp_id = "localhost"
-database = "manager.sqlite"
-invoice_key_file = "pending-invoice.key"
-allow_insecure_loopback = true
+[nodes.policy]                          # example limits; set your own
+create_invoice_msat = { min = "1000", max = "1000000000" }
+pay_invoice_msat = { min = "1000", max = "1000000000" }
+open_channel_sat = { min = "20000", max = "5000000" }
+send_onchain_sat = { min = "10000", max = "1000000" }
+fee_rate_sat_vbyte = { min = "1", max = "200" }
+max_routing_fee_msat = "5000000"
+default_max_routing_fee_msat = "1000000"
+invoice_expiry_seconds = { min = 600, max = 86400, default = 3600 }
+
+[nodes.peer_policy]
+allowed_hosts = ["peer.example.invalid"]
+allowed_ports = [9735]
 ```
 
-Create the directory with `install -d -m 700 /tmp/lightning-driver/lightning-auth-stage1`, save the configuration as `config.toml`, then run:
+A `bitcoin_rpc` node takes `expected_genesis` and the RPC cookie instead of the Lightning fields;
+`certificate_file` is required only for an HTTPS endpoint. For stock LND's self-signed certificate,
+set `tls_verification = "pinned"` and point `certificate_file` at that exact `tls.cert`; a rotated
+certificate needs the new file and a restart. CLN is CA-verified.
 
-```sh
-CARGO_BUILD_JOBS=2 cargo run -p api-server -- serve --config /tmp/lightning-driver/lightning-auth-stage1/config.toml
-```
+## Running it
 
-Both the bind address and public origin must be loopback when the development exception is enabled. Use `localhost` consistently in the browser, Origin and Host. A same-origin development proxy must preserve that Host; if its public port differs, configure that exact origin port. Development uses `ld_dev_session`/`ld_dev_preauth` HttpOnly, SameSite=Strict cookies without Secure; production always uses Secure `__Host-ld_session`/`__Host-ld_preauth` cookies. The development flag never weakens public HTTPS configuration or passkey verification.
-
-The Rust checkpoint does not serve frontend assets or a registration page. The frontend must use the same origin and the frozen JSON API; WebAuthn registration needs an authenticator, not a password or a curl-only login.
-
-### Running an instance
-
-`deploy/install.sh` installs the API and a static-plus-proxy server for the built UI as user-level systemd services. Build the UI first (`npm run build` in `lightning-driver-ui`), then:
+`deploy/install.sh` installs the release API and a static-plus-proxy server for the built UI as
+user-level systemd services. The state directory defaults to `~/.local/state/lightning-driver` and
+needs `config.toml` before the first install.
 
 ```sh
 deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist
 ```
 
-It writes `~/.local/lib/lightning-driver/{api-server,server.mjs}`, the UI assets under `~/.local/share/lightning-driver/dist`, and two units into `~/.config/systemd/user/`, then enables and restarts them. The state directory defaults to `~/.local/state/lightning-driver` and must hold `config.toml` before the first install; for a loopback instance:
+`--port` must match the port in `api.public_origin` (4400 by default). Re-running the script after a
+rebuild upgrades both artifacts and restarts the services; it never rewrites the state directory.
 
-```toml
-[api]
-bind = "127.0.0.1:8080"
-public_origin = "http://localhost:4400"
-rp_id = "localhost"
-database = "manager.sqlite"
-invoice_key_file = "pending-invoice.key"
-allow_insecure_loopback = true
-```
-
-`--port` must match the port in `api.public_origin`. Enroll the first sign-in method from the host with `~/.local/lib/lightning-driver/api-server auth enrollment --config ~/.local/state/lightning-driver/config.toml`, open the URL, and register a passkey.
-
-Re-running the script after `cargo build --release -p api-server` and a UI build upgrades both artifacts and restarts the services; the state directory is never rewritten. `--no-restart` installs without restarting, and `--binary PATH` installs an existing binary instead of building.
-
-## Host enrollment and recovery
-
-Issue an enrollment token from a trusted host terminal:
+For API-only work, run the server directly:
 
 ```sh
-CARGO_BUILD_JOBS=2 cargo run --quiet -p api-server -- auth enrollment --config /tmp/lightning-driver/lightning-auth-stage1/config.toml
+CARGO_BUILD_JOBS=2 cargo run -p api-server -- serve --config /path/to/state/config.toml
 ```
 
-The command prints one random token once on stdout. It expires after `api.limits.preauth_seconds` (default 300 seconds) and is hash-only at rest. A passkey enrollment consumes it when the ceremony starts; a Nostr enrollment consumes it only when the signature verifies, so a canceled or failed signature leaves the token usable until its expiry. Do not place it in a URL, command argument, log or persisted browser storage. Issue a new token if the passkey ceremony fails or is abandoned.
+The first `serve` creates `invoice_key_file` with mode `0600`. Logs are JSON Lines on stderr;
+[`docs/runbook.md`](docs/runbook.md) documents the events and the startup, lock, enrollment and node
+authentication procedures.
 
-Browser enrollment sequence:
+## Node permissions
 
-1. GET `/api/v1/auth/bootstrap` for the preauthentication cookie, CSRF token and expiry.
-2. POST `/api/v1/auth/enrollment/start` with `{ "enrollment_token": "..." }`, that cookie and `X-CSRF-Token`. Exact Origin/Host checks apply.
-3. Pass the returned `options.publicKey` JSON to a compatible WebAuthn browser helper; POST its registration response with `challenge_id` to `/api/v1/auth/enrollment/finish`.
-4. Keep only the returned authenticated CSRF/expiry view in memory. The app session is an opaque HttpOnly cookie.
+LND reads need `info:read`, `invoices:read`, `peers:read`, `offchain:read` and `onchain:read`. Every
+mutation is preflighted with `CheckMacaroonPermissions`, so the macaroon also needs `macaroon:read`,
+plus `invoices:write`, `offchain:write`, `peers:write` or `onchain:write` for the operations in use.
+CLN runes are checked with `checkrune` before dispatch.
 
-Nostr enrollment uses the same host token and a NIP-07 signer:
+## Enrollment and recovery
 
-1. GET `/api/v1/auth/bootstrap` for the preauthentication cookie, CSRF token and expiry.
-2. POST `/api/v1/auth/nostr/start` with `{ "purpose": "enrollment", "token": "..." }`; the response carries a 120-second challenge and the exact event template.
-3. Sign the template with the NIP-07 extension (`window.nostr.signEvent`) and POST the returned event with `challenge_id` to `/api/v1/auth/nostr/finish`.
-4. The server verifies the NIP-01 id, BIP-340 signature, exact URL/method/purpose/challenge tags and a ±120-second `created_at`, then consumes the token and issues the session. A failed signature does not consume the token.
-
-Nostr login is `/api/v1/auth/nostr/start` with `{ "purpose": "login" }` and the same finish route. Link and unlink use the authenticated session and the same pair with `{ "purpose": "link" }` or `{ "purpose": "unlink", "pubkey": "..." }`. Linking additionally requires a session authenticated within `api.limits.authorization_seconds` (60 by default): otherwise the server answers `reauth_required` and the operator signs in again with the method that owns the session, so a stolen live session cannot add a key it controls. Unlinking requires a fresh signature from the identity being removed and refuses to remove the last credential. Sensitive operation step-up uses `/nodes/{node_id}/operations/{operation_id}/authorize/nostr` and `/finish`, binding the event to the operation id and immutable review digest. The server never signs a Nostr event.
-
-Issue another host enrollment token to register an independent backup authenticator for the same operator. Enrollment does not create a second account or revoke existing authenticators. Passkey login uses `/api/v1/auth/passkey/start` and `/finish`; Nostr login uses `/api/v1/auth/nostr/start` with `{ "purpose": "login" }` and `/auth/nostr/finish`, both with a fresh anonymous bootstrap context. All ceremony state is held server-side, bounded, expiring and single-use, including failed verification attempts.
-
-Lost-all-authenticator recovery is host-only and requires explicit confirmation:
+Register an authenticator with a token printed once on the host:
 
 ```sh
-CARGO_BUILD_JOBS=2 cargo run --quiet -p api-server -- auth recovery \
-  --config /tmp/lightning-driver/lightning-auth-stage1/config.toml \
+cargo run --quiet -p api-server -- auth enrollment --config /path/to/state/config.toml
+```
+
+Submit the token in the UI and complete the passkey or NIP-07 ceremony. Tokens last
+`api.limits.preauth_seconds` (300 by default). Issue another token to add a backup authenticator; it
+does not create a second operator or revoke the first.
+
+If every authenticator is lost, reset authentication from the host:
+
+```sh
+cargo run --quiet -p api-server -- auth recovery \
+  --config /path/to/state/config.toml \
   --confirm-reset-authentication
 ```
 
-Without the confirmation flag, the command refuses without modifying storage. Confirmed recovery atomically revokes all registered passkeys and Nostr identities, previous enrollment tokens and outstanding challenges, advances the durable authentication generation, and prints one new enrollment token. Running sessions/ceremonies cannot authenticate after that generation changes. Re-enroll using the normal sequence. The operator ID, operation history, unresolved claims and encrypted pending-invoice records are not deleted by authentication recovery.
+That revokes passkeys, Nostr identities, sessions, tokens and outstanding challenges, then prints a
+new enrollment token. Operation history and pending records are kept.
 
-Stopping/restarting the API preserves passkeys, Nostr identities and SQLite operation history but loses ephemeral sessions/grants. Startup marks potentially dispatched unfinished operations unknown and expires undispatched reviews; it never submits or retries a node action. There is no password fallback, legacy `/login`, `/logout`, money-moving `/api` route or supported `set-password` utility.
+## Development
 
-## Session and policy endpoints
-
-- GET `/api/v1/session` returns the current CSRF token, idle/absolute expiries, last authentication time, the method that signed in (`passkey` or `nostr`), the Nostr pubkey when applicable and the server reauthentication policy; unauthenticated access returns 401.
-- GET `/api/v1/auth/nostr/identities` returns the enrolled Nostr identities (`pubkey`, `npub`, timestamps) and the passkey count to an authenticated session.
-- DELETE `/api/v1/session` requires exact Origin and the session's `X-CSRF-Token`, revokes that session and returns an empty 204 response.
-- GET `/api/v1/config` requires authentication and returns safe runtime policy only. It contains no database paths, node endpoints, certificates, macaroons, runes or other credential material.
-- JSON requests use `Content-Type: application/json`; responses/errors use `Cache-Control: no-store`. Bootstrap is reachable without an authenticated CSRF token. All POSTs use the preauth/session-bound token as appropriate; login is not a CSRF exemption.
-
-The default reauthentication policy is `every_operation`. For a server-controlled recent-auth window, configure:
-
-```toml
-[api.reauth]
-mode = "recent"
-recent_auth_seconds = 120
-```
-
-This policy is exposed now and enforced by the operation routes. A sensitive confirm without a bound, unexpired authorization is rejected; the browser cannot weaken the server policy.
-
-## Registry, history and decode reads
-
-Authenticated GET `/api/v1/nodes` returns the sorted configured registry, including a genuine fresh empty list when no nodes are configured. GET `/nodes/{node_id}`, `/status` and `/policy` under the same API prefix return sanitized registry/status/effective policy. These reads still present the registry projection, not a live observation: until the collection routes are wired, status reports `unsupported` with `node_unverified`, freshness is stale with no observation, observed identity/revision/sync are null and network is `unknown`. The fleet snapshot itself is a fresh local observation. Mutation capabilities follow the configured policy and adapter availability (`read_only` takes precedence, otherwise `unverified`). Configured expected identity/network are not advertised as verified observations.
-
-GET `/nodes/{node_id}/operations` and `/operations/{operation_id}` read the durable journal even for removed or retargeted node IDs. Lists support `state` (including `nonterminal`) and `kind`, ordered by exact creation time descending then ID ascending. Filters apply in SQLite before the snapshot bound. Unresolved counts use all nonterminal records, not a capped page. Historical review identities are never rewritten to the current configured binding. Mixed historical bindings produce page network `unknown`; a single historical binding retains its original network. Status reads perform at most one read-only node observation; new list snapshots reconcile at most two eligible nonterminal operations on that node, sequentially, with a two-second total deadline and the adapter's own deadline. Cursor continuations remain frozen local reads. Removed or retargeted bindings are never observed. These reads never dispatch mutations.
-
-Each operation has a durable lifetime ceiling of 96 reconciliation attempts, reserved before contacting the node (including failed, cancelled and timed-out reads). After attempt `n`, the next check is eligible after `min(5 × 2^(n−1), 1800)` seconds: 5 s, 10 s, 20 s, 40 s, 80 s, 160 s, 320 s, 640 s, 1280 s, then 30 min per attempt. With uninterrupted polling at those deadlines, the first-to-96th check spans 43 h 41 min 55 s; 96 checks spaced entirely at the cap span 47 h 30 min (95 intervals). Reads trigger checks; these are minimum spans, not background schedules or time-based expiry. Restart does not reset the count or deadline. `reconciliation`, when present, reports `attempts`, `last_attempt_at`, `next_attempt_at`, `last_outcome` and `exhausted`. `next_attempt_at` is the persisted eligibility deadline, set when reserving an attempt and cleared when the 96th attempt is reserved. Outcomes are `in_flight` (reserved, no validated completion yet), `positive`, `rejected`, `withheld` (node unavailable), `not_found`, `invalid`, `pruned`, `conflict` or `paid_elsewhere`. `exhausted=true` means all 96 attempts are reserved and no further automatic status/list observations will run, not that the operation failed. Unresolved operations retain their unknown/reconciling or already-established pending projection and resource claims. `last_reconciled_at` still records only validated completed read observations, including inconclusive ones, not attempted contact. No raw node response is retained. An exact closed CLN channel with explicitly withheld funding proves abandonment; absence, elapsed time, an on-chain state or close cause alone never proves an open failed. Older CLN versions without that authoritative fact can remain unknown.
-
-POST `/nodes/{node_id}/decode` requires the normal session/Origin/CSRF boundary and JSON `{ "bolt11": "..." }`. It uses the maintained local BOLT11 parser even for read-only/unverified nodes; an unobserved node network yields `network_matches_node: null`. Malformed invoices fail; valid expired invoices decode with `expired: true`. This call never pays or acquires a journal claim.
-
-Collection cursors are random opaque server-held snapshot tokens. They bind authenticated session, resource, node/config/history identity scope, filters and limit. Immutable rows and observation time do not shift between pages. TTL/restart returns `410 cursor_expired`; malformed cursors or changed selectors/session return `400 invalid_cursor`. A truncated snapshot remains truncated on its final page even with no next cursor. Query keys are explicit; duplicate/unknown keys and noncanonical/invalid explicit limits fail rather than falling back to defaults.
-
-Central `[api.limits]` cache defaults are `snapshot_max_entries=64`, `snapshot_per_session=8`, `snapshot_cache_bytes=16777216`. `[api.limits.pagination]` defaults are `default_limit=50`, `max_limit=200`, `snapshot_ttl_seconds=120`, `snapshot_max_items=10000`. Cache entry counts, serialized row bytes and per-snapshot row/token counts are bounded; expired allocations are reclaimed on requests without background workers. Repeated abandoned reads can hit `429 rate_limited` until expiry. Restart discards cursors, not history.
-
-Fingerprints are centralized SHA-256 digests of deterministic typed JSON tuples. The public policy/binding fingerprint still uses `binding-v1`, node ID, backend, expected pubkey/network, endpoint and certificate/credential file references (not file contents). The internal operation binding revision additionally hashes the certificate and credential bytes read at startup, so rotating either invalidates old bindings without exposing them. Policy input is `policy-v1`, that binding digest, money policy, peer egress policy, read-only flag, public origin, RP ID, explicit development exception, global reauth policy and runtime limits. File-reference rotation changes the digest; credential bytes are deliberately not read in this checkpoint. Actual transport observations must extend verified identity binding in the adapter stage; no verified identity revision is exposed yet. History scope hashes sorted distinct immutable review bindings; fleet scope hashes sorted IDs/binding/policy digests. Neither raw endpoint nor credential references are returned in DTOs.
-
-## Verification
-
-### Synthetic full-stack development
-
-Requires `openssl` on PATH. From the workspace root, start the disposable,
-loopback-only TLS node harness explicitly:
+The synthetic harness starts three throwaway loopback TLS nodes (CLN REST, LND REST, LND gRPC) and
+prints the commands for a disposable configuration. It needs `openssl` on PATH.
 
 ```sh
 cargo run -p synthetic-node-harness --features synthetic-dev -- --acknowledge-synthetic-dev --public-port 5173
 ```
 
-It prints exact `api-server serve` and `auth enrollment` commands using its
-generated private configuration directory under `/tmp/lightning-driver/`. Run those in
-separate terminals. Serve the UI on `http://localhost:5173`; its development proxy
-must forward `/api/v1` to `http://127.0.0.1:8080` with `changeOrigin: false`, keeping
-the browser's `Host: localhost:5173` and Origin. Enroll a passkey normally. Omit
-`--public-port` for API-only work directly on `http://localhost:8080`. There is no
-authentication bypass, injected adapter or production configuration change.
-Stop the API first, then Ctrl-C the harness: its synthetic journal, credentials
-and freshly generated TLS CA/keys are deleted. Do not use this directory for
-real state. The harness is not an API-server dependency, is excluded from the
-workspace default members, and its binary requires both the non-default feature
-and the acknowledgement flag. Every listener and peer must be loopback.
+Run the printed commands in separate terminals, then `npm run dev` in the UI repo. Its proxy sends
+`/api` to `http://127.0.0.1:8080` and keeps the browser's `Host` and `Origin`. Omit `--public-port`
+for API-only work on port 8080. Stop the API before Ctrl-C on the harness; its keys, journal and
+configuration are deleted. Nothing in that directory is real state.
 
-The three independent nodes implement the adapter subset of CLN v25.02 REST and
-LND v0.18.5-beta REST/gRPC (Lightning, Router and WalletKit). These are tagged
-synthetic shapes, not daemon compatibility certification. Each node runs one
-seeded scenario: one retained invoice/payment and fixed transaction/channel
-references. Restart the harness for a new independent scenario. Payments settle
-on tracking, channels activate after observation, and closes are cooperative.
-The library can script rejection, permission loss, timeout before/after effect,
-malformed/oversized responses and late LND stream errors, without retrying.
-Existing API read-route coverage is unchanged; this harness does not add missing
-HTTP collection endpoints or serve frontend assets.
+## Checks
 
-Run wire-level journeys and validate their actual HTTP responses against the
-unchanged frozen schema (the Python environment must provide `jsonschema`):
-
-```sh
-EVIDENCE=$(mktemp -d /tmp/lightning-driver/lightning-journeys.XXXXXX)
-HTTP_EVIDENCE_DIR="$EVIDENCE" CARGO_BUILD_JOBS=2 cargo test -p api-server --lib journeys
-python3 tools/validate-journey-responses.py "$EVIDENCE"
-CARGO_BUILD_JOBS=2 cargo test -p synthetic-node-harness --features synthetic-dev
-```
-
-From the workspace root:
+These are the CI steps:
 
 ```sh
 cargo fmt --all -- --check
 CARGO_BUILD_JOBS=2 cargo clippy --workspace --all-targets -- -D warnings
 CARGO_BUILD_JOBS=2 cargo test --workspace
 CARGO_BUILD_JOBS=2 cargo check -p lightning-client --no-default-features
-CARGO_BUILD_JOBS=2 cargo check -p lightning-client --all-features
+CARGO_BUILD_JOBS=2 cargo check --workspace --all-features
 ```
 
-Integration tests use the production application factory, real software-authenticator ceremonies, the loopback synthetic harness, temporary synthetic configuration and finite CLI subprocesses. Registry/history/decode tests cover safe projection, strict boundaries, stable filtered snapshots, session/selector/TTL/restart binding, cache limits, exact unresolved counts, removed/retargeted identities, nanosecond ordering and signed synthetic invoices. The nine journey tests exercise all eight mutations across the three transports through the real adapters and HTTP routes. Set `STAGE2A_EVIDENCE_DIR` to a scratch directory while running `cargo test -p api-server --test stage2a` to capture representative actual response JSON tagged with frozen schema names for independent validation. No real Lightning node or funds are involved; synthetic shapes are not daemon compatibility certification.
+Set `HTTP_EVIDENCE_DIR` while running `cargo test -p api-server --lib journeys` to capture actual
+response JSON, then validate it with `python3 tools/validate-journey-responses.py <dir>`. The
+validator needs the `jsonschema` Python package.
 
-For an intentional local reset, stop the API and remove **only the synthetic state directory you created** under `/tmp/lightning-driver/`, then recreate it and enroll again. Authentication recovery is the alternative when operation history must be retained. Do not delete a real journal, rotate its key or copy a live SQLite main file alone as a substitute for a reviewed backup/recovery procedure.
+Tests drive the real routes, adapters and passkey ceremonies against the synthetic harness. They are
+not a compatibility certification for a real daemon.
+
+## Limitations
+
+- The API serves no frontend assets. `deploy/install.sh` installs the UI build behind a separate
+  static-plus-proxy service on the same origin, routing `/api/v1/*` here.
+- No password or other login fallback.

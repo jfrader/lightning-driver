@@ -1,4 +1,4 @@
-# Auth/config checkpoint: no Lightning clients are started or contacted.
+# No nodes configured. Add [[nodes]] entries to manage real daemons.
 nodes = []
 
 [api]
@@ -6,7 +6,7 @@ bind = "127.0.0.1:8080"
 public_origin = "https://manager.example.invalid"
 rp_id = "manager.example.invalid"
 database = "manager.sqlite"
-# Reserved for the later operation engine; stage 1 does not read this file.
+# Created with mode 0600 on first serve if absent.
 invoice_key_file = "pending-invoice.key"
 allow_insecure_loopback = false
 
