@@ -101,13 +101,19 @@ async fn nodes(
         filters: query.filters,
         limit: query.limit,
     };
-    let now = Utc::now();
     if let Some(cursor) = query.cursor {
         return response(
-            auth.snapshots.next(&context, &selector, &cursor, now)?,
+            auth.snapshots
+                .next(&context, &selector, &cursor, Utc::now())?,
             auth.limits().max_response_bytes,
         );
     }
+    // One failed observation is recorded on that node and shown as its status; it must not fail the
+    // whole fleet page, and a rate-limited refresh is retried on the next request.
+    for (id, _) in auth.registry.entries() {
+        let _ = auth.refresh_node(id).await;
+    }
+    let now = Utc::now();
     let counts = auth.journal.unresolved_counts().await?;
     let mut rows: Vec<_> = auth
         .registry

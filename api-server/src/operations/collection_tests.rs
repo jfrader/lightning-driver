@@ -106,6 +106,47 @@ async fn stale_node_observation_does_not_block_an_unrelated_read() {
 }
 
 #[actix_web::test]
+async fn ready_harness_nodes_enable_capabilities_on_the_first_list_read() {
+    for backend in [Backend::LndGrpc, Backend::LndRest, Backend::ClnRest] {
+        let f = Journey::new(backend, false).await;
+        {
+            let mut scenario = f.harness.scenario.lock().unwrap();
+            scenario.set_ready();
+            scenario.expect_mutations(&[]);
+        }
+        let browser = login(&f.state, None).await;
+        let (status, page, _) = call(
+            &f.state,
+            authenticated(get("/api/v1/nodes"), &browser),
+            "NodesPage",
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{backend:?}: {page}");
+        let node = &page["items"][0];
+        assert_eq!(node["identity_pubkey"], PEER);
+        assert_eq!(node["network"], "regtest");
+        assert_eq!(node["status"]["status"], "online");
+        assert_eq!(node["status"]["synced_to_chain"], true);
+        assert_eq!(node["status"]["stale"], false);
+        let capabilities = node["capabilities"].as_object().unwrap();
+        assert_eq!(capabilities.len(), 8);
+        for (kind, capability) in capabilities {
+            assert_eq!(
+                *capability,
+                json!({"enabled":true,"reason":null}),
+                "{backend:?}/{kind}"
+            );
+        }
+        f.harness
+            .scenario
+            .lock()
+            .unwrap()
+            .assert_no_unexpected_calls();
+        f.harness.stop().await;
+    }
+}
+
+#[actix_web::test]
 async fn live_info_requires_graph_sync_only_for_routing_payments() {
     for backend in [Backend::LndGrpc, Backend::LndRest, Backend::ClnRest] {
         for read_only in [false, true] {
