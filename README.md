@@ -40,8 +40,9 @@ pinned copy of it.
 
 ## Setup
 
-Copy `config.example.toml` into the state directory and set `public_origin` and `rp_id` to the exact
-public hostname. Relative paths resolve against that directory, not the working directory.
+Copy `config.example.toml` into the state directory, set `public_origin` and `rp_id` to the exact
+public hostname, and replace `nodes = []` with your node entries. Relative paths resolve against
+that directory, not the working directory.
 
 A Lightning node entry:
 

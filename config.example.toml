@@ -1,4 +1,4 @@
-# No nodes configured. Add [[nodes]] entries to manage real daemons.
+# No nodes configured. Remove this line before adding [[nodes]] entries.
 nodes = []
 
 [api]
