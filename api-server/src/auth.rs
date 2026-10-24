@@ -603,9 +603,22 @@ impl AuthManager {
         now: DateTime<Utc>,
     ) -> Result<Vec<ActiveSession>, AuthError> {
         let _gate = self.session_gate.lock().map_err(|_| AuthError::Storage)?;
-        let memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
+        let cached = self.live_idle(context.generation)?;
         self.sessions
-            .list(context.generation, context.id, now, &memory.contexts)
+            .list(context.generation, context.id, now, &cached)
+    }
+
+    /// Idle deadlines of the live contexts, so listing never holds the memory lock across SQLite.
+    fn live_idle(&self, generation: i64) -> Result<HashMap<Uuid, DateTime<Utc>>, AuthError> {
+        Ok(self
+            .memory
+            .lock()
+            .map_err(|_| AuthError::Storage)?
+            .contexts
+            .values()
+            .filter(|context| context.generation == generation)
+            .map(|context| (context.id, context.idle_expires_at))
+            .collect())
     }
 
     pub fn revoke_session(
@@ -615,17 +628,20 @@ impl AuthManager {
         now: DateTime<Utc>,
     ) -> Result<(), AuthError> {
         let _gate = self.session_gate.lock().map_err(|_| AuthError::Storage)?;
-        let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
+        let cached = self.live_idle(context.generation)?;
         if !self
             .sessions
-            .list(context.generation, context.id, now, &memory.contexts)?
+            .list(context.generation, context.id, now, &cached)?
             .iter()
             .any(|session| session.id == id)
         {
             return Err(AuthError::NotFound);
         }
         self.sessions.delete_by_id(id, context.generation)?;
-        memory.remove_context(id);
+        self.memory
+            .lock()
+            .map_err(|_| AuthError::Storage)?
+            .remove_context(id);
         Ok(())
     }
 

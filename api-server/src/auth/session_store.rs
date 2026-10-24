@@ -191,7 +191,7 @@ impl SessionStore {
         generation: i64,
         current: Uuid,
         now: DateTime<Utc>,
-        cached: &HashMap<[u8; 32], Context>,
+        cached: &HashMap<Uuid, DateTime<Utc>>,
     ) -> Result<Vec<ActiveSession>, AuthError> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
@@ -211,20 +211,12 @@ impl SessionStore {
             .map_err(|_| AuthError::Storage)?;
         let time = |value| DateTime::from_timestamp(value, 0).ok_or(AuthError::Storage);
         let mut sessions = Vec::new();
-        let cached: HashMap<_, _> = cached
-            .values()
-            .filter(|context| context.generation == generation)
-            .map(|context| (context.id, context))
-            .collect();
         for row in rows {
             let (id, created, expires, idle, last, nostr_pubkey) =
                 row.map_err(|_| AuthError::Storage)?;
             let id = Uuid::parse_str(&id).map_err(|_| AuthError::Storage)?;
             // Idle writes are coalesced; cached authority can be newer than the row.
-            let idle_expires_at = cached
-                .get(&id)
-                .map(|context| context.idle_expires_at)
-                .unwrap_or(time(idle)?);
+            let idle_expires_at = cached.get(&id).copied().unwrap_or(time(idle)?);
             if idle_expires_at <= now {
                 continue;
             }
