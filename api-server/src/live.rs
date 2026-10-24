@@ -17,6 +17,10 @@ pub(crate) struct Cache {
 
 #[cfg(test)]
 impl Cache {
+    pub(crate) fn cached_for_test(&self, resource: &str) -> Option<Observed> {
+        self.values.get(resource).cloned()
+    }
+
     /// Puts a value in the cache so a test can prove it is dropped.
     pub(crate) fn seed_for_test(&mut self, resource: &'static str, bytes: usize) -> usize {
         self.values.insert(
@@ -44,6 +48,7 @@ impl Cache {
 }
 
 #[derive(Clone)]
+#[cfg_attr(test, derive(Debug, PartialEq))]
 pub(crate) struct Observed {
     pub value: Value,
     pub at: DateTime<Utc>,

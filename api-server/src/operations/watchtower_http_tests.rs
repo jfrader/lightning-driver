@@ -190,7 +190,10 @@ async fn denied_watchtower_macaroon_preserves_node_status_and_reports_permission
         let f = Fixture::new(backend, WatchtowerRole::DeniedMacaroon, 0).await;
         f.state.refresh_node("synthetic").await.unwrap();
         let entry = f.state.registry.get("synthetic").unwrap();
-        let before = serde_json::to_value(entry.summary(Utc::now(), Decimal::ZERO).status).unwrap();
+        // Hold summary time constant: these reads must not alter node status,
+        // but wall-clock aging alone can mark the observation stale.
+        let now = Utc::now();
+        let before = serde_json::to_value(entry.summary(now, Decimal::ZERO).status).unwrap();
         assert_eq!(before["status"], "online");
         let browser = login(&f.state, None).await;
         for path in [
@@ -211,7 +214,7 @@ async fn denied_watchtower_macaroon_preserves_node_status_and_reports_permission
         }
         assert_eq!(
             before,
-            serde_json::to_value(entry.summary(Utc::now(), Decimal::ZERO).status).unwrap()
+            serde_json::to_value(entry.summary(now, Decimal::ZERO).status).unwrap()
         );
         assert_eq!(f.harness.scenario.lock().unwrap().calls("Stats"), 1);
         assert_eq!(f.harness.scenario.lock().unwrap().calls("TowerGetInfo"), 1);
@@ -378,7 +381,9 @@ async fn watchtower_permission_revocation_is_reported_without_new_probes() {
         let browser = login(&f.state, None).await;
         f.state.refresh_node("synthetic").await.unwrap();
         let entry = f.state.registry.get("synthetic").unwrap();
-        let before = serde_json::to_value(entry.summary(Utc::now(), Decimal::ZERO).status).unwrap();
+        // Compare at one instant so only changes caused by the reads are visible.
+        let now = Utc::now();
+        let before = serde_json::to_value(entry.summary(now, Decimal::ZERO).status).unwrap();
         // Exercise an explicit PermissionDenied status as well as LND's plain error.
         f.harness
             .scenario
@@ -415,7 +420,7 @@ async fn watchtower_permission_revocation_is_reported_without_new_probes() {
         }
         assert_eq!(
             before,
-            serde_json::to_value(entry.summary(Utc::now(), Decimal::ZERO).status).unwrap()
+            serde_json::to_value(entry.summary(now, Decimal::ZERO).status).unwrap()
         );
         assert_eq!(f.harness.scenario.lock().unwrap().calls("Policy"), 3);
         assert!(f.availability().watchtower_client.enabled);

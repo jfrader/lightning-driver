@@ -28,13 +28,15 @@ async fn failing_collection_read_preserves_node_status_and_other_cached_reads() 
         let browser = login(&f.state, None).await;
         let (_, peers) = read(&f, &browser, "peers", "PeersPage").await;
         let (_, status) = read(&f, &browser, "status", "NodeStatus").await;
+        assert_eq!(status["status"], "online");
+        let entry = f.state.registry.get("synthetic").unwrap();
+        let cached_peers = entry.reads.lock().await.cached_for_test("peers").unwrap();
         let bytes = f.state.registry.retained_bytes();
-        let (channels_rpc, peers_rpc) = if backend == Backend::ClnRest {
-            ("listpeerchannels", "listpeers")
+        let channels_rpc = if backend == Backend::ClnRest {
+            "listpeerchannels"
         } else {
-            ("ListChannels", "ListPeers")
+            "ListChannels"
         };
-        let calls = f.harness.scenario.lock().unwrap().calls(peers_rpc);
         f.harness
             .scenario
             .lock()
@@ -42,19 +44,31 @@ async fn failing_collection_read_preserves_node_status_and_other_cached_reads() 
             .fault(channels_rpc, Fault::PermissionDenied);
         let (code, error) = read(&f, &browser, "channels", "ErrorResponse").await;
         assert_ne!(code, StatusCode::OK, "{error}");
-        assert_eq!(read(&f, &browser, "status", "NodeStatus").await.1, status);
-        assert_eq!(read(&f, &browser, "peers", "PeersPage").await.1, peers);
-        assert_eq!(f.harness.scenario.lock().unwrap().calls(peers_rpc), calls);
+        // Inspect the retained observation before another HTTP read can refresh it.
+        // Exact RPC counts/response timestamps assumed the one-second cache could
+        // not expire while the parallel suite was scheduling these requests.
+        assert_eq!(
+            entry.reads.lock().await.cached_for_test("peers"),
+            Some(cached_peers)
+        );
         assert_eq!(f.state.registry.retained_bytes(), bytes);
-        assert!(f
-            .state
-            .registry
-            .get("synthetic")
-            .unwrap()
-            .last_error
-            .lock()
-            .unwrap()
-            .is_none());
+        assert!(entry.last_error.lock().unwrap().is_none());
+        let (_, after) = read(&f, &browser, "status", "NodeStatus").await;
+        // A legitimate info refresh may change freshness, not node health.
+        for field in [
+            "node_id",
+            "status",
+            "error_code",
+            "block_height",
+            "synced_to_chain",
+            "synced_to_graph",
+        ] {
+            assert_eq!(after[field], status[field], "{backend:?}/{field}");
+        }
+        assert_eq!(
+            read(&f, &browser, "peers", "PeersPage").await.1["items"],
+            peers["items"]
+        );
         assert_eq!(
             read(&f, &browser, "invoices", "InvoicesPage").await.0,
             StatusCode::OK
