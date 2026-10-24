@@ -274,7 +274,9 @@ async fn host_cli_real_application_restart_and_recovery_share_one_persistent_ide
     let app = test::init_service(application(runtime.state.clone())).await;
     let response =
         test::call_service(&app, get("/api/v1/session").cookie(old_cookie).to_request()).await;
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::OK);
+    let restored: Value = test::read_body_json(response).await;
+    assert_eq!(restored["csrf_token"], session["csrf_token"]);
     let response = test::call_service(&app, get("/api/v1/auth/bootstrap").to_request()).await;
     let guest = response
         .response()

@@ -177,6 +177,19 @@ impl PendingSecretKey {
 }
 
 impl Journal {
+    pub(crate) fn path(&self) -> &Path {
+        self.path.as_path()
+    }
+
+    pub(crate) fn connection(path: &Path) -> Result<Connection, JournalError> {
+        ensure_protected(path)?;
+        let connection = Connection::open(path)?;
+        connection.busy_timeout(Duration::from_secs(SQLITE_BUSY_SECONDS))?;
+        connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
+        crate::migrations::register_functions(&connection)?;
+        Ok(connection)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_test_capacity(mut self, workers: usize) -> Self {
         self.workers = Arc::new(tokio::sync::Semaphore::new(workers));
@@ -208,11 +221,7 @@ impl Journal {
             .map_err(|_| JournalError::Storage)?;
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            ensure_protected(&path)?;
-            let mut connection = Connection::open(path.as_path())?;
-            connection.busy_timeout(Duration::from_secs(SQLITE_BUSY_SECONDS))?;
-            connection.execute_batch("PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON;")?;
-            crate::migrations::register_functions(&connection)?;
+            let mut connection = Self::connection(&path)?;
             action(&mut connection)
         })
         .await
@@ -252,6 +261,7 @@ impl Journal {
             let tx=connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             if recover {
                 tx.execute("UPDATE auth_meta SET generation=generation+1 WHERE singleton=1",[])?;
+                tx.execute("DELETE FROM sessions",[])?;
                 tx.execute("DELETE FROM credentials",[])?;
                 tx.execute("DELETE FROM nostr_identities",[])?;
                 tx.execute("DELETE FROM nostr_challenges",[])?;

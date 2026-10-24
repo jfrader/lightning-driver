@@ -14,6 +14,38 @@ fn invalid_event() -> Event {
 }
 
 #[tokio::test]
+async fn nostr_session_identity_and_csrf_survive_memory_loss_and_cap_still_applies() {
+    let (_dir, mut manager, now) = setup().await;
+    manager.limits.max_sessions = 1;
+    let session = enroll(&manager, now, 1).await;
+    let csrf = AuthManager::csrf(&session.context).to_owned();
+    manager.memory = Arc::new(Mutex::new(Memory::default()));
+    let restored = manager.context(&session.cookie, true, now).await.unwrap();
+    assert_eq!(restored.nostr_pubkey, session.context.nostr_pubkey);
+    assert_eq!(
+        restored.last_authenticated_at,
+        Some(DateTime::from_timestamp(now.timestamp(), 0).unwrap())
+    );
+    assert_eq!(AuthManager::csrf(&restored), csrf);
+    manager.memory = Arc::new(Mutex::new(Memory::default()));
+    let guest = guest(&manager, now).await;
+    let challenge = start(&manager, &guest.context, "login", None, None, now).await;
+    assert!(matches!(
+        manager
+            .finish_nostr(
+                &guest.context,
+                NostrFinish {
+                    challenge_id: challenge.challenge_id,
+                    event: sign(&challenge, 1),
+                },
+                now
+            )
+            .await,
+        Err(AuthError::Limited)
+    ));
+}
+
+#[tokio::test]
 async fn invalid_challenge_preflight_never_requires_the_sqlite_write_lock() {
     let (dir, manager, now) = setup().await;
     enroll(&manager, now, 1).await;
