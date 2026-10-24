@@ -8,6 +8,28 @@ fn now() -> DateTime<Utc> {
 }
 
 #[test]
+fn ready_scenario_preserves_opt_in_sync_transitions() {
+    let mut scenario = Scenario::new(45, now());
+    assert_eq!(scenario.lnd["info"]["synced_to_graph"], false);
+    scenario.set_identity("different", "unknown");
+    scenario.set_syncing(true);
+    scenario.set_ready();
+    let lnd = scenario.reply("GetInfo", &json!({})).unwrap();
+    assert_eq!(lnd["identity_pubkey"], PEER);
+    assert_eq!(lnd["chains"][0]["network"], "regtest");
+    assert_eq!(lnd["synced_to_chain"], true);
+    assert_eq!(lnd["synced_to_graph"], true);
+    let cln = scenario.reply("getinfo", &json!({})).unwrap();
+    assert_eq!(cln["id"], PEER);
+    assert_eq!(cln["network"], "regtest");
+    assert!(cln.get("warning_bitcoind_sync").is_none());
+    scenario.set_syncing(true);
+    assert_eq!(scenario.lnd["info"]["synced_to_chain"], false);
+    assert_eq!(scenario.lnd["info"]["synced_to_graph"], false);
+    assert!(scenario.cln["getinfo"]["warning_bitcoind_sync"].is_string());
+}
+
+#[test]
 fn cln_payment_returns_the_preimage_for_the_invoice_it_issued() {
     use bitcoin::hashes::{sha256, Hash};
     for seed in [45, u8::MAX] {

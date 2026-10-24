@@ -101,13 +101,17 @@ async fn nodes(
         filters: query.filters,
         limit: query.limit,
     };
-    let now = Utc::now();
     if let Some(cursor) = query.cursor {
         return response(
-            auth.snapshots.next(&context, &selector, &cursor, now)?,
+            auth.snapshots
+                .next(&context, &selector, &cursor, Utc::now())?,
             auth.limits().max_response_bytes,
         );
     }
+    for (id, _) in auth.registry.entries() {
+        auth.refresh_node(id).await?;
+    }
+    let now = Utc::now();
     let counts = auth.journal.unresolved_counts().await?;
     let mut rows: Vec<_> = auth
         .registry

@@ -119,6 +119,10 @@ impl Scenario {
         // The scenario serves one daemon family; its invoice storage follows that family.
         self.cln["listinvoices"] = serde_json::json!({"invoices":[invoice]});
     }
+    pub fn set_ready(&mut self) {
+        self.set_identity(PEER, "regtest");
+        self.set_syncing(false);
+    }
     pub fn set_identity(&mut self, pubkey: &str, network: &str) {
         self.lnd["info"]["identity_pubkey"] = serde_json::json!(pubkey);
         self.lnd["info"]["chains"][0]["network"] = serde_json::json!(network);

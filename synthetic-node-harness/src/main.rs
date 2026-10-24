@@ -28,6 +28,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         (Backend::LndGrpc, "lnd-grpc"),
     ] {
         let harness = Harness::start(backend, "127.0.0.1:0".parse()?, 77, Utc::now()).await?;
+        harness
+            .scenario
+            .lock()
+            .expect("synthetic scenario")
+            .set_ready();
         nodes.push(harness.node_configuration(id));
         harnesses.push(harness);
     }
