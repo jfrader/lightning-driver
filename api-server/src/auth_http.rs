@@ -271,6 +271,8 @@ pub fn configure(config: &mut web::ServiceConfig) {
         .route("/auth/enrollment/finish", web::post().to(finish_enrollment))
         .route("/session", web::get().to(session))
         .route("/session", web::delete().to(logout))
+        .route("/sessions", web::get().to(sessions))
+        .route("/sessions/{id}", web::delete().to(revoke_session))
         .route("/config", web::get().to(public_policy));
 }
 
@@ -443,6 +445,39 @@ async fn logout(
         .cookie(state.cookie(state.cookie_name(true), String::new(), 0))
         .finish())
 }
+
+async fn sessions(
+    request: HttpRequest,
+    application: web::Data<crate::state::ApplicationState>,
+) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
+    let context = state.context(&request, true, false).await?;
+    Ok(HttpResponse::Ok().json(serde_json::json!({
+        "sessions": state.manager.active_sessions(&context, Utc::now())?
+    })))
+}
+
+async fn revoke_session(
+    request: HttpRequest,
+    application: web::Data<crate::state::ApplicationState>,
+) -> Result<HttpResponse, ApiError> {
+    let state = &application.auth;
+    let context = state.context(&request, true, true).await?;
+    let text = request
+        .match_info()
+        .get("id")
+        .ok_or_else(|| ApiError::new(ErrorCode::InvalidRequest))?;
+    let id = uuid::Uuid::parse_str(text).map_err(|_| ApiError::new(ErrorCode::InvalidRequest))?;
+    if id.is_nil() || id.to_string() != text {
+        return Err(ApiError::new(ErrorCode::InvalidRequest));
+    }
+    state.manager.revoke_session(&context, id, Utc::now())?;
+    let mut response = HttpResponse::NoContent();
+    if id == context.snapshot_owner() {
+        response.cookie(state.cookie(state.cookie_name(true), String::new(), 0));
+    }
+    Ok(response.finish())
+}
 async fn public_policy(
     request: HttpRequest,
     application: web::Data<crate::state::ApplicationState>,
@@ -508,6 +543,258 @@ mod tests {
             object.insert("clientExtensionResults".into(), extensions);
         }
         value
+    }
+
+    async fn two_sessions(state: &crate::state::ApplicationState) -> [NewContext; 2] {
+        let manager = &state.auth.manager;
+        let now = Utc::now();
+        let identity = ClientIdentity::Socket(Ipv4Addr::LOCALHOST.into());
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        let guest = manager.anonymous(identity, now).await.unwrap();
+        let token = state
+            .journal
+            .issue_enrollment(now, std::time::Duration::from_secs(60), false)
+            .await
+            .unwrap();
+        let challenge = manager
+            .start_enrollment(&guest.context, token, now)
+            .await
+            .unwrap();
+        let credential = authenticator
+            .do_registration(state.auth.settings.public_origin.clone(), challenge.options)
+            .unwrap();
+        let first = manager
+            .finish_enrollment(
+                &guest.context,
+                RegistrationFinish {
+                    challenge_id: challenge.challenge_id,
+                    credential,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let now = now + chrono::Duration::seconds(1);
+        let guest = manager.anonymous(identity, now).await.unwrap();
+        let challenge = manager.start_login(&guest.context, now).await.unwrap();
+        let credential = authenticator
+            .do_authentication(state.auth.settings.public_origin.clone(), challenge.options)
+            .unwrap();
+        let second = manager
+            .finish_login(
+                &guest.context,
+                AuthenticationFinish {
+                    challenge_id: challenge.challenge_id,
+                    credential,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        [first, second]
+    }
+
+    fn session_request(session: &NewContext) -> test::TestRequest {
+        test::TestRequest::get()
+            .uri("/api/v1/session")
+            .insert_header((header::HOST, "manager.example.invalid"))
+            .cookie(Cookie::new(SESSION_COOKIE, session.cookie.to_string()))
+    }
+
+    fn delete_session_request(session: &NewContext, id: uuid::Uuid) -> test::TestRequest {
+        session_request(session)
+            .method(actix_web::http::Method::DELETE)
+            .uri(&format!("/api/v1/sessions/{id}"))
+            .insert_header((header::ORIGIN, "https://manager.example.invalid"))
+    }
+
+    #[actix_web::test]
+    async fn session_listing_marks_caller_orders_newest_first_and_excludes_secrets() {
+        use sha2::{Digest, Sha256};
+        let (_directory, state) = state().await;
+        let sessions = two_sessions(&state).await;
+        let app = test::init_service(crate::app::application(state.clone())).await;
+        let response = test::call_service(
+            &app,
+            session_request(&sessions[0])
+                .uri("/api/v1/sessions")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = test::read_body(response).await;
+        let text = std::str::from_utf8(&bytes).unwrap();
+        for session in &sessions {
+            assert!(!text.contains(session.cookie.as_str()));
+            assert!(!text.contains(AuthManager::csrf(&session.context)));
+            assert!(!text.contains(&hex::encode(Sha256::digest(session.cookie.as_bytes()))));
+        }
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
+        let rows = body["sessions"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        for (row, (session, current)) in rows
+            .iter()
+            .zip([(&sessions[1], false), (&sessions[0], true)])
+        {
+            assert_eq!(row.as_object().unwrap().len(), 8);
+            assert_eq!(row["id"], session.context.snapshot_owner().to_string());
+            assert_eq!(row["current"], current);
+            assert_eq!(row["method"], "passkey");
+            assert!(row["nostr_pubkey"].is_null());
+            for field in [
+                "created_at",
+                "expires_at",
+                "idle_expires_at",
+                "last_authenticated_at",
+            ] {
+                chrono::DateTime::parse_from_rfc3339(row[field].as_str().unwrap()).unwrap();
+            }
+        }
+        let response = test::call_service(
+            &app,
+            test::TestRequest::get()
+                .uri("/api/v1/sessions")
+                .insert_header((header::HOST, "manager.example.invalid"))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn deleting_another_session_revokes_its_cached_cookie_but_keeps_caller() {
+        let (_directory, state) = state().await;
+        let [caller, other] = two_sessions(&state).await;
+        let app = test::init_service(crate::app::application(state.clone())).await;
+        let response = test::call_service(
+            &app,
+            delete_session_request(&caller, other.context.snapshot_owner())
+                .insert_header(("X-CSRF-Token", AuthManager::csrf(&caller.context)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(response.response().cookies().next().is_none());
+        assert!(test::read_body(response).await.is_empty());
+        for (session, status) in [
+            (&other, StatusCode::UNAUTHORIZED),
+            (&caller, StatusCode::OK),
+        ] {
+            let response = test::call_service(&app, session_request(session).to_request()).await;
+            assert_eq!(response.status(), status);
+        }
+        // The revoked cookie also remains rejected by a fresh manager with an empty cache.
+        let restarted =
+            AuthHttp::new((*state.auth.settings).clone(), state.journal.clone()).unwrap();
+        assert!(restarted
+            .manager
+            .context(&other.cookie, true, Utc::now())
+            .await
+            .is_err());
+    }
+
+    #[actix_web::test]
+    async fn deleting_own_session_ends_it_and_expires_cookie() {
+        let (_directory, state) = state().await;
+        let [caller, _other] = two_sessions(&state).await;
+        let app = test::init_service(crate::app::application(state.clone())).await;
+        let response = test::call_service(
+            &app,
+            delete_session_request(&caller, caller.context.snapshot_owner())
+                .insert_header(("X-CSRF-Token", AuthManager::csrf(&caller.context)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        let cookie = response
+            .response()
+            .cookies()
+            .find(|cookie| cookie.name() == SESSION_COOKIE)
+            .unwrap();
+        assert_eq!(cookie.max_age(), Some(CookieDuration::ZERO));
+        let response = test::call_service(&app, session_request(&caller).to_request()).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[actix_web::test]
+    async fn deleting_unknown_session_returns_not_found_without_revoking_sessions() {
+        let (_directory, state) = state().await;
+        let sessions = two_sessions(&state).await;
+        let app = test::init_service(crate::app::application(state.clone())).await;
+        let response = test::call_service(
+            &app,
+            delete_session_request(&sessions[0], uuid::Uuid::new_v4())
+                .insert_header(("X-CSRF-Token", AuthManager::csrf(&sessions[0].context)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "not_found");
+        for session in &sessions {
+            let response = test::call_service(&app, session_request(session).to_request()).await;
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+    }
+
+    #[actix_web::test]
+    async fn deleting_expired_session_returns_not_found_and_keeps_caller() {
+        let (_directory, state) = state().await;
+        let [caller, other] = two_sessions(&state).await;
+        let id = other.context.snapshot_owner();
+        state
+            .journal
+            .run(move |connection| {
+                connection.execute(
+                    "UPDATE sessions SET expires_at=0 WHERE context_id=?1",
+                    [id.to_string()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let app = test::init_service(crate::app::application(state.clone())).await;
+        let response = test::call_service(
+            &app,
+            delete_session_request(&caller, id)
+                .insert_header(("X-CSRF-Token", AuthManager::csrf(&caller.context)))
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "not_found");
+        let response = test::call_service(
+            &app,
+            session_request(&caller)
+                .uri("/api/v1/sessions")
+                .to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            body["sessions"][0]["id"],
+            caller.context.snapshot_owner().to_string()
+        );
+    }
+
+    #[actix_web::test]
+    async fn deleting_session_requires_csrf_and_does_not_revoke_on_failure() {
+        let (_directory, state) = state().await;
+        let [caller, other] = two_sessions(&state).await;
+        let app = test::init_service(crate::app::application(state.clone())).await;
+        let response = test::call_service(
+            &app,
+            delete_session_request(&caller, other.context.snapshot_owner()).to_request(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let body: Value = test::read_body_json(response).await;
+        assert_eq!(body["error"]["code"], "csrf");
+        let response = test::call_service(&app, session_request(&other).to_request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[actix_web::test]

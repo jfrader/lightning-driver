@@ -143,6 +143,7 @@ impl From<AuthError> for ApiError {
             return error;
         }
         Self::new(match error {
+            AuthError::NotFound => ErrorCode::NotFound,
             AuthError::LastCredential => ErrorCode::LastCredential,
             AuthError::EnrollmentUnavailable => ErrorCode::EnrollmentUnavailable,
             AuthError::InvalidRequest => ErrorCode::InvalidRequest,

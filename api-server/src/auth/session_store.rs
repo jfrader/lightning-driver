@@ -1,8 +1,11 @@
-use super::{AuthError, ClientIdentity, Context};
+use super::{ActiveSession, AuthError, ClientIdentity, Context};
 use crate::journal::Journal;
 use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 use uuid::Uuid;
 use zeroize::Zeroizing;
 
@@ -180,6 +183,72 @@ impl SessionStore {
         self.connection()?
             .execute("DELETE FROM sessions WHERE key=?1", [key.as_slice()])
             .map_err(|_| AuthError::Storage)?;
+        Ok(())
+    }
+
+    pub(super) fn list(
+        &self,
+        generation: i64,
+        current: Uuid,
+        now: DateTime<Utc>,
+        cached: &HashMap<Uuid, DateTime<Utc>>,
+    ) -> Result<Vec<ActiveSession>, AuthError> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT context_id,created_at,expires_at,idle_expires_at,last_authenticated_at,nostr_pubkey FROM sessions WHERE generation=?1 AND expires_at>?2 ORDER BY created_at DESC,context_id DESC",
+        ).map_err(|_| AuthError::Storage)?;
+        let rows = statement
+            .query_map(params![generation, now.timestamp()], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, Option<String>>(5)?,
+                ))
+            })
+            .map_err(|_| AuthError::Storage)?;
+        let time = |value| DateTime::from_timestamp(value, 0).ok_or(AuthError::Storage);
+        let mut sessions = Vec::new();
+        for row in rows {
+            let (id, created, expires, idle, last, nostr_pubkey) =
+                row.map_err(|_| AuthError::Storage)?;
+            let id = Uuid::parse_str(&id).map_err(|_| AuthError::Storage)?;
+            // Idle writes are coalesced; cached authority can be newer than the row.
+            let idle_expires_at = cached.get(&id).copied().unwrap_or(time(idle)?);
+            if idle_expires_at <= now {
+                continue;
+            }
+            sessions.push(ActiveSession {
+                id,
+                created_at: time(created)?,
+                expires_at: time(expires)?,
+                idle_expires_at,
+                last_authenticated_at: time(last)?,
+                method: if nostr_pubkey.is_some() {
+                    "nostr"
+                } else {
+                    "passkey"
+                },
+                nostr_pubkey,
+                current: id == current,
+            });
+        }
+        Ok(sessions)
+    }
+
+    pub(super) fn delete_by_id(&self, id: Uuid, generation: i64) -> Result<(), AuthError> {
+        let changed = self
+            .connection()?
+            .execute(
+                "DELETE FROM sessions WHERE context_id=?1 AND generation=?2",
+                params![id.to_string(), generation],
+            )
+            .map_err(|_| AuthError::Storage)?;
+        if changed == 0 {
+            return Err(AuthError::NotFound);
+        }
         Ok(())
     }
 
