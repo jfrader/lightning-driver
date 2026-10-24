@@ -60,6 +60,8 @@ impl From<&Limits> for AdmissionLimits {
 
 #[derive(Debug, thiserror::Error)]
 pub enum AuthError {
+    #[error("Resource not found")]
+    NotFound,
     #[error("Keep at least one sign-in method")]
     LastCredential,
     #[error("Enrollment unavailable")]
@@ -235,6 +237,18 @@ pub struct SessionView {
     pub idle_expires_at: DateTime<Utc>,
     pub last_authenticated_at: DateTime<Utc>,
     pub reauth: ReauthPolicy,
+}
+
+#[derive(Serialize)]
+pub struct ActiveSession {
+    pub id: Uuid,
+    pub created_at: DateTime<Utc>,
+    pub expires_at: DateTime<Utc>,
+    pub idle_expires_at: DateTime<Utc>,
+    pub last_authenticated_at: DateTime<Utc>,
+    pub method: &'static str,
+    pub nostr_pubkey: Option<String>,
+    pub current: bool,
 }
 
 #[derive(Serialize)]
@@ -583,6 +597,38 @@ impl AuthManager {
         })
     }
 
+    pub fn active_sessions(
+        &self,
+        context: &Context,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<ActiveSession>, AuthError> {
+        let _gate = self.session_gate.lock().map_err(|_| AuthError::Storage)?;
+        let memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
+        self.sessions
+            .list(context.generation, context.id, now, &memory.contexts)
+    }
+
+    pub fn revoke_session(
+        &self,
+        context: &Context,
+        id: Uuid,
+        now: DateTime<Utc>,
+    ) -> Result<(), AuthError> {
+        let _gate = self.session_gate.lock().map_err(|_| AuthError::Storage)?;
+        let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
+        if !self
+            .sessions
+            .list(context.generation, context.id, now, &memory.contexts)?
+            .iter()
+            .any(|session| session.id == id)
+        {
+            return Err(AuthError::NotFound);
+        }
+        self.sessions.delete_by_id(id, context.generation)?;
+        memory.remove_context(id);
+        Ok(())
+    }
+
     pub fn revoke(&self, context: &Context) -> Result<(), AuthError> {
         let mut attempt = crate::observability::AuthAttempt::new(
             if context.nostr_pubkey.is_some() {
@@ -605,14 +651,7 @@ impl AuthManager {
             self.sessions.delete(&context.key)?;
         }
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
-        memory.contexts.remove(&context.key);
-        memory
-            .nostr_pending
-            .retain(|_, (owner, _)| *owner != context.id);
-        memory
-            .ceremonies
-            .retain(|_, ceremony| ceremony.owner != context.id);
-        memory.grants.retain(|_, grant| grant.owner != context.id);
+        memory.remove_context(context.id);
         Ok(())
     }
 
@@ -1157,6 +1196,13 @@ impl AuthManager {
 }
 
 impl Memory {
+    fn remove_context(&mut self, id: Uuid) {
+        self.contexts.retain(|_, context| context.id != id);
+        self.nostr_pending.retain(|_, (owner, _)| *owner != id);
+        self.ceremonies.retain(|_, ceremony| ceremony.owner != id);
+        self.grants.retain(|_, grant| grant.owner != id);
+    }
+
     fn live_session_keys(&self, now: DateTime<Utc>) -> Vec<[u8; 32]> {
         self.contexts
             .values()
@@ -1283,6 +1329,111 @@ mod tests {
 
     fn fixed_now() -> DateTime<Utc> {
         "2026-10-21T12:00:00Z".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn active_sessions_use_live_idle_expiry_and_exclude_expired_and_other_generations() {
+        let (_directory, manager, settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let caller = manager.create_context(now, 0, true, identity()).unwrap();
+        let idle = manager.create_context(now, 0, true, identity()).unwrap();
+        let absolute = manager.create_context(now, 0, true, identity()).unwrap();
+        let previous = manager.create_context(now, 0, true, identity()).unwrap();
+        let absolute_id = absolute.context.id.to_string();
+        let previous_id = previous.context.id.to_string();
+        manager
+            .journal
+            .run(move |connection| {
+                connection.execute(
+                    "UPDATE sessions SET expires_at=?1 WHERE context_id=?2",
+                    params![now.timestamp(), absolute_id],
+                )?;
+                connection.execute(
+                    "UPDATE sessions SET generation=1 WHERE context_id=?1",
+                    [previous_id],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        // Keep a session alive in memory beyond the coalesced disk idle deadline.
+        let just_before_idle = idle.context.idle_expires_at - Duration::seconds(1);
+        let mut cached = caller.context.clone();
+        cached.idle_expires_at = idle.context.idle_expires_at + Duration::seconds(10);
+        cached.nostr_pubkey = Some("ab".repeat(32));
+        manager.sessions.refresh(&cached).unwrap();
+        manager
+            .memory
+            .lock()
+            .unwrap()
+            .contexts
+            .insert(cached.key, cached.clone());
+        let rows = manager
+            .active_sessions(&cached, just_before_idle + Duration::seconds(1))
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].id, caller.context.id);
+        assert_eq!(rows[0].idle_expires_at, cached.idle_expires_at);
+        assert_eq!(rows[0].method, "nostr");
+        assert_eq!(rows[0].nostr_pubkey, cached.nostr_pubkey);
+        assert!(matches!(
+            manager.revoke_session(&cached, idle.context.id, idle.context.idle_expires_at),
+            Err(AuthError::NotFound)
+        ));
+        assert!(matches!(
+            manager.revoke_session(&cached, absolute.context.id, now),
+            Err(AuthError::NotFound)
+        ));
+        assert!(matches!(
+            manager.revoke_session(&cached, previous.context.id, now),
+            Err(AuthError::NotFound)
+        ));
+        manager
+            .revoke_session(&cached, caller.context.id, idle.context.idle_expires_at)
+            .unwrap();
+        assert!(!manager
+            .memory
+            .lock()
+            .unwrap()
+            .contexts
+            .contains_key(&cached.key));
+        let restarted = AuthManager::new(&settings, manager.journal.clone()).unwrap();
+        assert!(restarted
+            .active_sessions(&cached, idle.context.idle_expires_at)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn active_sessions_list_and_revoke_uncached_persisted_sessions() {
+        let (_directory, manager, settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let caller = manager.create_context(now, 0, true, identity()).unwrap();
+        let other = manager
+            .create_context(now + Duration::seconds(1), 0, true, identity())
+            .unwrap();
+        let restarted = AuthManager::new(&settings, manager.journal.clone()).unwrap();
+        assert!(restarted.memory.lock().unwrap().contexts.is_empty());
+        let rows = restarted
+            .active_sessions(&caller.context, now + Duration::seconds(2))
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, other.context.id);
+        restarted
+            .revoke_session(
+                &caller.context,
+                other.context.id,
+                now + Duration::seconds(2),
+            )
+            .unwrap();
+        assert!(restarted
+            .context(&other.cookie, true, now + Duration::seconds(2))
+            .await
+            .is_err());
+        assert!(restarted
+            .context(&caller.cookie, true, now + Duration::seconds(2))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
