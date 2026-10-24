@@ -100,7 +100,19 @@ CREATE TABLE nostr_challenges (
 CREATE TABLE nostr_replays (event_id TEXT PRIMARY KEY, expires_at INTEGER NOT NULL);
 ";
 
-const MIGRATIONS: &[&str] = &[BASELINE, METADATA, ENGINE, NOSTR];
+const SESSIONS: &str = "
+CREATE TABLE sessions (
+ key BLOB PRIMARY KEY CHECK(length(key)=32), context_id TEXT NOT NULL,
+ csrf TEXT NOT NULL, generation INTEGER NOT NULL,
+ identity_kind TEXT NOT NULL CHECK(identity_kind IN ('socket','forwarded')),
+ identity_ip TEXT NOT NULL, nostr_pubkey TEXT,
+ created_at INTEGER NOT NULL, expires_at INTEGER NOT NULL,
+ idle_expires_at INTEGER NOT NULL, last_authenticated_at INTEGER NOT NULL
+);
+CREATE INDEX sessions_expiry ON sessions(expires_at);
+";
+
+const MIGRATIONS: &[&str] = &[BASELINE, METADATA, ENGINE, NOSTR, SESSIONS];
 
 pub(crate) fn register_functions(connection: &Connection) -> Result<(), JournalError> {
     connection.create_scalar_function(

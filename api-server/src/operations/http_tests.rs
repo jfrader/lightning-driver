@@ -520,12 +520,11 @@ async fn unknown_restart_removed_node_and_revoked_session_never_redispatch() {
     f.reopen().await;
     let (status, _, _) = call(
         &f.state,
-        get(&path(&operation, "")).cookie(old_cookie.clone()),
-        "Operation",
+        get("/api/v1/session").cookie(old_cookie.clone()),
+        "Session",
     )
     .await;
-    assert_eq!(status, StatusCode::UNAUTHORIZED);
-    browser = login(&f.state, Some(browser.authenticator)).await;
+    assert_eq!(status, StatusCode::OK);
     assert_eq!(
         confirm(&f.state, &browser, &operation, Value::Null).await.0,
         StatusCode::OK
@@ -545,7 +544,6 @@ async fn unknown_restart_removed_node_and_revoked_session_never_redispatch() {
     f.state = ApplicationState::new(&f.settings, f.state.journal.clone())
         .await
         .unwrap();
-    browser = login(&f.state, Some(browser.authenticator)).await;
     let before = f.fake.counts();
     assert_eq!(
         confirm(&f.state, &browser, &operation, Value::Null).await.0,

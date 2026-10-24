@@ -463,9 +463,8 @@ async fn lost_address_response_remains_unknown_across_restart_without_redispatch
         f.restart().await;
         assert_eq!(
             confirm(&f.state, &browser, &op, Value::Null).await.0,
-            StatusCode::UNAUTHORIZED
+            StatusCode::OK
         );
-        let browser = login(&f.state, Some(browser.authenticator)).await;
         assert_eq!(f.observe(&browser, &op).await["state"], "unknown");
         assert_eq!(
             confirm(&f.state, &browser, &op, Value::Null).await.0,

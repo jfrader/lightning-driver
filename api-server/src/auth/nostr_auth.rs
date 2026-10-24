@@ -313,12 +313,15 @@ impl AuthManager {
         let context = context.clone();
         let manager = self.clone();
         self.journal.run(move |connection| {
+            let _gate = manager.session_gate.lock().map_err(|_| JournalError::Storage)?;
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let generation: i64 = tx.query_row("SELECT generation FROM auth_meta WHERE singleton=1", [], |row| row.get(0))?;
             let mut memory = manager.memory.lock().map_err(|_| JournalError::Storage)?;
             memory.prune(now);
             let Some(live) = memory.contexts.get(&context.key) else { return Ok(Err(AuthError::Session)); };
             if live.id != context.id || live.generation != generation || expires <= now { return Ok(Err(AuthError::Session)); }
+            let admission = memory.admit_challenge(&context, manager.limits.max_challenges);
+            drop(memory);
             if binding.purpose == "login" {
                 let count: i64 = tx.query_row("SELECT count(*) FROM nostr_identities", [], |row| row.get(0))?;
                 if count == 0 { return Ok(Err(AuthError::Authentication)); }
@@ -333,10 +336,11 @@ impl AuthManager {
                 let count: i64 = tx.query_row("SELECT (SELECT count(*) FROM credentials)+(SELECT count(*) FROM nostr_identities)", [], |row| row.get(0))?;
                 if count <= 1 { return Ok(Err(AuthError::LastCredential)); }
             }
+            if let Err(error) = admission { return Ok(Err(error)); }
             tx.execute("DELETE FROM nostr_challenges WHERE expires_at<=?1 OR generation<>?2", params![now.timestamp(), generation])?;
-            if let Err(error) = memory.admit_challenge(&context, manager.limits.max_challenges) { return Ok(Err(error)); }
             tx.execute("INSERT INTO nostr_challenges(id,owner,generation,nonce_hash,binding,expires_at) VALUES(?1,?2,?3,?4,?5,?6)", params![id.to_string(),context.id.to_string(),generation,nonce_hash,serde_json::to_string(&binding)?,expires.timestamp()])?;
             tx.commit()?;
+            let mut memory = manager.memory.lock().map_err(|_| JournalError::Storage)?;
             memory.nostr_pending.insert(id, (context.id, expires));
             Ok(Ok(()))
         }).await??;
@@ -400,9 +404,10 @@ impl AuthManager {
         let manager = self.clone();
         self.journal
             .run(move |connection| {
-                // Only WAL reads occur here. Hold the context lock while reading so a
-                // concurrent rotation cannot pair an old challenge with a revoked context.
-                let memory = manager.memory.lock().map_err(|_| JournalError::Storage)?;
+                let _gate = manager
+                    .session_gate
+                    .lock()
+                    .map_err(|_| JournalError::Storage)?;
                 let Some(challenge) = StoredChallenge::load(connection, id)? else {
                     return Ok(Err(AuthError::Challenge));
                 };
@@ -411,6 +416,7 @@ impl AuthManager {
                     [],
                     |row| row.get(0),
                 )?;
+                let memory = manager.memory.lock().map_err(|_| JournalError::Storage)?;
                 Ok(challenge.validate(&context, generation, &memory, now))
             })
             .await?
@@ -434,12 +440,13 @@ impl AuthManager {
             .map_err(|_| AuthError::Storage)?;
         self.journal.run(move |connection| {
             let _permit = permit;
+            let _gate = manager.session_gate.lock().map_err(|_| JournalError::Storage)?;
             let mut attempt = crate::observability::AuthAttempt::new(crate::observability::Method::Nostr, crate::observability::AuthAction::Challenge);
             let tx = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let Some(challenge) = StoredChallenge::load(&tx, finish.challenge_id)? else { return Ok(Err(AuthError::Challenge)); };
+            let current: i64 = tx.query_row("SELECT generation FROM auth_meta WHERE singleton=1", [], |row| row.get(0))?;
             let mut memory = manager.memory.lock().map_err(|_| JournalError::Storage)?;
             memory.prune(now);
-            let current: i64 = tx.query_row("SELECT generation FROM auth_meta WHERE singleton=1", [], |row| row.get(0))?;
             if let Err(error) = challenge.validate(&context, current, &memory, now) { return Ok(Err(error)); }
             let StoredChallenge { generation, nonce_hash, binding, .. } = challenge;
             attempt.action(crate::observability::AuthAction::nostr(&binding.purpose));
@@ -455,6 +462,8 @@ impl AuthManager {
                     memory.nostr_failures.remove(&oldest);
                 }
             }
+            let live_keys = memory.live_session_keys(now);
+            drop(memory);
             let verified = (|| -> Result<String, AuthError> {
                 match (&binding.operation, &operation) {
                     (None, None) => {},
@@ -475,7 +484,7 @@ impl AuthManager {
             let key = match verified {
                 Ok(key) => key,
                 Err(error) => {
-                    memory.nostr_failures.entry(context.id).or_default().push_back(now);
+                    manager.memory.lock().map_err(|_| JournalError::Storage)?.nostr_failures.entry(context.id).or_default().push_back(now);
                     tx.execute("UPDATE nostr_challenges SET attempts=attempts+1 WHERE id=?1", [finish.challenge_id.to_string()])?;
                     tx.commit()?;
                     return Ok(Err(error));
@@ -491,8 +500,8 @@ impl AuthManager {
             let replays: i64 = tx.query_row("SELECT count(*) FROM nostr_replays", [], |row| row.get(0))?;
             if replays >= manager.limits.max_challenges as i64 { return Ok(Err(AuthError::Limited)); }
             let session = if matches!(binding.purpose.as_str(), "login" | "enrollment") {
-                if memory.contexts.values().filter(|context| context.last_authenticated_at.is_some()).count() >= manager.limits.max_sessions {
-                    return Ok(Err(AuthError::Limited));
+                if let Err(error) = SessionStore::admit(&tx, generation, manager.limits.max_sessions, now, &live_keys) {
+                    return Ok(Err(error));
                 }
                 let mut session = manager.build_context(now, generation, true, context.identity);
                 session.context.nostr_pubkey = Some(key.clone());
@@ -516,14 +525,21 @@ impl AuthManager {
                 if count <= 1 { return Ok(Err(AuthError::LastCredential)); }
                 tx.execute("DELETE FROM nostr_identities WHERE pubkey=?1", [&key])?;
                 tx.execute("UPDATE auth_meta SET generation=generation+1 WHERE singleton=1", [])?;
+                tx.execute("DELETE FROM sessions WHERE generation<=?1", [generation])?;
             } else {
                 tx.execute("UPDATE nostr_identities SET last_used_at=?2 WHERE pubkey=?1", params![key,now.timestamp()])?;
+            }
+            if let Some(session) = &session {
+                if let Err(error) = SessionStore::insert(&tx, &session.context) {
+                    return Ok(Err(error));
+                }
             }
             tx.execute("UPDATE nostr_challenges SET attempts=?2 WHERE id=?1", params![finish.challenge_id.to_string(),CONSUMED_ATTEMPTS])?;
             tx.execute("INSERT INTO nostr_replays(event_id,expires_at) VALUES(?1,?2)", params![finish.event.id,(now + Duration::seconds(TTL_SECONDS)).timestamp()])?;
             tx.commit()?;
+            let mut memory = manager.memory.lock().map_err(|_| JournalError::Storage)?;
             memory.nostr_pending.remove(&finish.challenge_id);
-            // SQLite commit and session rotation share the live-context lock with logout.
+            // SQLite commit and session rotation share the session gate with logout.
             // No authority enters memory before durable challenge/token consumption.
             if let Some(session) = &session {
                 memory.contexts.remove(&context.key);
@@ -599,15 +615,7 @@ impl AuthManager {
         }
         self.verify_nostr(context, finish, Some(operation), now)
             .await?;
-        let refreshed = {
-            let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
-            let live = memory
-                .contexts
-                .get_mut(&context.key)
-                .ok_or(AuthError::Session)?;
-            live.last_authenticated_at = Some(now);
-            live.clone()
-        };
+        let refreshed = self.refresh_authentication(context, now)?;
         self.issue_grant(&refreshed, operation, now)
     }
 }

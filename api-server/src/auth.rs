@@ -20,9 +20,11 @@ use webauthn_rs::prelude::*;
 use zeroize::Zeroizing;
 
 mod nostr_auth;
+mod session_store;
 pub use nostr_auth::{
     NostrAuthorizationStart, NostrChallenge, NostrFinish, NostrIdentity, NostrOutcome, NostrStart,
 };
+use session_store::SessionStore;
 
 const MAX_AUTHENTICATORS: usize = 16;
 const MAX_RATE_BUCKETS: usize = 256;
@@ -103,6 +105,8 @@ pub struct AuthManager {
     public_origin: url::Url,
     webauthn: Arc<Webauthn>,
     journal: Journal,
+    sessions: SessionStore,
+    session_gate: Arc<Mutex<()>>,
     limits: Limits,
     admission: AdmissionLimits,
     policy: ReauthPolicy,
@@ -362,6 +366,8 @@ impl AuthManager {
         Ok(Self {
             public_origin: settings.public_origin.clone(),
             webauthn: Arc::new(webauthn),
+            sessions: SessionStore::new(journal.path()),
+            session_gate: Arc::new(Mutex::new(())),
             journal,
             limits: settings.limits.clone(),
             admission: AdmissionLimits::from(&settings.limits),
@@ -416,33 +422,42 @@ impl AuthManager {
         identity: ClientIdentity,
     ) -> Result<NewContext, AuthError> {
         let new = self.build_context(now, generation, authenticated, identity);
-        let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
-        if memory
-            .contexts
-            .values()
-            .any(|context| context.generation > generation)
+        let _gate = self.session_gate.lock().map_err(|_| AuthError::Storage)?;
         {
-            return Err(AuthError::Session);
-        }
-        memory
-            .contexts
-            .retain(|_, context| context.generation >= generation);
-        memory.prune(now);
-        if authenticated {
+            let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
             if memory
                 .contexts
                 .values()
-                .filter(|context| context.last_authenticated_at.is_some())
-                .count()
-                >= self.limits.max_sessions
+                .any(|context| context.generation > generation)
             {
-                return Err(AuthError::Limited);
+                return Err(AuthError::Session);
             }
-        } else {
-            memory.make_anonymous_room(identity, &self.admission, now)?;
+            memory
+                .contexts
+                .retain(|_, context| context.generation >= generation);
+            memory.prune(now);
+            if !authenticated {
+                memory.make_anonymous_room(identity, &self.admission, now)?;
+            }
         }
+        let live_keys = self.live_session_keys(now)?;
+        if authenticated {
+            self.sessions
+                .create(&new.context, self.limits.max_sessions, now, &live_keys)?;
+        } else {
+            self.sessions.maintain(generation, now, &live_keys)?;
+        }
+        let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
         memory.contexts.insert(new.context.key, new.context.clone());
         Ok(new)
+    }
+
+    fn live_session_keys(&self, now: DateTime<Utc>) -> Result<Vec<[u8; 32]>, AuthError> {
+        Ok(self
+            .memory
+            .lock()
+            .map_err(|_| AuthError::Storage)?
+            .live_session_keys(now))
     }
 
     fn build_context(
@@ -491,32 +506,52 @@ impl AuthManager {
             return Err(AuthError::Session);
         }
         let key = token_hash(cookie.as_bytes());
-        {
-            let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
-            memory.prune(now);
-            let context = memory.contexts.get(&key).ok_or(AuthError::Session)?;
-            if context.last_authenticated_at.is_some() != authenticated {
-                return Err(AuthError::Session);
-            }
-        }
         let generation = self.journal.authentication().await?.1;
-        let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
-        memory
-            .contexts
-            .retain(|_, context| context.generation >= generation);
-        memory.prune(now);
-        let context = memory.contexts.get_mut(&key).ok_or(AuthError::Session)?;
-        if context.generation != generation
-            || context.last_authenticated_at.is_some() != authenticated
+        let _gate = self.session_gate.lock().map_err(|_| AuthError::Storage)?;
+        self.sessions
+            .maintain(generation, now, &self.live_session_keys(now)?)?;
+        let cached = {
+            let memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
+            memory.contexts.get(&key).cloned()
+        };
+        let mut context = match cached {
+            Some(context) => context,
+            None if authenticated => self.sessions.load(&key)?.ok_or(AuthError::Session)?,
+            None => return Err(AuthError::Session),
+        };
+        if context.last_authenticated_at.is_some() != authenticated
+            || context.generation > generation
         {
+            return Err(AuthError::Session);
+        }
+        if context.generation != generation
+            || context.expires_at <= now
+            || context.idle_expires_at <= now
+        {
+            if context.last_authenticated_at.is_some() {
+                self.sessions.delete(&key)?;
+            }
+            let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
+            memory.contexts.remove(&key);
+            memory
+                .contexts
+                .retain(|_, context| context.generation >= generation);
+            memory.prune(now);
             return Err(AuthError::Session);
         }
         if authenticated {
             context.idle_expires_at = (now
                 + Duration::seconds(i64::from(self.limits.session_idle_seconds)))
             .min(context.expires_at);
+            self.sessions.slide(&context)?;
         }
-        Ok(context.clone())
+        let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
+        memory
+            .contexts
+            .retain(|_, context| context.generation >= generation);
+        memory.prune(now);
+        memory.contexts.insert(key, context.clone());
+        Ok(context)
     }
 
     pub fn verify_csrf(context: &Context, header: &str) -> Result<(), AuthError> {
@@ -565,6 +600,10 @@ impl AuthManager {
     }
 
     fn revoke_context(&self, context: &Context) -> Result<(), AuthError> {
+        let _gate = self.session_gate.lock().map_err(|_| AuthError::Storage)?;
+        if context.last_authenticated_at.is_some() {
+            self.sessions.delete(&context.key)?;
+        }
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
         memory.contexts.remove(&context.key);
         memory
@@ -806,16 +845,32 @@ impl AuthManager {
         }
         self.verify_authentication(finish.credential, state, ceremony.generation)
             .await?;
-        let refreshed = {
-            let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
-            let refreshed = memory
-                .contexts
-                .get_mut(&context.key)
-                .ok_or(AuthError::Session)?;
-            refreshed.last_authenticated_at = Some(now);
-            refreshed.clone()
-        };
+        let refreshed = self.refresh_authentication(context, now)?;
         self.issue_grant(&refreshed, operation, now)
+    }
+
+    fn refresh_authentication(
+        &self,
+        context: &Context,
+        now: DateTime<Utc>,
+    ) -> Result<Context, AuthError> {
+        let _gate = self.session_gate.lock().map_err(|_| AuthError::Storage)?;
+        let mut refreshed = self
+            .memory
+            .lock()
+            .map_err(|_| AuthError::Storage)?
+            .contexts
+            .get(&context.key)
+            .cloned()
+            .ok_or(AuthError::Session)?;
+        refreshed.last_authenticated_at = Some(now);
+        self.sessions.refresh(&refreshed)?;
+        self.memory
+            .lock()
+            .map_err(|_| AuthError::Storage)?
+            .contexts
+            .insert(context.key, refreshed.clone());
+        Ok(refreshed)
     }
 
     pub fn consume_grant(
@@ -912,6 +967,7 @@ impl AuthManager {
         let expires = (now + Duration::seconds(i64::from(self.limits.challenge_seconds)))
             .min(context.expires_at)
             .min(context.idle_expires_at);
+        let _gate = self.session_gate.lock().map_err(|_| AuthError::Storage)?;
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
         memory.prune(now);
         if !memory.contexts.contains_key(&context.key) {
@@ -1101,6 +1157,18 @@ impl AuthManager {
 }
 
 impl Memory {
+    fn live_session_keys(&self, now: DateTime<Utc>) -> Vec<[u8; 32]> {
+        self.contexts
+            .values()
+            .filter(|context| {
+                context.last_authenticated_at.is_some()
+                    && context.expires_at > now
+                    && context.idle_expires_at > now
+            })
+            .map(|context| context.key)
+            .collect()
+    }
+
     fn admit_challenge(&self, context: &Context, maximum: usize) -> Result<(), AuthError> {
         let capacity = if context.last_authenticated_at.is_none() {
             maximum - maximum / AUTHENTICATED_CHALLENGE_RESERVE_DIVISOR
@@ -1215,6 +1283,285 @@ mod tests {
 
     fn fixed_now() -> DateTime<Utc> {
         "2026-10-21T12:00:00Z".parse().unwrap()
+    }
+
+    #[tokio::test]
+    async fn signed_in_session_and_csrf_survive_restart() {
+        let (_directory, manager, settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let mut authenticator = WebauthnAuthenticator::new(SoftPasskey::new(true));
+        enroll(&manager, &settings, &mut authenticator, now).await;
+        let anonymous = manager.anonymous(identity(), now).await.unwrap();
+        let challenge = manager.start_login(&anonymous.context, now).await.unwrap();
+        let credential = authenticator
+            .do_authentication(settings.public_origin.clone(), challenge.options)
+            .unwrap();
+        let signed_in = manager
+            .finish_login(
+                &anonymous.context,
+                AuthenticationFinish {
+                    challenge_id: challenge.challenge_id,
+                    credential,
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        let csrf = AuthManager::csrf(&signed_in.context).to_owned();
+        drop(manager);
+        let journal = Journal::open(settings.database.clone()).await.unwrap();
+        let restarted = AuthManager::new(&settings, journal).unwrap();
+        let restored = restarted
+            .context(&signed_in.cookie, true, now + Duration::seconds(1))
+            .await
+            .unwrap();
+        assert_eq!(restored.id, signed_in.context.id);
+        assert_eq!(restored.identity, signed_in.context.identity);
+        assert_eq!(restored.last_authenticated_at, Some(now));
+        assert_eq!(AuthManager::csrf(&restored), csrf);
+        AuthManager::verify_csrf(&restored, &csrf).unwrap();
+        assert!(matches!(
+            restarted.context(&signed_in.cookie, false, now).await,
+            Err(AuthError::Session)
+        ));
+        assert!(restarted
+            .context(&signed_in.cookie, true, now)
+            .await
+            .is_ok());
+        assert!(restarted
+            .sessions
+            .load(&signed_in.context.key)
+            .unwrap()
+            .is_some());
+        assert!(matches!(
+            restarted.context(&anonymous.cookie, false, now).await,
+            Err(AuthError::Session)
+        ));
+    }
+
+    #[tokio::test]
+    async fn revoked_and_expired_sessions_stay_rejected_after_restart() {
+        let (_directory, manager, settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let revoked = manager.create_context(now, 0, true, identity()).unwrap();
+        let idle = manager.create_context(now, 0, true, identity()).unwrap();
+        let absolute = manager.create_context(now, 0, true, identity()).unwrap();
+        manager.revoke(&revoked.context).unwrap();
+        drop(manager);
+        let journal = Journal::open(settings.database.clone()).await.unwrap();
+        let restarted = AuthManager::new(&settings, journal).unwrap();
+        for (session, at) in [
+            (&revoked, now),
+            (&idle, idle.context.idle_expires_at),
+            (&absolute, absolute.context.expires_at),
+        ] {
+            assert!(matches!(
+                restarted.context(&session.cookie, true, at).await,
+                Err(AuthError::Session)
+            ));
+            assert!(restarted
+                .sessions
+                .load(&session.context.key)
+                .unwrap()
+                .is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn older_generation_sessions_are_deleted_after_restart() {
+        let (_directory, manager, settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let session = manager.create_context(now, 0, true, identity()).unwrap();
+        // Simulate a generation change made by an already-running journal owner.
+        manager
+            .journal
+            .run(|connection| {
+                connection.execute(
+                    "UPDATE auth_meta SET generation=generation+1 WHERE singleton=1",
+                    [],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        drop(manager);
+        let journal = Journal::open(settings.database.clone()).await.unwrap();
+        let restarted = AuthManager::new(&settings, journal).unwrap();
+        assert!(matches!(
+            restarted.context(&session.cookie, true, now).await,
+            Err(AuthError::Session)
+        ));
+        assert!(restarted
+            .sessions
+            .load(&session.context.key)
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn authenticated_session_cap_counts_persisted_sessions_after_restart() {
+        let (_directory, manager, mut settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let session = manager.create_context(now, 0, true, identity()).unwrap();
+        drop(manager);
+        settings.limits.max_sessions = 1;
+        let journal = Journal::open(settings.database.clone()).await.unwrap();
+        let restarted = AuthManager::new(&settings, journal).unwrap();
+        assert!(restarted.memory.lock().unwrap().contexts.is_empty());
+        assert!(matches!(
+            restarted.create_context(now, 0, true, identity()),
+            Err(AuthError::Limited)
+        ));
+        restarted.revoke(&session.context).unwrap();
+        restarted.create_context(now, 0, true, identity()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn sliding_idle_expiry_is_persisted_only_after_thirty_seconds() {
+        let (_directory, manager, _settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let session = manager.create_context(now, 0, true, identity()).unwrap();
+        manager.journal.run(|connection| {
+            connection.execute_batch("CREATE TRIGGER reject_session_update BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'unexpected session write'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        for seconds in [1, 15, 29] {
+            let live = manager
+                .context(&session.cookie, true, now + Duration::seconds(seconds))
+                .await
+                .unwrap();
+            assert_eq!(
+                live.idle_expires_at,
+                session.context.idle_expires_at + Duration::seconds(seconds)
+            );
+            assert_eq!(
+                manager
+                    .sessions
+                    .load(&session.context.key)
+                    .unwrap()
+                    .unwrap()
+                    .idle_expires_at,
+                session.context.idle_expires_at
+            );
+        }
+        assert!(matches!(
+            manager
+                .context(&session.cookie, true, now + Duration::seconds(30))
+                .await,
+            Err(AuthError::Storage)
+        ));
+        manager
+            .journal
+            .run(|connection| {
+                connection.execute_batch("DROP TRIGGER reject_session_update;")?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        manager
+            .context(&session.cookie, true, now + Duration::seconds(30))
+            .await
+            .unwrap();
+        assert_eq!(
+            manager
+                .sessions
+                .load(&session.context.key)
+                .unwrap()
+                .unwrap()
+                .idle_expires_at,
+            session.context.idle_expires_at + Duration::seconds(30)
+        );
+    }
+
+    #[tokio::test]
+    async fn coalesced_idle_writes_do_not_expire_a_live_cached_session() {
+        let (_directory, mut manager, _settings) = manager(ReauthMode::EveryOperation).await;
+        manager.limits.max_sessions = 1;
+        let now = fixed_now();
+        let session = manager.create_context(now, 0, true, identity()).unwrap();
+        manager
+            .context(&session.cookie, true, now + Duration::seconds(29))
+            .await
+            .unwrap();
+        let later = session.context.idle_expires_at + Duration::seconds(1);
+        // Pruning another request must not discard the unflushed, live idle extension.
+        manager.anonymous(identity(), later).await.unwrap();
+        assert!(matches!(
+            manager.create_context(later, 0, true, identity()),
+            Err(AuthError::Limited)
+        ));
+        assert!(manager.context(&session.cookie, true, later).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn failed_session_writes_never_publish_authentication_or_revocation() {
+        let (_directory, manager, _settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let session = manager.create_context(now, 0, true, identity()).unwrap();
+        manager.journal.run(|connection| {
+            connection.execute_batch("CREATE TRIGGER reject_session_update BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'unexpected session write'); END;
+                CREATE TRIGGER reject_session_delete BEFORE DELETE ON sessions BEGIN SELECT RAISE(ABORT, 'unexpected session delete'); END;
+                CREATE TRIGGER reject_session_insert BEFORE INSERT ON sessions BEGIN SELECT RAISE(ABORT, 'unexpected session insert'); END;")?;
+            Ok(())
+        }).await.unwrap();
+        assert!(matches!(
+            manager.refresh_authentication(&session.context, now + Duration::seconds(1)),
+            Err(AuthError::Storage)
+        ));
+        assert_eq!(
+            manager.memory.lock().unwrap().contexts[&session.context.key].last_authenticated_at,
+            Some(now)
+        );
+        assert!(matches!(
+            manager.revoke(&session.context),
+            Err(AuthError::Storage)
+        ));
+        assert!(manager.context(&session.cookie, true, now).await.is_ok());
+        assert!(matches!(
+            manager.create_context(now, 0, true, identity()),
+            Err(AuthError::Storage)
+        ));
+        assert_eq!(manager.memory.lock().unwrap().contexts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn malformed_stored_session_is_rejected_without_panicking() {
+        let (_directory, manager, settings) = manager(ReauthMode::EveryOperation).await;
+        let now = fixed_now();
+        let session = manager
+            .create_context(
+                now,
+                0,
+                true,
+                ClientIdentity::Forwarded("2001:db8::1".parse().unwrap()),
+            )
+            .unwrap();
+        let restarted = AuthManager::new(&settings, manager.journal.clone()).unwrap();
+        assert_eq!(
+            restarted
+                .context(&session.cookie, true, now)
+                .await
+                .unwrap()
+                .identity,
+            session.context.identity
+        );
+        let key = session.context.key;
+        manager
+            .journal
+            .run(move |connection| {
+                connection.execute(
+                    "UPDATE sessions SET identity_ip='invalid' WHERE key=?1",
+                    [key.as_slice()],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let restarted = AuthManager::new(&settings, manager.journal.clone()).unwrap();
+        assert!(matches!(
+            restarted.context(&session.cookie, true, now).await,
+            Err(AuthError::Session)
+        ));
     }
 
     async fn verified_assertion(
