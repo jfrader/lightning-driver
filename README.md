@@ -94,7 +94,8 @@ there. The UI account must not own or read that state. Install binaries/assets o
 (default `/usr/local`); `ProtectHome=yes` hides home directories from both services.
 
 ```sh
-sudo deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist
+sudo deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist \
+  --artifact-manifest /path/to/manifest.json --manifest-sha256 <trusted-manifest-sha256>
 ```
 
 `--port` must match the port in `api.public_origin` (4400 by default). Re-running the script after a
@@ -106,6 +107,15 @@ and update any absolute paths in config before installing system units. Do not r
 Host enrollment/recovery commands must run as `lightning-driver-api` for this installation.
 The API sandbox permits writes only in the configured state directory; database, key and credentials
 must live there. The UI has no writable persistent paths and cannot access the state directory.
+
+Supplied artifacts require a version-1 JSON manifest and its SHA-256 from an independent trusted
+release/build channel (a checksum shipped only beside an untrusted artifact is not provenance).
+The manifest contains `ui.repository` (`https://github.com/jfrader/lightning-driver-ui`),
+`ui.revision` (full source commit) and `ui.files` (every relative asset path mapped to its SHA-256).
+With `--binary`, it also requires `api.repository` (`https://github.com/jfrader/lightning-driver`),
+`api.revision` and `api.sha256`. Extra files, symlinks, missing provenance and mismatches are rejected.
+The installer verifies a private staged snapshot before installing it. Without `--binary`, it builds
+the checked-out backend with `Cargo.lock` and `--locked`; a supplied UI still requires trusted metadata.
 
 For API-only work, run the server directly:
 

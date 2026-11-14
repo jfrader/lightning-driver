@@ -16,6 +16,8 @@ Usage: deploy/install.sh --ui-dist DIR [options]
   --prefix DIR    Install prefix for the binary, proxy and assets [default: /usr/local]
   --port PORT     UI port; must match api.public_origin [default: 4400]
   --binary PATH   Install this api-server binary instead of building the workspace
+  --artifact-manifest PATH  Trusted release manifest for the supplied UI and optional binary
+  --manifest-sha256 HEX     Manifest digest obtained through an independent trusted channel
   --no-restart    Install and enable the units without restarting running services
   -h, --help      This text
 USAGE
@@ -31,6 +33,8 @@ STATE=/var/lib/lightning-driver
 PREFIX=/usr/local
 UI_DIST=
 BINARY=
+MANIFEST=
+MANIFEST_SHA256=
 PORT=4400
 RESTART=1
 
@@ -41,6 +45,8 @@ while [ $# -gt 0 ]; do
     --prefix) PREFIX=${2:?}; shift 2 ;;
     --port) PORT=${2:?}; shift 2 ;;
     --binary) BINARY=${2:?}; shift 2 ;;
+    --artifact-manifest) MANIFEST=${2:?}; shift 2 ;;
+    --manifest-sha256) MANIFEST_SHA256=${2:?}; shift 2 ;;
     --no-restart) RESTART=0; shift ;;
     -h|--help) usage; exit 0 ;;
     *) fail "Unknown option: $1" ;;
@@ -49,6 +55,9 @@ done
 
 [ -n "$UI_DIST" ] || fail "--ui-dist is required"
 [ -f "$UI_DIST/index.html" ] || fail "$UI_DIST does not look like a built UI (missing index.html)"
+[ -n "$MANIFEST" ] && [ -n "$MANIFEST_SHA256" ] || fail "trusted --artifact-manifest and --manifest-sha256 are required"
+command -v node >/dev/null || fail "node is required for artifact verification and the UI service"
+node "$ROOT/deploy/verify-artifacts.mjs" "$MANIFEST" "$MANIFEST_SHA256" "$UI_DIST" "$BINARY" || fail "artifact verification failed"
 [ -f "$STATE/config.toml" ] || fail "$STATE/config.toml is missing; write the configuration first"
 command -v systemctl >/dev/null || fail "systemctl is required"
 [ "$(id -u)" = 0 ] || fail "installation requires root for isolated system services"
@@ -65,19 +74,33 @@ UNIT_DIR=/etc/systemd/system
 
 printf 'Building the release API\n'
 if [ -n "$BINARY" ]; then
+  SUPPLIED_BINARY=1
   [ -x "$BINARY" ] || fail "$BINARY is not an executable api-server"
   printf 'Using %s\n' "$BINARY"
 else
-  (cd "$ROOT" && CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build --release -p api-server)
-  BINARY=$ROOT/target/release/api-server
+  [ -f "$ROOT/Cargo.lock" ] || fail "Cargo.lock is required"
+  (cd "$ROOT" && CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build --locked --release -p api-server)
+  BINARY=${CARGO_TARGET_DIR:-$ROOT/target}/release/api-server
 fi
 
 printf 'Installing into %s and %s\n' "$LIB" "$SHARE"
+STAGING=$(mktemp -d)
+trap 'rm -rf "$STAGING"' EXIT
+mkdir "$STAGING/ui"
+cp -R "$UI_DIST"/. "$STAGING/ui/"
+install -m 755 "$BINARY" "$STAGING/api-server"
+# Verify the private snapshot, not a mutable caller-owned path, before publication.
+if [ -n "${MANIFEST:-}" ]; then
+  cp "$MANIFEST" "$STAGING/manifest.json"
+  VERIFIED_BINARY=
+  if [ -n "${SUPPLIED_BINARY:-}" ]; then VERIFIED_BINARY=$STAGING/api-server; fi
+  node "$ROOT/deploy/verify-artifacts.mjs" "$STAGING/manifest.json" "$MANIFEST_SHA256" "$STAGING/ui" "$VERIFIED_BINARY" || fail "staged artifact verification failed"
+fi
 install -d -m 755 "$LIB" "$(dirname "$SHARE")"
-install -m 755 "$BINARY" "$LIB/api-server"
+install -m 755 "$STAGING/api-server" "$LIB/api-server"
 install -m 644 "$ROOT/deploy/server.mjs" "$LIB/server.mjs"
 rm -rf "$SHARE"
-cp -R "$UI_DIST" "$SHARE"
+cp -R "$STAGING/ui" "$SHARE"
 
 printf 'Rendering units into %s\n' "$UNIT_DIR"
 install -d -m 755 "$UNIT_DIR"
