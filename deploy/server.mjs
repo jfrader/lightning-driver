@@ -11,6 +11,29 @@ const API_PORT = Number(process.env.API_PORT ?? 8080);
 const PORT = Number(process.env.PORT ?? 4400);
 const HOST = process.env.HOST ?? '127.0.0.1';
 
+// NIP-46 remote signing opens a WebSocket to a relay the operator chooses. Only the origins named
+// here may be reached; anything else stays blocked by `connect-src`.
+function relayOrigins(value) {
+  return (value ?? '')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((candidate) => {
+      let url;
+      try {
+        url = new URL(candidate);
+      } catch {
+        throw new Error(`RELAY_ORIGINS must list wss:// origins, got ${candidate}`);
+      }
+      if (url.protocol !== 'wss:' || url.pathname !== '/' || url.search || url.hash) {
+        throw new Error(`RELAY_ORIGINS must list wss:// origins, got ${candidate}`);
+      }
+      return url.origin;
+    });
+}
+
+const CONNECT_SRC = ["'self'", ...new Set(relayOrigins(process.env.RELAY_ORIGINS))].join(' ');
+const CONTENT_SECURITY_POLICY = `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src ${CONNECT_SRC}; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`;
+
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
   '.js': 'text/javascript; charset=utf-8',
@@ -35,7 +58,7 @@ function headersFor(urlPath, path, length, encoding) {
     'content-length': length,
     'cache-control': IMMUTABLE.test(urlPath) ? 'public, max-age=31536000, immutable' : 'no-cache',
     'x-content-type-options': 'nosniff',
-    'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    'content-security-policy': CONTENT_SECURITY_POLICY,
     'referrer-policy': 'no-referrer',
   };
   if (encoding) {

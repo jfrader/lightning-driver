@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, writeFile, rm, mkdir, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -71,8 +71,28 @@ test('documents and assets have explicit browser security headers', async t => {
     assert.equal(response.statusCode, 200);
     assert.equal(response.headers['x-content-type-options'], 'nosniff');
     assert.equal(response.headers['referrer-policy'], 'no-referrer');
+    assert.match(response.headers['content-security-policy'], /default-src 'none'/);
     assert.match(response.headers['content-security-policy'], /frame-ancestors 'none'/);
     assert.match(response.headers['content-security-policy'], /script-src 'self'/);
-    assert.match(response.headers['content-security-policy'], /connect-src 'self'/);
+    assert.equal(response.headers['content-security-policy'].match(/connect-src ([^;]+)/)[1], "'self'");
+  }
+});
+
+test('approved remote-signer relay origins extend connect-src and nothing else', async t => {
+  const { get } = await fixture(t, { RELAY_ORIGINS: 'wss://relay.example wss://relay.example:443' });
+  const response = await get('/');
+  const connect = response.headers['content-security-policy'].match(/connect-src ([^;]+)/)[1];
+  assert.equal(connect, "'self' wss://relay.example");
+  assert.match(response.headers['content-security-policy'], /default-src 'none'/);
+});
+
+test('an unapproved relay origin fails at startup', async () => {
+  for (const origin of ['https://relay.example', 'wss://relay.example/path', 'relay.example']) {
+    const rejected = spawnSync(process.execPath, ['deploy/server.mjs'], {
+      env: { ...process.env, DIST: '.', PORT: '0', RELAY_ORIGINS: origin },
+      encoding: 'utf8',
+    });
+    assert.equal(rejected.status, 1, origin);
+    assert.match(rejected.stderr, /wss:\/\/ origins/, origin);
   }
 });

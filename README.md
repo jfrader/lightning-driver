@@ -101,6 +101,18 @@ sudo deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist \
 `--port` must match the port in `api.public_origin` (4400 by default). Re-running the script after a
 rebuild upgrades both artifacts and restarts the services; it never rewrites the state directory.
 
+The static server sends `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src
+'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; …` with
+`frame-ancestors 'none'`, plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+NIP-46 remote signing connects to a relay the operator picks, so those origins are blocked by
+default: add the approved ones to the UI unit, space-separated and `wss://` only, and restart it:
+
+```ini
+Environment=RELAY_ORIGINS=wss://relay.example wss://relay2.example
+```
+
+Any other scheme, a path, a query or the absence of an explicit origin fails the server at startup.
+
 When migrating an existing user installation, stop and disable its two `systemctl --user` units first.
 Move the complete state (including the original invoice key), transfer ownership to the API account,
 and update any absolute paths in config before installing system units. Do not run both installations.
