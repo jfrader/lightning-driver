@@ -416,6 +416,11 @@ impl ApiSettings {
         {
             return Err(SettingsError("Public origin must use HTTPS"));
         }
+        if !self.bind.ip().is_loopback() {
+            return Err(SettingsError(
+                "Plaintext API listener requires a loopback bind",
+            ));
+        }
         if !matches!(
             (&self.reauth.mode, self.reauth.recent_auth_seconds),
             (ReauthMode::EveryOperation, None) | (ReauthMode::Recent, Some(1..))
@@ -584,6 +589,19 @@ mod tests {
             recent_auth_seconds: Some(0),
         };
         assert!(settings.validate().is_err());
+    }
+
+    #[test]
+    fn plaintext_listener_cannot_expose_an_https_origin() {
+        let mut settings = api("https://manager.example.invalid", false);
+        for bind in ["0.0.0.0:8080", "192.0.2.1:8080", "[::]:8080"] {
+            settings.bind = bind.parse().unwrap();
+            assert!(settings.validate().is_err(), "{bind}");
+        }
+        for bind in ["127.0.0.1:8080", "[::1]:8080"] {
+            settings.bind = bind.parse().unwrap();
+            assert!(settings.validate().is_ok(), "{bind}");
+        }
     }
 
     #[test]

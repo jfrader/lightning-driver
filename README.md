@@ -35,6 +35,10 @@ The API contract is [`api-server/openapi.json`](api-server/openapi.json); the UI
 - One `serve` process per database. It holds an exclusive lock, so bind it privately behind a TLS
   reverse proxy that preserves the `Host` header.
 
+The plaintext API listener only accepts loopback bind addresses, including when `public_origin`
+uses HTTPS. Terminate TLS on the same host. Remote proxy transport is not supported; do not expose
+the listener on a LAN or wildcard address.
+
 ## Setup
 
 Copy `config.example.toml` into the state directory, set `public_origin` and `rp_id` to the exact
