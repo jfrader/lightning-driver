@@ -533,6 +533,121 @@ impl CountingFake {
 }
 impl Reads for CountingFake {}
 
+#[tokio::test]
+async fn cancelling_a_preparing_review_releases_its_shared_permit() {
+    struct SlowPrepare {
+        inner: Arc<CountingFake>,
+        entered: Arc<tokio::sync::Notify>,
+    }
+    impl Reads for SlowPrepare {}
+    impl Adapter for SlowPrepare {
+        fn prepare<'a>(&'a self, _: &'a OperationRequest) -> ResponseFuture<'a, Result<ReadFacts>> {
+            Box::pin(async move {
+                self.entered.notify_one();
+                std::future::pending().await
+            })
+        }
+        fn execute_once(&self, permit: ClaimPermit) -> ResponseFuture<'_, Evidence> {
+            self.inner.execute_once(permit)
+        }
+        fn observe_exact(&self, query: ObservationQuery) -> ResponseFuture<'_, Evidence> {
+            self.inner.observe_exact(query)
+        }
+    }
+    let f = Fixture::new().await;
+    let entered = Arc::new(tokio::sync::Notify::new());
+    f.engine
+        .nodes
+        .get(&f.node)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .as_mut()
+        .unwrap()
+        .adapter = Arc::new(SlowPrepare {
+        inner: f.fake.clone(),
+        entered: entered.clone(),
+    });
+    let occupied = f.engine.tasks.acquire_many(63).await.unwrap();
+    let engine = f.engine.clone();
+    let context = f.context.clone();
+    let node = f.node.clone();
+    let request = request(OperationKind::NewAddress, f.clock.now());
+    let task = tokio::spawn(async move {
+        engine
+            .create_review(&context, &node, Uuid::new_v4(), request)
+            .await
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(f.engine.tasks.available_permits(), 0);
+    assert_eq!(
+        f.engine
+            .read_node(&f.node, ReadQuery::Info)
+            .await
+            .err()
+            .unwrap()
+            .code,
+        ErrorCode::RateLimited
+    );
+    assert!(f
+        .engine
+        .dispatch_once(&f.context, &f.node, Uuid::new_v4(), "unused", None)
+        .await
+        .is_err());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(f.engine.tasks.available_permits(), 1);
+    drop(occupied);
+    assert_eq!(f.engine.tasks.available_permits(), 64);
+}
+
+#[tokio::test]
+async fn reviews_share_admission_with_reads_and_confirms_and_release_on_errors() {
+    let f = Fixture::new().await;
+    let occupied = f.engine.tasks.acquire_many(64).await.unwrap();
+    let review = f
+        .engine
+        .create_review(
+            &f.context,
+            &f.node,
+            Uuid::new_v4(),
+            request(OperationKind::NewAddress, f.clock.now()),
+        )
+        .await;
+    assert_eq!(review.unwrap_err().code(), ErrorCode::RateLimited);
+    assert_eq!(f.fake.preparations.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        f.engine
+            .read_node(&f.node, ReadQuery::Info)
+            .await
+            .err()
+            .unwrap()
+            .code,
+        ErrorCode::RateLimited
+    );
+    assert!(f
+        .engine
+        .dispatch_once(&f.context, &f.node, Uuid::new_v4(), "unused", None)
+        .await
+        .is_err());
+    drop(occupied);
+    assert!(f
+        .engine
+        .create_review(
+            &f.context,
+            &f.node,
+            Uuid::nil(),
+            request(OperationKind::NewAddress, f.clock.now())
+        )
+        .await
+        .is_err());
+    assert_eq!(f.engine.tasks.available_permits(), 64);
+    f.create(OperationKind::NewAddress).await;
+    assert_eq!(f.engine.tasks.available_permits(), 64);
+}
+
 impl Adapter for CountingFake {
     fn prepare<'a>(&'a self, _: &'a OperationRequest) -> ResponseFuture<'a, Result<ReadFacts>> {
         self.preparations.fetch_add(1, Ordering::SeqCst);

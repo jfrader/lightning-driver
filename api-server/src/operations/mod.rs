@@ -348,6 +348,10 @@ impl Engine {
         key: Uuid,
         request: OperationRequest,
     ) -> Result<(Operation, bool)> {
+        let _slot = self
+            .tasks
+            .try_acquire()
+            .map_err(|_| failure(ErrorCode::RateLimited))?;
         self.live(context).await?;
         let pinned = self.pinned(node)?;
         writable(&pinned.config)?;
