@@ -99,6 +99,14 @@ Refreshes run at most eight node reads concurrently and share one `api.limits.rp
 unfinished reads are cancelled. A later fleet request can refresh again. Individual node reads still
 refresh their own observation before answering.
 
+## Proxy identity
+
+The UI proxy overwrites `X-Real-IP` with its TCP peer and strips `Forwarded`/`X-Forwarded-For`.
+For `trusted_single_proxy`, configure the API's trusted CIDRs to contain only the UI proxy's socket
+address and select `header = "x-real-ip"`. Never trust client-provided headers at that ingress.
+An outer TLS proxy is not an additional trusted identity hop: its clients share that proxy's rate
+bucket. The default API `socket_peer` policy similarly groups clients behind the UI proxy.
+
 1. Filter `read_failure` by `node_id` and `surface`. Check `error_code` and `stale`; compare the response's observation time with the current time. `stale=true` is not current node state.
 2. Restore connectivity/permissions or correct the verified identity/network mismatch. Identity/network mismatches invalidate Bitcoin/watchtower caches; tower-detail reads cannot return a stale fallback.
 3. Wait at least `api.limits.rpc_seconds`, then refresh the surface. A successful read has no log; confirm freshness from the API/UI. For `rate_limited`, wait the advertised delay and reduce polling/concurrency; do not raise limits without checking capacity.

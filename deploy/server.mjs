@@ -43,8 +43,12 @@ function headersFor(urlPath, path, length, encoding) {
 }
 
 function proxy(req, res) {
+  // This ingress trusts the TCP peer only, never client-supplied forwarding headers.
+  const headers = { ...req.headers, 'x-real-ip': req.socket.remoteAddress?.replace(/^::ffff:/, '') };
+  delete headers.forwarded;
+  delete headers['x-forwarded-for'];
   const upstream = request(
-    { host: API_HOST, port: API_PORT, method: req.method, path: req.url, headers: req.headers },
+    { host: API_HOST, port: API_PORT, method: req.method, path: req.url, headers },
     (answer) => {
       res.writeHead(answer.statusCode ?? 502, answer.headers);
       answer.pipe(res);

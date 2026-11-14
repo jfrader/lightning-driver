@@ -4,13 +4,13 @@ import { spawn } from 'node:child_process';
 import { mkdtemp, writeFile, rm, mkdir, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { request } from 'node:http';
+import { request, createServer } from 'node:http';
 
-async function fixture(t) {
+async function fixture(t, env = {}) {
   const root = await mkdtemp(join(tmpdir(), 'ld-ui-'));
   await writeFile(join(root, 'index.html'), '<html>UI</html>');
   const child = spawn(process.execPath, ['deploy/server.mjs'], {
-    env: { ...process.env, DIST: root, PORT: '0', HOST: '127.0.0.1' },
+    env: { ...process.env, DIST: root, PORT: '0', HOST: '127.0.0.1', ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   t.after(async () => {
@@ -22,8 +22,8 @@ async function fixture(t) {
     child.once('error', reject);
     child.stdout.once('data', data => resolve(String(data).match(/http:\/\/([^ ]+)/)[1]));
   });
-  return { root, get: path => new Promise((resolve, reject) => {
-    request(`http://${address}`, { path }, res => {
+  return { root, get: (path, headers) => new Promise((resolve, reject) => {
+    request(`http://${address}`, { path, headers }, res => {
       res.resume();
       res.on('end', () => resolve(res));
     }).on('error', reject).end();
@@ -34,6 +34,20 @@ test('malformed URL is rejected without killing the server', async t => {
   const { get } = await fixture(t);
   assert.equal((await get('/%E0%A4%A')).statusCode, 400);
   assert.equal((await get('/')).statusCode, 200);
+});
+
+test('ingress overwrites spoofed client identity with its TCP peer', async t => {
+  let received;
+  const api = createServer((req, res) => { received = req.headers; res.end('ok'); });
+  await new Promise(resolve => api.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => api.close(resolve)));
+  const { get } = await fixture(t, { API_PORT: String(api.address().port) });
+  assert.equal((await get('/api/v1/auth/bootstrap', {
+    'x-real-ip': '192.0.2.99', 'x-forwarded-for': '192.0.2.98', forwarded: 'for=192.0.2.97',
+  })).statusCode, 200);
+  assert.equal(received['x-real-ip'], '127.0.0.1');
+  assert.equal(received['x-forwarded-for'], undefined);
+  assert.equal(received.forwarded, undefined);
 });
 
 test('static files cannot escape into prefix siblings or external symlinks', async t => {
