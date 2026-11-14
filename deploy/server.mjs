@@ -34,6 +34,9 @@ function headersFor(urlPath, path, length, encoding) {
     'content-type': TYPES[extname(path)] ?? 'application/octet-stream',
     'content-length': length,
     'cache-control': IMMUTABLE.test(urlPath) ? 'public, max-age=31536000, immutable' : 'no-cache',
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    'referrer-policy': 'no-referrer',
   };
   if (encoding) {
     headers['content-encoding'] = encoding;

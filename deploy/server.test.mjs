@@ -62,3 +62,17 @@ test('static files cannot escape into prefix siblings or external symlinks', asy
   assert.equal((await get('/escape')).statusCode, 403);
   assert.equal((await get('/valid.js')).statusCode, 200);
 });
+
+test('documents and assets have explicit browser security headers', async t => {
+  const { root, get } = await fixture(t);
+  await writeFile(join(root, 'asset.js'), 'console.log(1)');
+  for (const path of ['/', '/asset.js']) {
+    const response = await get(path);
+    assert.equal(response.statusCode, 200);
+    assert.equal(response.headers['x-content-type-options'], 'nosniff');
+    assert.equal(response.headers['referrer-policy'], 'no-referrer');
+    assert.match(response.headers['content-security-policy'], /frame-ancestors 'none'/);
+    assert.match(response.headers['content-security-policy'], /script-src 'self'/);
+    assert.match(response.headers['content-security-policy'], /connect-src 'self'/);
+  }
+});
