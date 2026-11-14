@@ -1,37 +1,19 @@
-import { createHash } from 'node:crypto';
-import { readFile, readdir, lstat } from 'node:fs/promises';
+import { lstat, readFile } from 'node:fs/promises';
 import { join } from 'node:path';
-
-const HEX_SHA256 = /^[a-f0-9]{64}$/;
-const REVISION = /^[a-f0-9]{40}$/;
-const digest = bytes => createHash('sha256').update(bytes).digest('hex');
-
-async function filesIn(root, prefix = '') {
-  const files = [];
-  for (const name of await readdir(join(root, prefix))) {
-    const path = prefix ? `${prefix}/${name}` : name;
-    const info = await lstat(join(root, path));
-    if (info.isDirectory()) files.push(...await filesIn(root, path));
-    else if (info.isFile()) files.push(path);
-    else throw new Error(`artifact contains a symlink or special file: ${path}`);
-  }
-  return files.sort();
-}
-
-function provenance(artifact, repository) {
-  if (artifact?.repository !== repository || !REVISION.test(artifact?.revision ?? '')) {
-    throw new Error('missing or invalid artifact source provenance');
-  }
-}
+import {
+  API_REPOSITORY,
+  HEX_SHA256,
+  UI_REPOSITORY,
+  digest,
+  filesIn,
+  provenance,
+  readTrustedManifest,
+} from './artifact-manifest.mjs';
 
 try {
   const [manifestPath, trustedDigest, uiRoot, binary] = process.argv.slice(2);
-  if (!HEX_SHA256.test(trustedDigest ?? '')) throw new Error('trusted manifest SHA-256 is required');
-  const bytes = await readFile(manifestPath);
-  if (digest(bytes) !== trustedDigest) throw new Error('manifest does not match trusted SHA-256');
-  const manifest = JSON.parse(bytes);
-  if (manifest.version !== 1) throw new Error('unsupported artifact manifest version');
-  provenance(manifest.ui, 'https://github.com/jfrader/lightning-driver-ui');
+  const manifest = await readTrustedManifest(manifestPath, trustedDigest);
+  provenance(manifest.ui, UI_REPOSITORY);
   const files = await filesIn(uiRoot);
   const declared = Object.keys(manifest.ui.files ?? {}).sort();
   if (!files.includes('index.html') || JSON.stringify(files) !== JSON.stringify(declared)) {
@@ -44,7 +26,7 @@ try {
     }
   }
   if (binary) {
-    provenance(manifest.api, 'https://github.com/jfrader/lightning-driver');
+    provenance(manifest.api, API_REPOSITORY);
     if (!(await lstat(binary)).isFile() || !HEX_SHA256.test(manifest.api.sha256 ?? '') || digest(await readFile(binary)) !== manifest.api.sha256) {
       throw new Error('API integrity check failed');
     }

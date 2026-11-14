@@ -32,7 +32,7 @@ jobs:
           command -v protoc >/dev/null || (sudo apt-get update && sudo apt-get install -y protobuf-compiler)
           protoc --version
           pkg-config --modversion openssl
-      - name: Format
+      - name: Deployment scripts
         run: node --test deploy/*.test.mjs
       - name: Rust format
         run: cargo fmt --all -- --check

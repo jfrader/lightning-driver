@@ -110,6 +110,15 @@ must live there. The UI has no writable persistent paths and cannot access the s
 
 Supplied artifacts require a version-1 JSON manifest and its SHA-256 from an independent trusted
 release/build channel (a checksum shipped only beside an untrusted artifact is not provenance).
+`deploy/manifest.mjs` writes that manifest from a built UI and, optionally, a built binary, and prints
+its digest:
+
+```sh
+node deploy/manifest.mjs --ui-dist /path/to/lightning-driver-ui/dist \
+  --ui-revision <full-ui-commit> --binary target/release/api-server \
+  --api-revision <full-backend-commit> --out manifest.json
+```
+
 The manifest contains `ui.repository` (`https://github.com/jfrader/lightning-driver-ui`),
 `ui.revision` (full source commit) and `ui.files` (every relative asset path mapped to its SHA-256).
 With `--binary`, it also requires `api.repository` (`https://github.com/jfrader/lightning-driver`),
