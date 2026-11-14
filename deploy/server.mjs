@@ -1,11 +1,11 @@
 // Serves the built UI and proxies /api to the loopback API, preserving the browser's Host so the
 // API's Origin and Host checks see the same origin the browser used.
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, stat, realpath } from 'node:fs/promises';
 import { createServer, request } from 'node:http';
-import { extname, join, normalize } from 'node:path';
+import { extname, join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { gzipSync } from 'node:zlib';
 
-const DIST = process.env.DIST ?? '/usr/local/share/lightning-driver/dist';
+const DIST = await realpath(process.env.DIST ?? '/usr/local/share/lightning-driver/dist');
 const API_HOST = process.env.API_HOST ?? '127.0.0.1';
 const API_PORT = Number(process.env.API_PORT ?? 8080);
 const PORT = Number(process.env.PORT ?? 4400);
@@ -58,6 +58,8 @@ function proxy(req, res) {
 }
 
 async function send(req, res, urlPath, path) {
+  path = await realpath(path);
+  if (!contained(path)) return res.writeHead(403).end();
   const body = await readFile(path);
   const accepts = String(req.headers['accept-encoding'] ?? '');
   const type = extname(path);
@@ -74,6 +76,11 @@ async function send(req, res, urlPath, path) {
   return req.method === 'HEAD' ? res.end() : res.end(body);
 }
 
+function contained(path) {
+  const part = relative(DIST, path);
+  return part !== '..' && !part.startsWith(`..${sep}`) && !isAbsolute(part);
+}
+
 async function handle(req, res) {
   let url;
   let pathname;
@@ -85,15 +92,16 @@ async function handle(req, res) {
     return;
   }
   if (url.pathname.startsWith('/api/')) return proxy(req, res);
-  const candidate = normalize(join(DIST, pathname));
-  if (!candidate.startsWith(DIST)) {
+  const candidate = resolve(DIST, `.${sep}${pathname}`);
+  if (!contained(candidate)) {
     res.writeHead(403).end();
     return;
   }
   try {
     const info = await stat(candidate);
     if (info.isFile()) return await send(req, res, url.pathname, candidate);
-  } catch {
+  } catch (error) {
+    if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
     // fall through to the SPA entry
   }
   return await send(req, res, '/index.html', join(DIST, 'index.html'));
