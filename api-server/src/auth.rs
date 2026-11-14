@@ -124,6 +124,7 @@ struct Memory {
     ceremonies: HashMap<Uuid, Ceremony>,
     grants: HashMap<Uuid, Grant>,
     rates: HashMap<ClientIdentity, VecDeque<DateTime<Utc>>>,
+    bootstrap_rates: HashMap<ClientIdentity, VecDeque<DateTime<Utc>>>,
     verifying: HashMap<Uuid, usize>,
 }
 
@@ -396,8 +397,35 @@ impl AuthManager {
         identity: ClientIdentity,
         now: DateTime<Utc>,
     ) -> Result<(), AuthError> {
+        self.admit(identity, now, false)
+    }
+
+    pub fn admit_bootstrap(
+        &self,
+        identity: ClientIdentity,
+        now: DateTime<Utc>,
+    ) -> Result<(), AuthError> {
+        self.admit(identity, now, true)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn context_count(&self) -> usize {
+        self.memory.lock().unwrap().contexts.len()
+    }
+
+    fn admit(
+        &self,
+        identity: ClientIdentity,
+        now: DateTime<Utc>,
+        bootstrap: bool,
+    ) -> Result<(), AuthError> {
         let mut memory = self.memory.lock().map_err(|_| AuthError::Storage)?;
-        memory.rates.retain(|_, queue| {
+        let rates = if bootstrap {
+            &mut memory.bootstrap_rates
+        } else {
+            &mut memory.rates
+        };
+        rates.retain(|_, queue| {
             while queue
                 .front()
                 .is_some_and(|time| *time + Duration::seconds(RATE_WINDOW_SECONDS) <= now)
@@ -406,12 +434,10 @@ impl AuthManager {
             }
             !queue.is_empty()
         });
-        if !memory.rates.contains_key(&identity)
-            && memory.rates.len() >= self.admission.rate_buckets
-        {
+        if !rates.contains_key(&identity) && rates.len() >= self.admission.rate_buckets {
             return Err(AuthError::Limited);
         }
-        let queue = memory.rates.entry(identity).or_default();
+        let queue = rates.entry(identity).or_default();
         if queue.len() >= self.admission.starts_per_minute {
             return Err(AuthError::Limited);
         }
