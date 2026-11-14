@@ -9,6 +9,76 @@ use lightning_client::model::ErrorCode;
 use serde_json::Value;
 use std::collections::BTreeMap;
 
+const FLEET_REFRESH_CONCURRENCY: usize = 8;
+
+#[cfg(test)]
+mod fleet_tests {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    #[tokio::test]
+    async fn slow_fleet_has_one_deadline_and_bounded_cancelled_work() {
+        struct Active(Arc<AtomicUsize>);
+        impl Drop for Active {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, Ordering::SeqCst);
+            }
+        }
+        let active = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let begin = std::time::Instant::now();
+        refresh_bounded(
+            (0..100).map(|id| id.to_string()),
+            std::time::Duration::from_millis(30),
+            |_| {
+                let active = active.clone();
+                let started = started.clone();
+                async move {
+                    let _guard = Active(active.clone());
+                    assert!(active.fetch_add(1, Ordering::SeqCst) < FLEET_REFRESH_CONCURRENCY);
+                    started.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                }
+            },
+        )
+        .await;
+        assert!(begin.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(started.load(Ordering::SeqCst), FLEET_REFRESH_CONCURRENCY);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+}
+
+struct RefreshGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
+async fn refresh_bounded<I, F, Fut>(ids: I, deadline: std::time::Duration, refresh: F)
+where
+    I: IntoIterator<Item = String>,
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let mut tasks = tokio::task::JoinSet::new();
+    let _ = tokio::time::timeout(deadline, async {
+        for id in ids {
+            if tasks.len() == FLEET_REFRESH_CONCURRENCY {
+                tasks.join_next().await;
+            }
+            tasks.spawn(refresh(id));
+        }
+        while tasks.join_next().await.is_some() {}
+    })
+    .await;
+    tasks.abort_all();
+    while tasks.join_next().await.is_some() {}
+}
+
 #[derive(Default)]
 pub(crate) struct Cache {
     pub(crate) checked: Option<DateTime<Utc>>,
@@ -66,6 +136,38 @@ fn record_error(entry: &Entry, error: &ApiError, now: DateTime<Utc>) -> Result<(
 }
 
 impl ApplicationState {
+    pub(crate) fn schedule_fleet_refresh(&self) {
+        if self
+            .fleet_refreshing
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        let guard = RefreshGuard(self.fleet_refreshing.clone());
+        let state = self.clone();
+        let ids: Vec<_> = self
+            .registry
+            .entries()
+            .map(|(id, _)| id.to_owned())
+            .collect();
+        tokio::spawn(async move {
+            let _guard = guard;
+            let deadline = std::time::Duration::from_secs(u64::from(state.limits().rpc_seconds));
+            refresh_bounded(ids, deadline, |id| {
+                let state = state.clone();
+                async move {
+                    let _ = state.refresh_node(&id).await;
+                }
+            })
+            .await;
+        });
+    }
     async fn read_cache<'a>(
         &self,
         entry: &'a Entry,

@@ -94,6 +94,11 @@ This revokes existing passkeys, Nostr identities and sessions, preserves operati
 
 ## Stale reads
 
+Fleet pages serve cached observations immediately and schedule at most one background fleet refresh.
+Refreshes run at most eight node reads concurrently and share one `api.limits.rpc_seconds` deadline;
+unfinished reads are cancelled. A later fleet request can refresh again. Individual node reads still
+refresh their own observation before answering.
+
 1. Filter `read_failure` by `node_id` and `surface`. Check `error_code` and `stale`; compare the response's observation time with the current time. `stale=true` is not current node state.
 2. Restore connectivity/permissions or correct the verified identity/network mismatch. Identity/network mismatches invalidate Bitcoin/watchtower caches; tower-detail reads cannot return a stale fallback.
 3. Wait at least `api.limits.rpc_seconds`, then refresh the surface. A successful read has no log; confirm freshness from the API/UI. For `rate_limited`, wait the advertised delay and reduce polling/concurrency; do not raise limits without checking capacity.
