@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Installs a personal Lightning Driver instance as user-level systemd services.
+# Installs Lightning Driver as isolated system-level systemd services.
 #
 #   deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist
 #
@@ -12,8 +12,8 @@ usage() {
 Usage: deploy/install.sh --ui-dist DIR [options]
 
   --ui-dist DIR   Built UI assets (dist/) from the lightning-driver-ui repository. Required.
-  --state DIR     State directory with config.toml [default: ~/.local/state/lightning-driver]
-  --prefix DIR    Install prefix for the binary, proxy and assets [default: ~/.local]
+  --state DIR     State directory with config.toml [default: /var/lib/lightning-driver]
+  --prefix DIR    Install prefix for the binary, proxy and assets [default: /usr/local]
   --port PORT     UI port; must match api.public_origin [default: 4400]
   --binary PATH   Install this api-server binary instead of building the workspace
   --no-restart    Install and enable the units without restarting running services
@@ -27,8 +27,8 @@ fail() {
 }
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-STATE=${XDG_STATE_HOME:-$HOME/.local/state}/lightning-driver
-PREFIX=$HOME/.local
+STATE=/var/lib/lightning-driver
+PREFIX=/usr/local
 UI_DIST=
 BINARY=
 PORT=4400
@@ -51,11 +51,17 @@ done
 [ -f "$UI_DIST/index.html" ] || fail "$UI_DIST does not look like a built UI (missing index.html)"
 [ -f "$STATE/config.toml" ] || fail "$STATE/config.toml is missing; write the configuration first"
 command -v systemctl >/dev/null || fail "systemctl is required"
-systemctl --user show-environment >/dev/null 2>&1 || fail "a user systemd session is required"
+[ "$(id -u)" = 0 ] || fail "installation requires root for isolated system services"
+for account in lightning-driver-api lightning-driver-ui; do
+  id "$account" >/dev/null 2>&1 || fail "create the system account $account before installation"
+done
+[ "$(id -u lightning-driver-api)" != "$(id -u lightning-driver-ui)" ] || fail "service accounts must have distinct UIDs"
+case "$PREFIX/" in /home/*|/root/*) fail "prefix must be outside protected home directories" ;; esac
+case "$STATE/" in /home/*|/root/*) fail "state must be outside protected home directories" ;; esac
 
 LIB=$PREFIX/lib/lightning-driver
 SHARE=$PREFIX/share/lightning-driver/dist
-UNIT_DIR=${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user
+UNIT_DIR=/etc/systemd/system
 
 printf 'Building the release API\n'
 if [ -n "$BINARY" ]; then
@@ -80,19 +86,19 @@ for unit in lightning-driver-api lightning-driver-ui; do
     "$ROOT/deploy/$unit.service.in" > "$UNIT_DIR/$unit.service"
 done
 
-systemctl --user daemon-reload
-systemctl --user enable lightning-driver-api.service lightning-driver-ui.service
+systemctl daemon-reload
+systemctl enable lightning-driver-api.service lightning-driver-ui.service
 if [ "$RESTART" = 1 ]; then
-  systemctl --user restart lightning-driver-api.service lightning-driver-ui.service
+  systemctl restart lightning-driver-api.service lightning-driver-ui.service
 fi
 
 cat <<DONE
 
 Installed. Services: lightning-driver-api.service, lightning-driver-ui.service.
-  systemctl --user status lightning-driver-api
-  journalctl --user -u lightning-driver-api -f
+  systemctl status lightning-driver-api
+  journalctl -u lightning-driver-api -f
   http://localhost:$PORT
 
 Enroll the first sign-in method on this host:
-  $LIB/api-server auth enrollment --config $STATE/config.toml
+  runuser -u lightning-driver-api -- $LIB/api-server auth enrollment --config $STATE/config.toml
 DONE

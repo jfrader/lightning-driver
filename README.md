@@ -86,16 +86,26 @@ certificate needs the new file and a restart. CLN is CA-verified.
 
 ## Running it
 
-`deploy/install.sh` installs the release API and a static-plus-proxy server for the built UI as
-user-level systemd services. The state directory defaults to `~/.local/state/lightning-driver` and
-needs `config.toml` before the first install.
+`deploy/install.sh` installs the release API and a static-plus-proxy server as system services with
+distinct `lightning-driver-api` and `lightning-driver-ui` accounts. Create these unprivileged system
+accounts before installation. The state directory defaults to `/var/lib/lightning-driver`; provision
+it with mode `0700`, owned by `lightning-driver-api`, and put the protected config and credentials
+there. The UI account must not own or read that state. Install binaries/assets outside home directories
+(default `/usr/local`); `ProtectHome=yes` hides home directories from both services.
 
 ```sh
-deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist
+sudo deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist
 ```
 
 `--port` must match the port in `api.public_origin` (4400 by default). Re-running the script after a
 rebuild upgrades both artifacts and restarts the services; it never rewrites the state directory.
+
+When migrating an existing user installation, stop and disable its two `systemctl --user` units first.
+Move the complete state (including the original invoice key), transfer ownership to the API account,
+and update any absolute paths in config before installing system units. Do not run both installations.
+Host enrollment/recovery commands must run as `lightning-driver-api` for this installation.
+The API sandbox permits writes only in the configured state directory; database, key and credentials
+must live there. The UI has no writable persistent paths and cannot access the state directory.
 
 For API-only work, run the server directly:
 
