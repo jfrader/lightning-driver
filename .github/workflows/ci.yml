@@ -32,6 +32,8 @@ jobs:
           protoc --version
           pkg-config --modversion openssl
       - name: Format
+        run: node --test deploy/*.test.mjs
+      - name: Rust format
         run: cargo fmt --all -- --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings

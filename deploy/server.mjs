@@ -74,21 +74,36 @@ async function send(req, res, urlPath, path) {
   return req.method === 'HEAD' ? res.end() : res.end(body);
 }
 
-createServer(async (req, res) => {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+async function handle(req, res) {
+  let url;
+  let pathname;
+  try {
+    url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    res.writeHead(400).end();
+    return;
+  }
   if (url.pathname.startsWith('/api/')) return proxy(req, res);
-  const candidate = normalize(join(DIST, decodeURIComponent(url.pathname)));
+  const candidate = normalize(join(DIST, pathname));
   if (!candidate.startsWith(DIST)) {
     res.writeHead(403).end();
     return;
   }
   try {
     const info = await stat(candidate);
-    if (info.isFile()) return send(req, res, url.pathname, candidate);
+    if (info.isFile()) return await send(req, res, url.pathname, candidate);
   } catch {
     // fall through to the SPA entry
   }
-  return send(req, res, '/index.html', join(DIST, 'index.html'));
-}).listen(PORT, HOST, () => {
-  console.log(`lightning-driver-ui on http://${HOST}:${PORT} (api ${API_HOST}:${API_PORT})`);
+  return await send(req, res, '/index.html', join(DIST, 'index.html'));
+}
+
+createServer((req, res) => {
+  handle(req, res).catch(() => {
+    if (res.headersSent) return res.destroy();
+    res.writeHead(500).end();
+  });
+}).listen(PORT, HOST, function () {
+  console.log(`lightning-driver-ui on http://${HOST}:${this.address().port} (api ${API_HOST}:${API_PORT})`);
 });
