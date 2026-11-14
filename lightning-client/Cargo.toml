@@ -13,6 +13,7 @@ url = { workspace = true }
 bitcoin = "0.32"
 lightning-invoice = "=0.34.1"
 libc = "0.2"
+rustix = { version = "1", features = ["process"] }
 ipnet = { version = "2", features = ["serde"] }
 
 [dev-dependencies]

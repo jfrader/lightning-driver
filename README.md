@@ -39,6 +39,11 @@ The plaintext API listener only accepts loopback bind addresses, including when 
 uses HTTPS. Terminate TLS on the same host. Remote proxy transport is not supported; do not expose
 the listener on a LAN or wildcard address.
 
+Credential files must be owned by the service user, have one hard link and mode `0600` (or stricter).
+Public certificates may also be root-owned. Ancestors must be real directories owned by root or the
+service user and not group/world-writable; root-owned sticky directories such as `/tmp` are allowed.
+Symlinks in any path component and hard-linked material are rejected.
+
 ## Setup
 
 Copy `config.example.toml` into the state directory, set `public_origin` and `rp_id` to the exact

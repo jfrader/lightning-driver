@@ -8,7 +8,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Read,
     net::{IpAddr, SocketAddr},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 use url::Url;
@@ -519,9 +519,26 @@ pub fn validate_peer_host(host: &str) -> Result<(), SettingsError> {
 }
 
 pub fn read_protected(path: &Path, secret: bool) -> Result<Vec<u8>, SettingsError> {
+    let absolute =
+        std::path::absolute(path).map_err(|_| SettingsError("Invalid protected path"))?;
+    for ancestor in absolute
+        .parent()
+        .ok_or(SettingsError("Invalid protected path"))?
+        .ancestors()
+    {
+        let metadata = std::fs::symlink_metadata(ancestor)
+            .map_err(|_| SettingsError("Cannot inspect protected ancestor"))?;
+        let root_sticky = metadata.uid() == 0 && metadata.mode() & libc::S_ISVTX != 0;
+        if !metadata.is_dir()
+            || !trusted_material_owner(metadata.uid(), false)
+            || (metadata.mode() & 0o022 != 0 && !root_sticky)
+        {
+            return Err(SettingsError("Protected material has unsafe ancestors"));
+        }
+    }
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)
         .map_err(|_| SettingsError("Cannot open protected material"))?;
     validate_permissions(&file, secret)?;
@@ -541,10 +558,18 @@ fn validate_permissions(file: &File, secret: bool) -> Result<(), SettingsError> 
         .metadata()
         .map_err(|_| SettingsError("Cannot inspect protected material"))?;
     let mask = if secret { 0o077 } else { 0o022 };
-    if !metadata.is_file() || metadata.permissions().mode() & mask != 0 {
+    if !metadata.is_file()
+        || metadata.permissions().mode() & mask != 0
+        || !trusted_material_owner(metadata.uid(), secret)
+        || metadata.nlink() != 1
+    {
         return Err(SettingsError("Protected material has unsafe permissions"));
     }
     Ok(())
+}
+
+fn trusted_material_owner(uid: u32, secret: bool) -> bool {
+    uid == rustix::process::geteuid().as_raw() || (!secret && uid == 0)
 }
 
 #[cfg(test)]
@@ -666,6 +691,30 @@ mod tests {
         .unwrap();
         assert!(read_protected(&path, true).is_err());
         assert!(read_protected(&directory.path().join("missing"), true).is_err());
+    }
+
+    #[test]
+    fn protected_material_rejects_unsafe_ancestors_links_and_foreign_owners() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credential");
+        std::fs::write(&path, b"secret").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(read_protected(&path, true).is_err());
+        std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let link = directory.path().join("hardlink");
+        std::fs::hard_link(&path, &link).unwrap();
+        assert!(read_protected(&path, true).is_err());
+        std::fs::remove_file(link).unwrap();
+        assert!(read_protected(&path, true).is_ok());
+        let alias = directory.path().with_extension("alias");
+        std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+        assert!(read_protected(&alias.join("credential"), true).is_err());
+        std::fs::remove_file(alias).unwrap();
+        assert!(!trusted_material_owner(
+            rustix::process::geteuid().as_raw().wrapping_add(1),
+            true
+        ));
     }
 
     #[test]
