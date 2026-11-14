@@ -2,6 +2,7 @@
 // API's Origin and Host checks see the same origin the browser used.
 import { readFile, stat, realpath } from 'node:fs/promises';
 import { createServer, request } from 'node:http';
+import { isIP } from 'node:net';
 import { extname, join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { gzipSync } from 'node:zlib';
 
@@ -68,9 +69,25 @@ function headersFor(urlPath, path, length, encoding) {
   return headers;
 }
 
+// The outer TLS proxy is the only source whose forwarding header is believed. It must overwrite
+// `X-Real-IP` with the client it accepted; anything else keeps the TCP peer identity.
+const TRUSTED_PROXY = new Set(
+  (process.env.TRUSTED_PROXY ?? '')
+    .split(',')
+    .map((value) => value.trim().replace(/^::ffff:/, ''))
+    .filter(Boolean),
+);
+
+function clientIdentity(req) {
+  const peer = req.socket.remoteAddress?.replace(/^::ffff:/, '') ?? '';
+  if (!TRUSTED_PROXY.has(peer)) return peer;
+  const claimed = String(req.headers['x-real-ip'] ?? '').trim();
+  return isIP(claimed) ? claimed : peer;
+}
+
 function proxy(req, res) {
-  // This ingress trusts the TCP peer only, never client-supplied forwarding headers.
-  const headers = { ...req.headers, 'x-real-ip': req.socket.remoteAddress?.replace(/^::ffff:/, '') };
+  // One identity per client for the API's admission: the TCP peer, or the trusted proxy's claim.
+  const headers = { ...req.headers, 'x-real-ip': clientIdentity(req) };
   delete headers.forwarded;
   delete headers['x-forwarded-for'];
   const upstream = request(

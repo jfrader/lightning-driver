@@ -6,6 +6,8 @@
 # The state directory (config, database, credentials) is never written to except for the proxy
 # entry point, so re-running this after a rebuild upgrades the binary and the UI in place.
 set -euo pipefail
+# Published artifacts must be readable by the two service accounts regardless of the caller's umask.
+umask 022
 
 usage() {
   cat <<'USAGE'
@@ -15,7 +17,7 @@ Usage: deploy/install.sh --ui-dist DIR [options]
   --state DIR     State directory with config.toml [default: /var/lib/lightning-driver]
   --prefix DIR    Install prefix for the binary, proxy and assets [default: /usr/local]
   --port PORT     UI port; must match api.public_origin [default: 4400]
-  --binary PATH   Install this api-server binary instead of building the workspace
+  --binary PATH   Release api-server binary built as your own user (required)
   --artifact-manifest PATH  Trusted release manifest for the supplied UI and optional binary
   --manifest-sha256 HEX     Manifest digest obtained through an independent trusted channel
   --no-restart    Install and enable the units without restarting running services
@@ -54,6 +56,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$UI_DIST" ] || fail "--ui-dist is required"
+[ -n "$BINARY" ] || fail "build as your own user first (cargo build --locked --release -p api-server) and pass --binary target/release/api-server; this installer never builds as root"
 [ -f "$UI_DIST/index.html" ] || fail "$UI_DIST does not look like a built UI (missing index.html)"
 [ -n "$MANIFEST" ] && [ -n "$MANIFEST_SHA256" ] || fail "trusted --artifact-manifest and --manifest-sha256 are required"
 command -v node >/dev/null || fail "node is required for artifact verification and the UI service"
@@ -72,16 +75,9 @@ LIB=$PREFIX/lib/lightning-driver
 SHARE=$PREFIX/share/lightning-driver/dist
 UNIT_DIR=/etc/systemd/system
 
-printf 'Building the release API\n'
-if [ -n "$BINARY" ]; then
-  SUPPLIED_BINARY=1
-  [ -x "$BINARY" ] || fail "$BINARY is not an executable api-server"
-  printf 'Using %s\n' "$BINARY"
-else
-  [ -f "$ROOT/Cargo.lock" ] || fail "Cargo.lock is required"
-  (cd "$ROOT" && CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-2} cargo build --locked --release -p api-server)
-  BINARY=${CARGO_TARGET_DIR:-$ROOT/target}/release/api-server
-fi
+SUPPLIED_BINARY=1
+[ -x "$BINARY" ] || fail "$BINARY is not an executable api-server"
+printf 'Using %s\n' "$BINARY"
 
 printf 'Installing into %s and %s\n' "$LIB" "$SHARE"
 STAGING=$(mktemp -d)
@@ -101,6 +97,7 @@ install -m 755 "$STAGING/api-server" "$LIB/api-server"
 install -m 644 "$ROOT/deploy/server.mjs" "$LIB/server.mjs"
 rm -rf "$SHARE"
 cp -R "$STAGING/ui" "$SHARE"
+chmod -R a+rX "$SHARE" "$LIB"
 
 printf 'Rendering units into %s\n' "$UNIT_DIR"
 install -d -m 755 "$UNIT_DIR"

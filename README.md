@@ -99,10 +99,13 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin lightning-drive
 sudo install -d -m 0700 -o lightning-driver-api -g lightning-driver-api /var/lib/lightning-driver
 ```
 
-Then install, with the manifest and digest produced by `deploy/manifest.mjs` (see below):
+Build as your own user first: the installer requires root, and building as root is refused. Then
+install with the manifest and digest produced by `deploy/manifest.mjs` (see below):
 
 ```sh
+cargo build --locked --release -p api-server
 sudo deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist \
+  --binary target/release/api-server \
   --artifact-manifest /path/to/manifest.json --manifest-sha256 <trusted-manifest-sha256>
 ```
 
@@ -113,13 +116,23 @@ The static server sends `Content-Security-Policy: default-src 'none'; script-src
 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; …` with
 `frame-ancestors 'none'`, plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
 NIP-46 remote signing connects to a relay the operator picks, so those origins are blocked by
-default: add the approved ones to the UI unit, space-separated and `wss://` only, and restart it:
+default. Add the approved ones in a drop-in, space-separated and `wss://` only, then restart the
+unit; the installer re-renders the main unit and would drop values written there:
 
-```ini
-Environment=RELAY_ORIGINS=wss://relay.example wss://relay2.example
+```sh
+sudo systemctl edit lightning-driver-ui
+# [Service]
+# Environment=RELAY_ORIGINS=wss://relay.example wss://relay2.example
+sudo systemctl restart lightning-driver-ui.service
 ```
 
 Any other scheme, a path, a query or the absence of an explicit origin fails the server at startup.
+
+When a TLS reverse proxy fronts this server, set `TRUSTED_PROXY` in the same drop-in to the proxy's
+address (comma-separated for several). Only then does the server believe the `X-Real-IP` that proxy
+sets, and the API's admission sees one identity per browser instead of the proxy's address for
+everyone. The proxy must overwrite (not append) `X-Real-IP` with the client it accepted; from any
+other peer the header is ignored and the TCP peer is used.
 
 When migrating an existing user installation, stop and disable its two `systemctl --user` units first.
 Move the complete state (including the original invoice key), transfer ownership to the API account,
@@ -143,8 +156,8 @@ The manifest contains `ui.repository` (`https://github.com/jfrader/lightning-dri
 `ui.revision` (full source commit) and `ui.files` (every relative asset path mapped to its SHA-256).
 With `--binary`, it also requires `api.repository` (`https://github.com/jfrader/lightning-driver`),
 `api.revision` and `api.sha256`. Extra files, symlinks, missing provenance and mismatches are rejected.
-The installer verifies a private staged snapshot before installing it. Without `--binary`, it builds
-the checked-out backend with `Cargo.lock` and `--locked`; a supplied UI still requires trusted metadata.
+The installer verifies a private staged snapshot before installing it. It never builds: pass the
+`--binary` you built with `--locked`.
 
 For API-only work, run the server directly:
 

@@ -50,6 +50,19 @@ test('ingress overwrites spoofed client identity with its TCP peer', async t => 
   assert.equal(received.forwarded, undefined);
 });
 
+test('only a trusted proxy may name the client identity', async t => {
+  let received;
+  const api = createServer((req, res) => { received = req.headers; res.end('ok'); });
+  await new Promise(resolve => api.listen(0, '127.0.0.1', resolve));
+  t.after(() => new Promise(resolve => api.close(resolve)));
+  const { get } = await fixture(t, { API_PORT: String(api.address().port), TRUSTED_PROXY: '127.0.0.1' });
+  await get('/api/v1/auth/bootstrap', { 'x-real-ip': '203.0.113.9', 'x-forwarded-for': '192.0.2.98' });
+  assert.equal(received['x-real-ip'], '203.0.113.9');
+  assert.equal(received['x-forwarded-for'], undefined);
+  await get('/api/v1/auth/bootstrap', { 'x-real-ip': 'not-an-ip' });
+  assert.equal(received['x-real-ip'], '127.0.0.1');
+});
+
 test('static files cannot escape into prefix siblings or external symlinks', async t => {
   const { root, get } = await fixture(t);
   const sibling = `${root}-outside`;

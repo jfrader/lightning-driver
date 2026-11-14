@@ -29,6 +29,7 @@ mod fleet_tests {
         }
         let active = Arc::new(AtomicUsize::new(0));
         let started = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
         let begin = std::time::Instant::now();
         refresh_bounded(
             (0..100).map(|id| id.to_string()),
@@ -36,9 +37,10 @@ mod fleet_tests {
             |_| {
                 let active = active.clone();
                 let started = started.clone();
+                let peak = peak.clone();
                 async move {
                     let _guard = Active(active.clone());
-                    assert!(active.fetch_add(1, Ordering::SeqCst) < FLEET_REFRESH_CONCURRENCY);
+                    peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
                     started.fetch_add(1, Ordering::SeqCst);
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
                 }
@@ -47,6 +49,7 @@ mod fleet_tests {
         .await;
         assert!(begin.elapsed() < std::time::Duration::from_secs(1));
         assert_eq!(started.load(Ordering::SeqCst), FLEET_REFRESH_CONCURRENCY);
+        assert!(peak.load(Ordering::SeqCst) <= FLEET_REFRESH_CONCURRENCY);
         assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 }

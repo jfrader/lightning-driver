@@ -37,8 +37,14 @@ test('artifact verification fails closed for tampering, extra files and untruste
   await symlink(binary, join(ui, 'extra.js'));
   assert.equal(verify().status, 1);
   const installer = await readFile('deploy/install.sh', 'utf8');
-  assert.match(installer, /cargo build --locked --release/);
+  const readme = await readFile('README.md', 'utf8');
+  // The installer never builds as root; the documented build step requires the lockfile.
+  assert.match(readme, /cargo build --locked --release -p api-server/);
+  assert.match(installer, /never builds as root/);
   const rejection = spawnSync('bash', ['deploy/install.sh', '--ui-dist', ui]);
   assert.equal(rejection.status, 1);
-  assert.match(String(rejection.stderr), /trusted --artifact-manifest/);
+  assert.match(String(rejection.stderr), /pass --binary/);
+  const withoutManifest = spawnSync('bash', ['deploy/install.sh', '--ui-dist', ui, '--binary', binary]);
+  assert.equal(withoutManifest.status, 1);
+  assert.match(String(withoutManifest.stderr), /trusted --artifact-manifest/);
 });
