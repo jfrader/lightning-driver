@@ -94,6 +94,14 @@ there. The UI account must not own or read that state. Install binaries/assets o
 (default `/usr/local`); `ProtectHome=yes` hides home directories from both services.
 
 ```sh
+sudo useradd --system --home-dir /var/lib/lightning-driver --shell /usr/sbin/nologin lightning-driver-api
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin lightning-driver-ui
+sudo install -d -m 0700 -o lightning-driver-api -g lightning-driver-api /var/lib/lightning-driver
+```
+
+Then install, with the manifest and digest produced by `deploy/manifest.mjs` (see below):
+
+```sh
 sudo deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist \
   --artifact-manifest /path/to/manifest.json --manifest-sha256 <trusted-manifest-sha256>
 ```
