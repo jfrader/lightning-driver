@@ -237,18 +237,11 @@ fn load_key(path: &Path, pending: bool) -> std::result::Result<PendingSecretKey,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !pending => {
             let mut bytes = zeroize::Zeroizing::new([0u8; 32]);
             rand::rngs::OsRng.fill_bytes(bytes.as_mut());
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-                .open(path)
-                .map_err(|_| storage())?;
-            file.write_all(bytes.as_ref()).map_err(|_| storage())?;
-            file.sync_all().map_err(|_| storage())?;
-            std::fs::File::open(path.parent().ok_or_else(storage)?)
-                .and_then(|parent| parent.sync_all())
-                .map_err(|_| storage())?;
+            match publish_key(path, |file| file.write_all(bytes.as_ref())) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(_) => return Err(storage()),
+            }
             options.open(path).map_err(|_| storage())?
         }
         Err(_) => return Err(storage()),
@@ -267,9 +260,50 @@ fn load_key(path: &Path, pending: bool) -> std::result::Result<PendingSecretKey,
     Ok(PendingSecretKey::new(*bytes))
 }
 
+fn publish_key(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".invoice-key-")
+        .tempfile_in(parent)?;
+    write(temporary.as_file_mut())?;
+    temporary.as_file().sync_all()?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)?;
+    std::fs::File::open(parent)?.sync_all()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_publication_never_exposes_partial_or_overwrites_existing_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("key");
+        let failure = publish_key(&path, |file| {
+            file.write_all(&[1; 8])?;
+            assert!(!path.exists());
+            Err(std::io::ErrorKind::WriteZero.into())
+        });
+        assert!(failure.is_err());
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+        publish_key(&path, |file| file.write_all(&[2; 32])).unwrap();
+        assert_eq!(
+            publish_key(&path, |file| file.write_all(&[3; 32]))
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), [2; 32]);
+        assert_eq!(std::fs::metadata(path).unwrap().nlink(), 1);
+    }
 
     #[tokio::test]
     async fn read_only_adapter_can_override_registration_availability() {
