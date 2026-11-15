@@ -9,6 +9,9 @@ pub struct ApplicationState {
     pub registry: Arc<crate::registry::Registry>,
     pub snapshots: crate::pagination::Snapshots,
     pub(crate) engine: Engine,
+    pub(crate) fleet_refreshing: Arc<std::sync::atomic::AtomicBool>,
+    /// Rotates the first node of each fleet refresh so a stalled prefix cannot starve the tail.
+    pub(crate) fleet_cursor: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ApplicationState {
@@ -42,6 +45,8 @@ impl ApplicationState {
             registry,
             snapshots: crate::pagination::Snapshots::new(settings.api.limits.clone()),
             engine,
+            fleet_refreshing: Arc::default(),
+            fleet_cursor: Arc::default(),
         })
     }
 }

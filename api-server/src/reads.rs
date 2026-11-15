@@ -108,11 +108,7 @@ async fn nodes(
             auth.limits().max_response_bytes,
         );
     }
-    // One failed observation is recorded on that node and shown as its status; it must not fail the
-    // whole fleet page, and a rate-limited refresh is retried on the next request.
-    for (id, _) in auth.registry.entries() {
-        let _ = auth.refresh_node(id).await;
-    }
+    auth.schedule_fleet_refresh();
     let now = Utc::now();
     let counts = auth.journal.unresolved_counts().await?;
     let mut rows: Vec<_> = auth

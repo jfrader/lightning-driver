@@ -7,3 +7,27 @@ project_source_bundled_for_ai.txt
 graphify-out/
 .idea/
 source-to-txt.sh
+
+# Local runtime state and protected node material.
+/state/
+/runtime/
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.sqlite3-journal
+*.db-wal
+*.db-shm
+*.db-journal
+*.serve.lock
+*.key
+*.macaroon
+*.rune
+*.pem
+.cookie
+# Synthetic, reviewed fixtures remain visible to git.
+!**/tests/fixtures/**

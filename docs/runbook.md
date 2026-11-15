@@ -1,11 +1,11 @@
 # API operations runbook
 
-Commands below use the default user-service install. For a custom install, substitute its binary, configuration and service names.
+Commands below use the default system-service install. For a custom install, substitute its binary, configuration and service names.
 
 ```sh
-API="$HOME/.local/lib/lightning-driver/api-server"
-CONFIG="$HOME/.local/state/lightning-driver/config.toml"
-journalctl --user -u lightning-driver-api.service -n 100 --no-pager -o cat
+API="/usr/local/lib/lightning-driver/api-server"
+CONFIG="/var/lib/lightning-driver/config.toml"
+journalctl -u lightning-driver-api.service -n 100 --no-pager -o cat
 ```
 
 ## Log contract
@@ -35,9 +35,9 @@ Only the allowlisted projection is serialized. No node endpoints, credentials, c
 For example:
 
 ```sh
-journalctl --user -u lightning-driver-api.service -o cat --no-pager |
+journalctl -u lightning-driver-api.service -o cat --no-pager |
   grep '"event":"node_registration"'
-journalctl --user -u lightning-driver-api.service -o cat --no-pager |
+journalctl -u lightning-driver-api.service -o cat --no-pager |
   jq -R 'fromjson? | select(.event == "read_failure" and .node_id == "node-a")'
 ```
 
@@ -47,11 +47,11 @@ journalctl --user -u lightning-driver-api.service -o cat --no-pager |
 2. `configuration`: check TOML syntax, exact `api.public_origin` and `api.rp_id`, bind address, node IDs and runtime limits. Relative paths resolve from the config directory. Keep the existing origin/RP ID for enrolled passkeys.
 3. `storage_unavailable`: check the service user's ownership, free space and permissions. The state directory must be `0700`; the database, key and lock files must be `0600`, regular files, owned by the service user and not symlinks. Check the pending invoice key is the original 32-byte file. Restore the original key if missing; do not generate a replacement when pending ciphertext exists.
 4. `listener_unavailable`: check `ss -ltnp` for an occupied bind address and check the service's configured bind. Do not expose the listener publicly to work around a proxy error.
-5. Correct the cause and run `systemctl --user restart lightning-driver-api.service`. Confirm `instance_lock.outcome=acquired`, then `startup`, and inspect every `node_registration`.
+5. Correct the cause and run `sudo systemctl restart lightning-driver-api.service`. Confirm `instance_lock.outcome=acquired`, then `startup`, and inspect every `node_registration`.
 
 ## Instance lock or database lock
 
-1. For `instance_lock.outcome=failure` / `startup_failure.error_code=instance_lock_unavailable`, inspect `systemctl --user status lightning-driver-api.service` and `pgrep -af api-server`. Stop a duplicate service/process gracefully. Run only one serving process per database.
+1. For `instance_lock.outcome=failure` / `startup_failure.error_code=instance_lock_unavailable`, inspect `systemctl status lightning-driver-api.service` and `pgrep -af api-server`. Stop a duplicate service/process gracefully. Run only one serving process per database.
 2. Do not remove `<database>.serve.lock` while a process may hold it: deleting it can permit two writers. The OS releases the lock when its owner exits; the empty file can remain.
 3. If no process owns it, check the lock file's ownership, mode, file type and link count. Fix ownership/permissions only after stopping the service. Do not replace it with a symlink.
 4. SQLite contention can surface as `storage_unavailable` (startup or API response); the API does not distinguish a busy DB from other protected-storage failures in logs. Let an in-progress host enrollment/recovery command finish. Find other processes using the database. Keep it on local persistent storage, not NFS. Never delete the database, WAL or SHM files to clear a lock.
@@ -59,7 +59,7 @@ journalctl --user -u lightning-driver-api.service -o cat --no-pager |
 ## Enrollment and recovery
 
 ```sh
-"$API" auth enrollment --config "$CONFIG"
+sudo -u lightning-driver-api "$API" auth enrollment --config "$CONFIG"
 ```
 
 Use the printed one-use token in the same-origin UI enrollment flow within `api.limits.preauth_seconds` (default 300 seconds). Keep stdout private; do not paste the token into a URL, command argument, issue or log. Successful registration logs `auth` with `action=enroll`, the chosen `method`, and `outcome=success`. For `outcome=failure`, verify the browser origin/Host, token expiry and authenticator; restart the ceremony. Passkey enrollment consumes the token at start, so issue another after an abandoned/failed start. Nostr enrollment consumes it after signature verification. Respect `rate_limited.retry_after_seconds` before retrying.
@@ -67,7 +67,7 @@ Use the printed one-use token in the same-origin UI enrollment flow within `api.
 If all sign-in methods are lost, run from a trusted host terminal:
 
 ```sh
-"$API" auth recovery --config "$CONFIG" --confirm-reset-authentication
+sudo -u lightning-driver-api "$API" auth recovery --config "$CONFIG" --confirm-reset-authentication
 ```
 
 This revokes existing passkeys, Nostr identities and sessions, preserves operations, and prints a new enrollment token. Without confirmation, expect `startup_failure.error_code=confirmation_required`. Enroll again and sign in; inspect `auth.action=enroll` and `auth.action=sign_in`. Do not reset the database to recover authentication. Host auth commands may run while the serving process holds its instance lock.
@@ -94,13 +94,29 @@ This revokes existing passkeys, Nostr identities and sessions, preserves operati
 
 ## Stale reads
 
+Fleet pages serve cached observations immediately and schedule at most one background fleet refresh.
+Refreshes run at most eight node reads concurrently and share one `api.limits.rpc_seconds` deadline;
+unfinished reads are cancelled. A later fleet request can refresh again. Individual node reads still
+refresh their own observation before answering.
+
 1. Filter `read_failure` by `node_id` and `surface`. Check `error_code` and `stale`; compare the response's observation time with the current time. `stale=true` is not current node state.
 2. Restore connectivity/permissions or correct the verified identity/network mismatch. Identity/network mismatches invalidate Bitcoin/watchtower caches; tower-detail reads cannot return a stale fallback.
 3. Wait at least `api.limits.rpc_seconds`, then refresh the surface. A successful read has no log; confirm freshness from the API/UI. For `rate_limited`, wait the advertised delay and reduce polling/concurrency; do not raise limits without checking capacity.
 
+## Proxy identity
+
+The UI proxy overwrites `X-Real-IP` with its TCP peer and strips `Forwarded`/`X-Forwarded-For`.
+When an outer TLS proxy fronts it, list that proxy's address in `TRUSTED_PROXY` (a drop-in for
+`lightning-driver-ui`) and make the proxy overwrite `X-Real-IP` with the client it accepted; only
+then is that header believed, and each browser gets its own admission bucket. For
+`trusted_single_proxy`, configure the API's trusted CIDRs to contain only the UI proxy's socket
+address and select `header = "x-real-ip"`. Never trust client-provided headers at that ingress.
+Without `TRUSTED_PROXY`, every browser behind one proxy shares that proxy's rate bucket; the
+default API `socket_peer` policy has the same shape.
+
 ## Restart / redeploy
 
-1. Record unresolved operation IDs. Stop the API gracefully: `systemctl --user stop lightning-driver-api.service`.
+1. Record unresolved operation IDs. Stop the API gracefully: `sudo systemctl stop lightning-driver-api.service`.
 2. With writers stopped, back up the state directory, database (including any remaining WAL/SHM), original invoice key and protected configuration/material together. Keep backups private. Never replace the key independently of the database.
 3. Install the built binary/UI using the documented `deploy/install.sh` options. Preserve the state directory, origin/RP ID and verified node identity/material. Start/restart the service and inspect `startup`, `instance_lock` and each `node_registration`.
 4. Authenticated sessions survive restarts until expiry, sign-out or credential recovery. Grants and challenges are process-local; restart any unfinished sign-in or authorization ceremony. Undispatched reviews expire on restart; create a new review. Dispatched unresolved operations transition to `unknown` / `reconciling` and retain their lifetime reconciliation budget. Check their status before creating another mutation.

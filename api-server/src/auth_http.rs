@@ -282,6 +282,9 @@ async fn bootstrap(
 ) -> Result<HttpResponse, ApiError> {
     let state = &application.auth;
     state.validate_request(&request, false)?;
+    state
+        .manager
+        .admit_bootstrap(state.identity(&request)?, Utc::now())?;
     if let Some(cookie) = request.cookie(state.cookie_name(false)) {
         if let Ok(old) = state
             .manager
@@ -543,6 +546,53 @@ mod tests {
             object.insert("clientExtensionResults".into(), extensions);
         }
         value
+    }
+
+    #[actix_web::test]
+    async fn bootstrap_rejection_precedes_context_rotation_and_sqlite() {
+        let (_directory, state) = state().await;
+        let peer = ClientIdentity::Socket(Ipv4Addr::LOCALHOST.into());
+        let guest = state
+            .auth
+            .manager
+            .anonymous(peer, Utc::now())
+            .await
+            .unwrap();
+        for _ in 0..state.limits().login_attempts_per_minute {
+            state
+                .auth
+                .manager
+                .admit_bootstrap(peer, Utc::now())
+                .unwrap();
+        }
+        let database = rusqlite::Connection::open(&state.auth.settings.database).unwrap();
+        // Make the very first authentication query fail if the handler touches SQLite.
+        database
+            .execute_batch("ALTER TABLE auth_meta RENAME TO unavailable_auth_meta")
+            .unwrap();
+        let contexts = state.auth.manager.context_count();
+        let request = test::TestRequest::get()
+            .peer_addr("127.0.0.1:1234".parse().unwrap())
+            .insert_header((header::HOST, "manager.example.invalid"))
+            .cookie(Cookie::new(PREAUTH_COOKIE, guest.cookie.to_string()))
+            .to_http_request();
+        let started = std::time::Instant::now();
+        let error = bootstrap(request, web::Data::new(state.clone()))
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(error.code, ErrorCode::RateLimited);
+        assert!(started.elapsed() < std::time::Duration::from_millis(100));
+        assert_eq!(state.auth.manager.context_count(), contexts);
+        database
+            .execute_batch("ALTER TABLE unavailable_auth_meta RENAME TO auth_meta")
+            .unwrap();
+        assert!(state
+            .auth
+            .manager
+            .context(&guest.cookie, false, Utc::now())
+            .await
+            .is_ok());
     }
 
     async fn two_sessions(state: &crate::state::ApplicationState) -> [NewContext; 2] {

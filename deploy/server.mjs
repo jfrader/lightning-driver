@@ -1,15 +1,39 @@
 // Serves the built UI and proxies /api to the loopback API, preserving the browser's Host so the
 // API's Origin and Host checks see the same origin the browser used.
-import { readFile, stat } from 'node:fs/promises';
+import { readFile, stat, realpath } from 'node:fs/promises';
 import { createServer, request } from 'node:http';
-import { extname, join, normalize } from 'node:path';
+import { isIP } from 'node:net';
+import { extname, join, resolve, relative, isAbsolute, sep } from 'node:path';
 import { gzipSync } from 'node:zlib';
 
-const DIST = process.env.DIST ?? '/usr/local/share/lightning-driver/dist';
+const DIST = await realpath(process.env.DIST ?? '/usr/local/share/lightning-driver/dist');
 const API_HOST = process.env.API_HOST ?? '127.0.0.1';
 const API_PORT = Number(process.env.API_PORT ?? 8080);
 const PORT = Number(process.env.PORT ?? 4400);
 const HOST = process.env.HOST ?? '127.0.0.1';
+
+// NIP-46 remote signing opens a WebSocket to a relay the operator chooses. Only the origins named
+// here may be reached; anything else stays blocked by `connect-src`.
+function relayOrigins(value) {
+  return (value ?? '')
+    .split(/\s+/)
+    .filter(Boolean)
+    .map((candidate) => {
+      let url;
+      try {
+        url = new URL(candidate);
+      } catch {
+        throw new Error(`RELAY_ORIGINS must list wss:// origins, got ${candidate}`);
+      }
+      if (url.protocol !== 'wss:' || url.pathname !== '/' || url.search || url.hash) {
+        throw new Error(`RELAY_ORIGINS must list wss:// origins, got ${candidate}`);
+      }
+      return url.origin;
+    });
+}
+
+const CONNECT_SRC = ["'self'", ...new Set(relayOrigins(process.env.RELAY_ORIGINS))].join(' ');
+const CONTENT_SECURITY_POLICY = `default-src 'none'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src ${CONNECT_SRC}; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'`;
 
 const TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -34,6 +58,9 @@ function headersFor(urlPath, path, length, encoding) {
     'content-type': TYPES[extname(path)] ?? 'application/octet-stream',
     'content-length': length,
     'cache-control': IMMUTABLE.test(urlPath) ? 'public, max-age=31536000, immutable' : 'no-cache',
+    'x-content-type-options': 'nosniff',
+    'content-security-policy': CONTENT_SECURITY_POLICY,
+    'referrer-policy': 'no-referrer',
   };
   if (encoding) {
     headers['content-encoding'] = encoding;
@@ -42,9 +69,42 @@ function headersFor(urlPath, path, length, encoding) {
   return headers;
 }
 
+// The outer TLS proxy is the only source whose forwarding header is believed. It must overwrite
+// `X-Real-IP` with the client it accepted; anything else keeps the TCP peer identity.
+const TRUSTED_PROXY = new Set(
+  (process.env.TRUSTED_PROXY ?? '')
+    .split(',')
+    .map((value) => value.trim().replace(/^::ffff:/, ''))
+    .filter(Boolean),
+);
+
+function canonicalIp(text) {
+  const version = isIP(text);
+  if (version === 0) return null;
+  if (version === 4) return text;
+  // The API compares the header text with the canonical Rust rendering of the address, so an
+  // expanded or uppercase IPv6 claim must be compressed here before it is forwarded.
+  try {
+    return new URL(`http://[${text}]/`).hostname.slice(1, -1);
+  } catch {
+    return null;
+  }
+}
+
+function clientIdentity(req) {
+  const peer = req.socket.remoteAddress?.replace(/^::ffff:/, '') ?? '';
+  if (!TRUSTED_PROXY.has(peer)) return peer;
+  const claimed = canonicalIp(String(req.headers['x-real-ip'] ?? '').trim());
+  return claimed ?? peer;
+}
+
 function proxy(req, res) {
+  // One identity per client for the API's admission: the TCP peer, or the trusted proxy's claim.
+  const headers = { ...req.headers, 'x-real-ip': clientIdentity(req) };
+  delete headers.forwarded;
+  delete headers['x-forwarded-for'];
   const upstream = request(
-    { host: API_HOST, port: API_PORT, method: req.method, path: req.url, headers: req.headers },
+    { host: API_HOST, port: API_PORT, method: req.method, path: req.url, headers },
     (answer) => {
       res.writeHead(answer.statusCode ?? 502, answer.headers);
       answer.pipe(res);
@@ -58,6 +118,8 @@ function proxy(req, res) {
 }
 
 async function send(req, res, urlPath, path) {
+  path = await realpath(path);
+  if (!contained(path)) return res.writeHead(403).end();
   const body = await readFile(path);
   const accepts = String(req.headers['accept-encoding'] ?? '');
   const type = extname(path);
@@ -74,21 +136,42 @@ async function send(req, res, urlPath, path) {
   return req.method === 'HEAD' ? res.end() : res.end(body);
 }
 
-createServer(async (req, res) => {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+function contained(path) {
+  const part = relative(DIST, path);
+  return part !== '..' && !part.startsWith(`..${sep}`) && !isAbsolute(part);
+}
+
+async function handle(req, res) {
+  let url;
+  let pathname;
+  try {
+    url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`);
+    pathname = decodeURIComponent(url.pathname);
+  } catch {
+    res.writeHead(400).end();
+    return;
+  }
   if (url.pathname.startsWith('/api/')) return proxy(req, res);
-  const candidate = normalize(join(DIST, decodeURIComponent(url.pathname)));
-  if (!candidate.startsWith(DIST)) {
+  const candidate = resolve(DIST, `.${sep}${pathname}`);
+  if (!contained(candidate)) {
     res.writeHead(403).end();
     return;
   }
   try {
     const info = await stat(candidate);
-    if (info.isFile()) return send(req, res, url.pathname, candidate);
-  } catch {
+    if (info.isFile()) return await send(req, res, url.pathname, candidate);
+  } catch (error) {
+    if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') throw error;
     // fall through to the SPA entry
   }
-  return send(req, res, '/index.html', join(DIST, 'index.html'));
-}).listen(PORT, HOST, () => {
-  console.log(`lightning-driver-ui on http://${HOST}:${PORT} (api ${API_HOST}:${API_PORT})`);
+  return await send(req, res, '/index.html', join(DIST, 'index.html'));
+}
+
+createServer((req, res) => {
+  handle(req, res).catch(() => {
+    if (res.headersSent) return res.destroy();
+    res.writeHead(500).end();
+  });
+}).listen(PORT, HOST, function () {
+  console.log(`lightning-driver-ui on http://${HOST}:${this.address().port} (api ${API_HOST}:${API_PORT})`);
 });

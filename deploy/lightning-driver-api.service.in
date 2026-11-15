@@ -4,10 +4,23 @@ After=network-online.target
 
 [Service]
 Type=simple
+User=lightning-driver-api
+Group=lightning-driver-api
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=@STATE@
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
 WorkingDirectory=@STATE@
 ExecStart=@PREFIX@/lib/lightning-driver/api-server serve --config @STATE@/config.toml
 Restart=on-failure
 RestartSec=2
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

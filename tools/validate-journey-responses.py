@@ -14,7 +14,7 @@ from jsonschema import Draft202012Validator, FormatChecker
 
 ROOT = Path(__file__).resolve().parents[1]
 FROZEN = {
-    "api-server/openapi.json": "a9aa7112084ec1a0cc8ca84157e4f9b750eb1cb3a2a96133cc494fa597327717",
+    "api-server/openapi.json": "1dcd7501b415e1a8cad097d1376f15d334fa725045ebd98c937ccb357a890af7",
     "api-server/tests/fixtures/api-examples.json": "e5af66a0b8ba6f390eb86a247a763800cd173034fd166ae8f2c0b0ae7c5c86f9",
 }
 KINDS = {

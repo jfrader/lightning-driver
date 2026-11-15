@@ -4,6 +4,19 @@ After=lightning-driver-api.service
 
 [Service]
 Type=simple
+User=lightning-driver-ui
+Group=lightning-driver-ui
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+InaccessiblePaths=@STATE@
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=yes
 Environment=DIST=@PREFIX@/share/lightning-driver/dist
 Environment=PORT=@PORT@
 ExecStart=/usr/bin/env node @PREFIX@/lib/lightning-driver/server.mjs
@@ -11,4 +24,4 @@ Restart=on-failure
 RestartSec=2
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

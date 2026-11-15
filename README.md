@@ -35,6 +35,15 @@ The API contract is [`api-server/openapi.json`](api-server/openapi.json); the UI
 - One `serve` process per database. It holds an exclusive lock, so bind it privately behind a TLS
   reverse proxy that preserves the `Host` header.
 
+The plaintext API listener only accepts loopback bind addresses, including when `public_origin`
+uses HTTPS. Terminate TLS on the same host. Remote proxy transport is not supported; do not expose
+the listener on a LAN or wildcard address.
+
+Credential files must be owned by the service user, have one hard link and mode `0600` (or stricter).
+Public certificates may also be root-owned. Ancestors must be real directories owned by root or the
+service user and not group/world-writable; root-owned sticky directories such as `/tmp` are allowed.
+Symlinks in any path component and hard-linked material are rejected.
+
 ## Setup
 
 Copy `config.example.toml` into the state directory, set `public_origin` and `rp_id` to the exact
@@ -77,16 +86,78 @@ certificate needs the new file and a restart. CLN is CA-verified.
 
 ## Running it
 
-`deploy/install.sh` installs the release API and a static-plus-proxy server for the built UI as
-user-level systemd services. The state directory defaults to `~/.local/state/lightning-driver` and
-needs `config.toml` before the first install.
+`deploy/install.sh` installs the release API and a static-plus-proxy server as system services with
+distinct `lightning-driver-api` and `lightning-driver-ui` accounts. Create these unprivileged system
+accounts before installation. The state directory defaults to `/var/lib/lightning-driver`; provision
+it with mode `0700`, owned by `lightning-driver-api`, and put the protected config and credentials
+there. The UI account must not own or read that state. Install binaries/assets outside home directories
+(default `/usr/local`); `ProtectHome=yes` hides home directories from both services.
 
 ```sh
-deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist
+sudo useradd --system --home-dir /var/lib/lightning-driver --shell /usr/sbin/nologin lightning-driver-api
+sudo useradd --system --no-create-home --shell /usr/sbin/nologin lightning-driver-ui
+sudo install -d -m 0700 -o lightning-driver-api -g lightning-driver-api /var/lib/lightning-driver
+```
+
+Build as your own user first: the installer requires root, and building as root is refused. Then
+install with the manifest and digest produced by `deploy/manifest.mjs` (see below):
+
+```sh
+cargo build --locked --release -p api-server
+sudo deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist \
+  --binary target/release/api-server \
+  --artifact-manifest /path/to/manifest.json --manifest-sha256 <trusted-manifest-sha256>
 ```
 
 `--port` must match the port in `api.public_origin` (4400 by default). Re-running the script after a
 rebuild upgrades both artifacts and restarts the services; it never rewrites the state directory.
+
+The static server sends `Content-Security-Policy: default-src 'none'; script-src 'self'; style-src
+'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; …` with
+`frame-ancestors 'none'`, plus `X-Content-Type-Options: nosniff` and `Referrer-Policy: no-referrer`.
+NIP-46 remote signing connects to a relay the operator picks, so those origins are blocked by
+default. Add the approved ones in a drop-in, space-separated and `wss://` only, then restart the
+unit; the installer re-renders the main unit and would drop values written there:
+
+```sh
+sudo systemctl edit lightning-driver-ui
+# [Service]
+# Environment="RELAY_ORIGINS=wss://relay.example wss://relay2.example"
+sudo systemctl restart lightning-driver-ui.service
+```
+
+Any other scheme, a path, a query or the absence of an explicit origin fails the server at startup.
+
+When a TLS reverse proxy fronts this server, set `TRUSTED_PROXY` in the same drop-in to the proxy's
+address (comma-separated for several). Only then does the server believe the `X-Real-IP` that proxy
+sets, and the API's admission sees one identity per browser instead of the proxy's address for
+everyone. The proxy must overwrite (not append) `X-Real-IP` with the client it accepted; from any
+other peer the header is ignored and the TCP peer is used.
+
+When migrating an existing user installation, stop and disable its two `systemctl --user` units first.
+Move the complete state (including the original invoice key), transfer ownership to the API account,
+and update any absolute paths in config before installing system units. Do not run both installations.
+Host enrollment/recovery commands must run as `lightning-driver-api` for this installation.
+The API sandbox permits writes only in the configured state directory; database, key and credentials
+must live there. The UI has no writable persistent paths and cannot access the state directory.
+
+Supplied artifacts require a version-1 JSON manifest and its SHA-256 from an independent trusted
+release/build channel (a checksum shipped only beside an untrusted artifact is not provenance).
+`deploy/manifest.mjs` writes that manifest from a built UI and, optionally, a built binary, and prints
+its digest:
+
+```sh
+node deploy/manifest.mjs --ui-dist /path/to/lightning-driver-ui/dist \
+  --ui-revision <full-ui-commit> --binary target/release/api-server \
+  --api-revision <full-backend-commit> --out manifest.json
+```
+
+The manifest contains `ui.repository` (`https://github.com/jfrader/lightning-driver-ui`),
+`ui.revision` (full source commit) and `ui.files` (every relative asset path mapped to its SHA-256).
+With `--binary`, it also requires `api.repository` (`https://github.com/jfrader/lightning-driver`),
+`api.revision` and `api.sha256`. Extra files, symlinks, missing provenance and mismatches are rejected.
+The installer verifies a private staged snapshot before installing it. It never builds: pass the
+`--binary` you built with `--locked`.
 
 For API-only work, run the server directly:
 

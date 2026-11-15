@@ -120,7 +120,7 @@ async fn stale_node_observation_does_not_block_an_unrelated_read() {
 }
 
 #[actix_web::test]
-async fn ready_harness_nodes_enable_capabilities_on_the_first_list_read() {
+async fn fleet_serves_cache_without_waiting_for_refresh_then_enables_live_capabilities() {
     for backend in [Backend::LndGrpc, Backend::LndRest, Backend::ClnRest] {
         let f = Journey::new(backend, false).await;
         {
@@ -129,9 +129,41 @@ async fn ready_harness_nodes_enable_capabilities_on_the_first_list_read() {
             scenario.expect_mutations(&[]);
         }
         let browser = login(&f.state, None).await;
+        let slow_node = f
+            .state
+            .registry
+            .get("synthetic")
+            .unwrap()
+            .reads
+            .lock()
+            .await;
+        let (status, page, _) = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            call(
+                &f.state,
+                authenticated(get("/api/v1/nodes?limit=1"), &browser),
+                "NodesPage",
+            ),
+        )
+        .await
+        .expect("small fleet page must not wait for node reads");
+        assert_eq!(status, StatusCode::OK);
+        assert!(page["items"][0]["identity_pubkey"].is_null());
+        drop(slow_node);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while f
+                .state
+                .fleet_refreshing
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background fleet refresh completes");
         let (status, page, _) = call(
             &f.state,
-            authenticated(get("/api/v1/nodes"), &browser),
+            authenticated(get("/api/v1/nodes?limit=1"), &browser),
             "NodesPage",
         )
         .await;

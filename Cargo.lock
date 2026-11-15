@@ -1753,6 +1753,7 @@ dependencies = [
  "ipnet",
  "libc",
  "lightning-invoice",
+ "rustix 1.1.2",
  "serde",
  "serde_json",
  "tempfile",
