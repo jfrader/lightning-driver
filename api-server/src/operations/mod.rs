@@ -90,10 +90,13 @@ impl EngineError {
 }
 impl From<JournalError> for EngineError {
     fn from(error: JournalError) -> Self {
-        match error {
-            JournalError::NotFound => failure(ErrorCode::NotFound),
-            JournalError::Revoked => failure(ErrorCode::SessionRequired),
-            _ => failure(ErrorCode::StorageUnavailable),
+        let (code, operation_id) = crate::error::mapping::journal_error_detail(
+            error,
+            crate::error::mapping::ErrorSurface::Engine,
+        );
+        Self {
+            operation_id,
+            ..failure(code)
         }
     }
 }
@@ -109,16 +112,10 @@ impl From<serde_json::Error> for EngineError {
 }
 impl From<AuthError> for EngineError {
     fn from(error: AuthError) -> Self {
-        failure(match error {
-            AuthError::Session => ErrorCode::SessionRequired,
-            AuthError::NotRequired => ErrorCode::AuthorizationNotRequired,
-            AuthError::Authorization => ErrorCode::AuthorizationInvalid,
-            AuthError::Storage => ErrorCode::StorageUnavailable,
-            AuthError::Limited | AuthError::AllocationLimited(_) => ErrorCode::RateLimited,
-            AuthError::Expired => ErrorCode::ChallengeExpired,
-            AuthError::Challenge => ErrorCode::ChallengeInvalid,
-            _ => ErrorCode::AuthenticationFailed,
-        })
+        failure(crate::error::mapping::auth_error_code(
+            &error,
+            crate::error::mapping::ErrorSurface::Engine,
+        ))
     }
 }
 
