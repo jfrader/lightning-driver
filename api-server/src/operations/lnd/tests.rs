@@ -1304,6 +1304,30 @@ async fn rest_hostile_bodies_redirects_permission_and_late_stream_errors_never_r
 }
 
 #[tokio::test]
+async fn rest_body_reader_preserves_frames_and_byte_count_on_late_parse_errors() {
+    for suffix in ["", "{\"error\":{\"code\":7}}\n", "{invalid}\n"] {
+        let body = format!("{{\"result\":{{\"marker\":1}}}}\n{suffix}").into_bytes();
+        let budget = body.len();
+        let server = Server::start(false, vec![Step::raw("POST", "/v2/router/send", body)]).await;
+        let directory = tempfile::tempdir().unwrap();
+        let settings = settings(directory.path(), server.endpoint.clone(), Backend::LndRest);
+        let rest = Rest::connect(&settings, &Limits::default()).unwrap();
+        let reply = rest.call(Rpc::Pay, json!({}), budget).await;
+        assert_eq!(reply.frames, vec![json!({"marker":1})]);
+        assert_eq!(reply.bytes, budget);
+        match suffix {
+            "" => assert!(reply.error.is_none()),
+            "{invalid}\n" => assert!(matches!(reply.error, Some(transport::CallError::Invalid))),
+            _ => assert!(matches!(
+                reply.error,
+                Some(transport::CallError::Status(tonic::Code::PermissionDenied))
+            )),
+        }
+        server.stop(1).await;
+    }
+}
+
+#[tokio::test]
 async fn grpc_stream_statuses_truncation_and_late_errors_preserve_only_proven_evidence() {
     for (status, frame, code, expected) in [
         (2, true, 7, "success"),

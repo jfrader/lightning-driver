@@ -61,17 +61,13 @@ impl ClnAdapter {
         Ok(InfoObservation {
             identity_pubkey: info.identity,
             network: info.network,
-            status: NodeStatus {
-                node_id: self.config.binding.node_id.clone(),
-                status: NodeConnection::Online,
-                synced_to_chain: info.synced,
-                synced_to_graph: None,
-                block_height: info.height,
-                observed_at: Some(now),
-                checked_at: now,
-                stale: false,
-                error_code: None,
-            },
+            status: adapter::online_status(
+                &self.config.binding.node_id,
+                info.synced,
+                None,
+                info.height,
+                now,
+            ),
             alias: info.alias,
             version: info.version,
         })
@@ -493,17 +489,7 @@ impl Adapter for ClnAdapter {
     }
     fn observe_exact(&self, query: ObservationQuery) -> ResponseFuture<'_, Evidence> {
         Box::pin(async move {
-            let fallback = Evidence {
-                operation_id: query.operation_id,
-                binding: query.binding.clone(),
-                generation: query.generation,
-                kind: query.kind,
-                claim_id: query.claim_id,
-                sequence: query.sequence,
-                reference: query.reference.clone(),
-                class: Class::Lost,
-                facts: None,
-            };
+            let fallback = Evidence::lost(&query);
             tokio::time::timeout(self.transport.deadline(), self.observe(query))
                 .await
                 .unwrap_or(fallback)
@@ -659,7 +645,7 @@ fn dispatch_facts(
                 for tx in reads::array(value, "txids")? {
                     txids.push(reads::txid(&json!({"txid":tx}), "txid")?);
                 }
-                if txids.is_empty() || txids.len() > 64 {
+                if txids.is_empty() || txids.len() > evidence::MAX_CLOSE_TXIDS {
                     return Err(invalid());
                 }
             }

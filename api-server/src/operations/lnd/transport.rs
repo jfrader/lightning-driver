@@ -1,6 +1,9 @@
 use super::*;
+use crate::transport::{
+    node_client_builder, read_bounded_body, validate_node_endpoint, EndpointPolicy,
+};
 use lightning_client::settings::{read_protected, Limits, NodeSettings};
-use reqwest::{header::HeaderValue, redirect::Policy};
+use reqwest::header::HeaderValue;
 use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -260,18 +263,7 @@ pub(super) struct Credentials {
 impl Credentials {
     pub fn load(settings: &NodeSettings, limits: &Limits) -> Result<Self> {
         let u = &settings.endpoint;
-        if u.scheme() != "https"
-            || u.host_str().is_none()
-            || !u.username().is_empty()
-            || u.password().is_some()
-            || u.query().is_some()
-            || u.fragment().is_some()
-            || u.path() != "/"
-            || limits.rpc_seconds == 0
-            || limits.rpc_seconds > i32::MAX as u32
-            || limits.max_response_bytes == 0
-            || limits.pagination.snapshot_max_items == 0
-        {
+        if !validate_node_endpoint(u, limits, EndpointPolicy::Lnd) {
             return Err(failure(ErrorCode::NotConfigured));
         }
         let certificate = read_protected(
@@ -308,12 +300,7 @@ pub(super) struct Rest {
 impl Rest {
     pub fn connect(settings: &NodeSettings, limits: &Limits) -> Result<Self> {
         let c = Credentials::load(settings, limits)?;
-        let client = reqwest::Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .timeout(c.deadline)
-            .https_only(true)
-            .tls_built_in_root_certs(false);
+        let client = node_client_builder(limits, true);
         let client = match settings.tls_verification {
             lightning_client::settings::TlsVerification::Ca => client.add_root_certificate(
                 reqwest::Certificate::from_pem(&c.certificate)
@@ -406,31 +393,31 @@ impl Rest {
                 .collect();
             req = req.query(&query);
         }
-        let mut response = req.send().await.map_err(|_| CallError::Offline)?;
+        let response = req.send().await.map_err(|_| CallError::Offline)?;
         let status = response.status();
         if status.is_redirection() {
             return Err(CallError::Offline);
         }
         let success = matches!(status.as_u16(), 200 | 201);
-        if response.content_length().is_some_and(|n| n > budget as u64) {
-            return Err(CallError::Limit);
-        }
-        let mut buffer = zeroize::Zeroizing::new(Vec::new());
-        while let Some(chunk) = response.chunk().await.map_err(|_| CallError::Offline)? {
-            if chunk.len() > budget.saturating_sub(reply.bytes) {
-                return Err(CallError::Limit);
-            }
-            reply.bytes += chunk.len();
-            buffer.extend_from_slice(&chunk);
-            if rpc.streamed() && success {
-                while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
-                    let frame: Value =
-                        serde_json::from_slice(&buffer[..pos]).map_err(|_| CallError::Invalid)?;
-                    parse_frame(frame, reply)?;
-                    buffer.drain(..=pos);
+        let buffer = read_bounded_body(
+            response,
+            budget,
+            || CallError::Limit,
+            || CallError::Offline,
+            |buffer, received| {
+                reply.bytes = received;
+                if rpc.streamed() && success {
+                    while let Some(pos) = buffer.iter().position(|b| *b == b'\n') {
+                        let frame: Value = serde_json::from_slice(&buffer[..pos])
+                            .map_err(|_| CallError::Invalid)?;
+                        parse_frame(frame, reply)?;
+                        buffer.drain(..=pos);
+                    }
                 }
-            }
-        }
+                Ok(())
+            },
+        )
+        .await?;
         if !success {
             let v: Value = serde_json::from_slice(&buffer).map_err(|_| CallError::Invalid)?;
             let error = status_error(&v)?;

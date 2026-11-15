@@ -1,8 +1,10 @@
 use super::*;
+use crate::transport::{
+    node_client_builder, read_bounded_body, validate_node_endpoint, EndpointPolicy,
+};
 use lightning_client::settings::{read_protected, Limits, NodeSettings};
 use reqwest::{
     header::{HeaderMap, HeaderValue},
-    redirect::Policy,
     Client, StatusCode,
 };
 use std::time::Duration;
@@ -150,17 +152,7 @@ pub(super) struct Transport {
 impl Transport {
     pub fn connect(settings: &NodeSettings, limits: &Limits) -> Result<Self> {
         let endpoint = &settings.endpoint;
-        if endpoint.scheme() != "https"
-            || endpoint.host_str().is_none()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-            || endpoint.path() != "/"
-            || limits.rpc_seconds == 0
-            || limits.max_response_bytes == 0
-            || limits.pagination.snapshot_max_items == 0
-        {
+        if !validate_node_endpoint(endpoint, limits, EndpointPolicy::Cln) {
             return Err(failure(ErrorCode::NotConfigured));
         }
         let certificate = read_protected(
@@ -183,19 +175,11 @@ impl Transport {
                 .trim_end_matches(['\r', '\n'])
                 .to_owned(),
         );
-        let client = Self::builder(limits)
-            .https_only(true)
-            .tls_built_in_root_certs(false)
+        let client = node_client_builder(limits, true)
             .add_root_certificate(certificate)
             .build()
             .map_err(|_| failure(ErrorCode::NotConfigured))?;
         Self::new(client, endpoint.clone(), rune, limits)
-    }
-    fn builder(limits: &Limits) -> reqwest::ClientBuilder {
-        Client::builder()
-            .redirect(Policy::none())
-            .no_proxy()
-            .timeout(Duration::from_secs(u64::from(limits.rpc_seconds)))
     }
     fn new(
         client: Client,
@@ -260,7 +244,7 @@ impl Transport {
             .endpoint
             .join(&format!("v1/{}", rpc.method()))
             .map_err(|_| CallError::Invalid)?;
-        let mut response = self
+        let response = self
             .client
             .post(url)
             .headers(headers)
@@ -272,16 +256,14 @@ impl Transport {
         if status.is_redirection() {
             return Err(CallError::Offline);
         }
-        if response.content_length().is_some_and(|n| n > budget as u64) {
-            return Err(CallError::Limit);
-        }
-        let mut bytes = zeroize::Zeroizing::new(Vec::new());
-        while let Some(chunk) = response.chunk().await.map_err(|_| CallError::Offline)? {
-            if chunk.len() > budget.saturating_sub(bytes.len()) {
-                return Err(CallError::Limit);
-            }
-            bytes.extend_from_slice(&chunk);
-        }
+        let bytes = read_bounded_body(
+            response,
+            budget,
+            || CallError::Limit,
+            || CallError::Offline,
+            |_, _| Ok(()),
+        )
+        .await?;
         if status != StatusCode::CREATED {
             #[derive(Deserialize)]
             struct RpcError {
@@ -303,7 +285,7 @@ impl Transport {
     #[cfg(test)]
     pub fn synthetic(endpoint: url::Url, limits: &Limits) -> Self {
         Self::new(
-            Self::builder(limits).build().unwrap(),
+            node_client_builder(limits, false).build().unwrap(),
             endpoint,
             zeroize::Zeroizing::new("SYNTHETIC_RUNE_CANARY".into()),
             limits,

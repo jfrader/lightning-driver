@@ -5,6 +5,9 @@ use serde::Serialize;
 use std::fmt;
 use uuid::Uuid;
 
+pub(crate) mod mapping;
+use mapping::{auth_error_code, journal_error_detail, ErrorSurface};
+
 #[derive(Debug)]
 pub struct ApiError {
     pub code: ErrorCode,
@@ -137,50 +140,51 @@ impl ResponseError for ApiError {
 
 impl From<AuthError> for ApiError {
     fn from(error: AuthError) -> Self {
+        let mut api_error = Self::new(auth_error_code(&error, ErrorSurface::Api));
         if let AuthError::AllocationLimited(seconds) = error {
-            let mut error = Self::new(ErrorCode::RateLimited);
-            error.retry_after = Some(seconds);
-            return error;
+            api_error.retry_after = Some(seconds);
         }
-        Self::new(match error {
-            AuthError::NotFound => ErrorCode::NotFound,
-            AuthError::LastCredential => ErrorCode::LastCredential,
-            AuthError::EnrollmentUnavailable => ErrorCode::EnrollmentUnavailable,
-            AuthError::InvalidRequest => ErrorCode::InvalidRequest,
-            AuthError::Session => ErrorCode::SessionRequired,
-            AuthError::Csrf => ErrorCode::Csrf,
-            AuthError::Authentication => ErrorCode::AuthenticationFailed,
-            AuthError::Challenge => ErrorCode::ChallengeInvalid,
-            AuthError::Expired => ErrorCode::ChallengeExpired,
-            AuthError::Limited => ErrorCode::RateLimited,
-            AuthError::AllocationLimited(_) => ErrorCode::RateLimited,
-            AuthError::Authorization => ErrorCode::AuthorizationInvalid,
-            AuthError::NotRequired => ErrorCode::AuthorizationNotRequired,
-            AuthError::ReauthRequired => ErrorCode::ReauthRequired,
-            AuthError::Storage => ErrorCode::StorageUnavailable,
-        })
+        api_error
     }
 }
 
 impl From<JournalError> for ApiError {
     fn from(error: JournalError) -> Self {
-        let (code, id) = match error {
-            JournalError::NotFound => (ErrorCode::NotFound, None),
-            JournalError::IdempotencyConflict(id) => (ErrorCode::IdempotencyConflict, Some(id)),
-            JournalError::ResourceBusy(id) => (ErrorCode::ResourceBusy, Some(id)),
-            JournalError::AlreadyPaid(id) => (ErrorCode::AlreadyPaid, Some(id)),
-            JournalError::NotReviewable => (ErrorCode::OperationNotReviewable, None),
-            JournalError::ReviewExpired => (ErrorCode::ReviewExpired, None),
-            JournalError::Revoked => (ErrorCode::SessionRequired, None),
-            JournalError::ResponseTooLarge => (ErrorCode::InternalError, None),
-            JournalError::Storage | JournalError::Secret => (ErrorCode::StorageUnavailable, None),
-        };
+        let (code, id) = journal_error_detail(error, ErrorSurface::Api);
         Self {
             code,
             operation_id: id,
             outcome: ErrorOutcome::NotDispatched,
             retry_after: None,
             availability_reason: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn allocation_limit_keeps_retry_after_and_message() {
+        for seconds in [0, 17] {
+            let error = ApiError::from(AuthError::AllocationLimited(seconds));
+            assert_eq!(error.code, ErrorCode::RateLimited);
+            assert_eq!(error.retry_after, Some(seconds));
+            assert_eq!(
+                error.message(),
+                "Too many requests. Wait before starting again."
+            );
+            assert_eq!(
+                error
+                    .error_response()
+                    .headers()
+                    .get("Retry-After")
+                    .unwrap()
+                    .to_str()
+                    .unwrap(),
+                seconds.to_string()
+            );
         }
     }
 }

@@ -936,6 +936,19 @@ async fn configured_tls_root_hostname_and_file_credentials_fail_closed() {
 }
 
 #[tokio::test]
+async fn cln_keeps_ca_verification_even_when_pinned_is_selected() {
+    let directory = tempfile::tempdir().unwrap();
+    let (endpoint, task) = tls_server("localhost").await;
+    let mut settings = settings(directory.path(), endpoint);
+    settings.tls_verification = lightning_client::settings::TlsVerification::Pinned;
+    let adapter = ClnAdapter::connect(&settings, &Limits::default(), config())
+        .await
+        .unwrap();
+    adapter.read(ReadQuery::Info).await.unwrap();
+    assert!(task.await.unwrap().is_some());
+}
+
+#[tokio::test]
 async fn configured_deadline_never_retries_a_mutation() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/", listener.local_addr().unwrap())
@@ -1051,6 +1064,32 @@ fn query(
         close_type: None,
         close_txids: vec![],
     }
+}
+
+#[test]
+fn lost_evidence_keeps_exact_observation_identity_and_reference() {
+    let mut query = query(
+        OperationKind::CloseChannel,
+        &config(),
+        RecoveryReference {
+            channel: Some("ab".repeat(32)),
+            ..Default::default()
+        },
+    );
+    query.sequence = 19;
+    let fallback = Evidence::lost(&query);
+    assert_eq!(fallback.operation_id, query.operation_id);
+    assert_eq!(fallback.binding, query.binding);
+    assert_eq!(fallback.generation, query.generation);
+    assert_eq!(fallback.kind, query.kind);
+    assert_eq!(fallback.claim_id, query.claim_id);
+    assert_eq!(fallback.sequence, 19);
+    assert_eq!(
+        serde_json::to_value(&fallback.reference).unwrap(),
+        serde_json::to_value(&query.reference).unwrap()
+    );
+    assert!(matches!(fallback.class, Class::Lost));
+    assert!(fallback.facts.is_none());
 }
 
 #[tokio::test]

@@ -29,6 +29,191 @@ const KINDS: [OperationKind; 8] = [
     OperationKind::SendOnchain,
 ];
 
+#[test]
+fn auth_error_conversions_preserve_every_surface_code() {
+    use crate::error::ApiError;
+    type Case = (fn() -> AuthError, ErrorCode, ErrorCode);
+    let cases: [Case; 16] = [
+        (
+            || AuthError::NotFound,
+            ErrorCode::NotFound,
+            ErrorCode::AuthenticationFailed,
+        ),
+        (
+            || AuthError::LastCredential,
+            ErrorCode::LastCredential,
+            ErrorCode::AuthenticationFailed,
+        ),
+        (
+            || AuthError::EnrollmentUnavailable,
+            ErrorCode::EnrollmentUnavailable,
+            ErrorCode::AuthenticationFailed,
+        ),
+        (
+            || AuthError::InvalidRequest,
+            ErrorCode::InvalidRequest,
+            ErrorCode::AuthenticationFailed,
+        ),
+        (
+            || AuthError::Csrf,
+            ErrorCode::Csrf,
+            ErrorCode::AuthenticationFailed,
+        ),
+        (
+            || AuthError::ReauthRequired,
+            ErrorCode::ReauthRequired,
+            ErrorCode::AuthenticationFailed,
+        ),
+        (
+            || AuthError::Session,
+            ErrorCode::SessionRequired,
+            ErrorCode::SessionRequired,
+        ),
+        (
+            || AuthError::Authentication,
+            ErrorCode::AuthenticationFailed,
+            ErrorCode::AuthenticationFailed,
+        ),
+        (
+            || AuthError::Challenge,
+            ErrorCode::ChallengeInvalid,
+            ErrorCode::ChallengeInvalid,
+        ),
+        (
+            || AuthError::Expired,
+            ErrorCode::ChallengeExpired,
+            ErrorCode::ChallengeExpired,
+        ),
+        (
+            || AuthError::Limited,
+            ErrorCode::RateLimited,
+            ErrorCode::RateLimited,
+        ),
+        (
+            || AuthError::AllocationLimited(17),
+            ErrorCode::RateLimited,
+            ErrorCode::RateLimited,
+        ),
+        (
+            || AuthError::Authorization,
+            ErrorCode::AuthorizationInvalid,
+            ErrorCode::AuthorizationInvalid,
+        ),
+        (
+            || AuthError::NotRequired,
+            ErrorCode::AuthorizationNotRequired,
+            ErrorCode::AuthorizationNotRequired,
+        ),
+        (
+            || AuthError::Storage,
+            ErrorCode::StorageUnavailable,
+            ErrorCode::StorageUnavailable,
+        ),
+        (
+            || AuthError::AllocationLimited(0),
+            ErrorCode::RateLimited,
+            ErrorCode::RateLimited,
+        ),
+    ];
+    for (error, api_code, engine_code) in cases {
+        let api = ApiError::from(error());
+        let engine = EngineError::from(error());
+        assert_eq!(api.code, api_code, "{:?}", error());
+        assert_eq!(engine.code, engine_code, "{:?}", error());
+        assert_eq!(api.operation_id, None);
+        assert_eq!(engine.operation_id, None);
+        assert_eq!(api.outcome, ErrorOutcome::NotDispatched);
+        assert_eq!(engine.outcome, ErrorOutcome::NotDispatched);
+    }
+}
+
+#[test]
+fn journal_error_conversions_preserve_every_code_and_operation_id() {
+    use crate::error::ApiError;
+    let id = Uuid::new_v4();
+    for (api_error, engine_error, api_code, engine_code, api_id) in [
+        (
+            JournalError::NotFound,
+            JournalError::NotFound,
+            ErrorCode::NotFound,
+            ErrorCode::NotFound,
+            None,
+        ),
+        (
+            JournalError::Revoked,
+            JournalError::Revoked,
+            ErrorCode::SessionRequired,
+            ErrorCode::SessionRequired,
+            None,
+        ),
+        (
+            JournalError::IdempotencyConflict(id),
+            JournalError::IdempotencyConflict(id),
+            ErrorCode::IdempotencyConflict,
+            ErrorCode::StorageUnavailable,
+            Some(id),
+        ),
+        (
+            JournalError::ResourceBusy(id),
+            JournalError::ResourceBusy(id),
+            ErrorCode::ResourceBusy,
+            ErrorCode::StorageUnavailable,
+            Some(id),
+        ),
+        (
+            JournalError::AlreadyPaid(id),
+            JournalError::AlreadyPaid(id),
+            ErrorCode::AlreadyPaid,
+            ErrorCode::StorageUnavailable,
+            Some(id),
+        ),
+        (
+            JournalError::NotReviewable,
+            JournalError::NotReviewable,
+            ErrorCode::OperationNotReviewable,
+            ErrorCode::StorageUnavailable,
+            None,
+        ),
+        (
+            JournalError::ReviewExpired,
+            JournalError::ReviewExpired,
+            ErrorCode::ReviewExpired,
+            ErrorCode::StorageUnavailable,
+            None,
+        ),
+        (
+            JournalError::ResponseTooLarge,
+            JournalError::ResponseTooLarge,
+            ErrorCode::InternalError,
+            ErrorCode::StorageUnavailable,
+            None,
+        ),
+        (
+            JournalError::Storage,
+            JournalError::Storage,
+            ErrorCode::StorageUnavailable,
+            ErrorCode::StorageUnavailable,
+            None,
+        ),
+        (
+            JournalError::Secret,
+            JournalError::Secret,
+            ErrorCode::StorageUnavailable,
+            ErrorCode::StorageUnavailable,
+            None,
+        ),
+    ] {
+        let api = ApiError::from(api_error);
+        let engine = EngineError::from(engine_error);
+        assert_eq!(api.code, api_code);
+        assert_eq!(engine.code, engine_code);
+        assert_eq!(api.operation_id, api_id);
+        assert_eq!(engine.operation_id, None);
+        assert_eq!(api.outcome, ErrorOutcome::NotDispatched);
+        assert_eq!(engine.outcome, ErrorOutcome::NotDispatched);
+    }
+}
+
 #[tokio::test]
 async fn reconciliation_unknown_interval_budget_and_restart_never_redispatch() {
     let mut f = Fixture::new().await;

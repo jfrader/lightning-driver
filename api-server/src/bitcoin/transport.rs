@@ -1,4 +1,7 @@
 use crate::operations::{failure, Result};
+use crate::transport::{
+    node_client_builder, read_bounded_body, validate_node_endpoint, EndpointPolicy,
+};
 use lightning_client::{
     model::ErrorCode,
     settings::{read_protected, Limits, NodeSettings, TlsVerification},
@@ -55,23 +58,11 @@ impl Transport {
     pub async fn connect(node: &NodeSettings, limits: &Limits) -> Result<Self> {
         let invalid = || failure(ErrorCode::NotConfigured);
         let endpoint = &node.endpoint;
-        if !matches!(endpoint.scheme(), "http" | "https")
-            || endpoint.host_str().is_none()
-            || !endpoint.username().is_empty()
-            || endpoint.password().is_some()
-            || endpoint.path() != "/"
-            || endpoint.query().is_some()
-            || endpoint.fragment().is_some()
-            || limits.max_response_bytes == 0
-            || limits.rpc_seconds == 0
-        {
+        if !validate_node_endpoint(endpoint, limits, EndpointPolicy::Bitcoin) {
             return Err(invalid());
         }
         let deadline = Duration::from_secs(u64::from(limits.rpc_seconds));
-        let mut builder = reqwest::Client::builder()
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(deadline);
+        let mut builder = node_client_builder(limits, endpoint.scheme() == "https");
         if endpoint.scheme() == "http" {
             let host = endpoint
                 .host_str()
@@ -93,7 +84,6 @@ impl Transport {
             let certificate =
                 read_protected(node.certificate_file.as_deref().ok_or_else(invalid)?, false)
                     .map_err(|_| invalid())?;
-            builder = builder.https_only(true).tls_built_in_root_certs(false);
             builder = match node.tls_verification {
                 TlsVerification::Ca => builder.add_root_certificate(
                     reqwest::Certificate::from_pem(&certificate).map_err(|_| invalid())?,
@@ -152,7 +142,7 @@ impl Transport {
         let (user, password) = credential
             .split_once(':')
             .ok_or_else(|| failure(ErrorCode::NotConfigured))?;
-        let mut response = self
+        let response = self
             .client
             .post(self.endpoint.clone())
             .basic_auth(user, Some(password))
@@ -168,23 +158,14 @@ impl Transport {
             return Err(failure(ErrorCode::NodeAuthError));
         }
         let invalid = || failure(ErrorCode::UpstreamInvalidResponse);
-        if response
-            .content_length()
-            .is_some_and(|size| size > self.max_bytes as u64)
-        {
-            return Err(invalid());
-        }
-        let mut body = zeroize::Zeroizing::new(Vec::new());
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .map_err(|_| failure(ErrorCode::NodeOffline))?
-        {
-            if chunk.len() > self.max_bytes.saturating_sub(body.len()) {
-                return Err(invalid());
-            }
-            body.extend_from_slice(&chunk);
-        }
+        let body = read_bounded_body(
+            response,
+            self.max_bytes,
+            invalid,
+            || failure(ErrorCode::NodeOffline),
+            |_, _| Ok(()),
+        )
+        .await?;
         let envelope: Value = serde_json::from_slice(&body).map_err(|_| invalid())?;
         if envelope.get("id") != Some(&json!(id)) {
             return Err(invalid());
