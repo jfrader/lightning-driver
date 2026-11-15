@@ -1,6 +1,8 @@
 use super::*;
 use lightning_client::money::{Decimal, Msat, Sat};
 
+pub(super) const MAX_CLOSE_TXIDS: usize = 64;
+
 #[derive(Clone, Copy, Serialize, Deserialize)]
 pub(super) enum Rejection {
     InsufficientFunds,
@@ -93,6 +95,21 @@ pub(super) struct Evidence {
     pub reference: RecoveryReference,
     pub class: Class,
     pub facts: Option<Facts>,
+}
+impl Evidence {
+    pub(super) fn lost(query: &ObservationQuery) -> Self {
+        Self {
+            operation_id: query.operation_id,
+            binding: query.binding.clone(),
+            generation: query.generation,
+            kind: query.kind,
+            claim_id: query.claim_id,
+            sequence: query.sequence,
+            reference: query.reference.clone(),
+            class: Class::Lost,
+            facts: None,
+        }
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct Knowledge {
@@ -597,7 +614,7 @@ fn positive(
         ) => {
             if Some(&channel) != intent.close_target.as_ref()
                 || reference.channel.as_ref() != Some(&channel)
-                || txids.len() > 64
+                || txids.len() > MAX_CLOSE_TXIDS
                 || txids.iter().any(|id| !txid(id))
             {
                 return Err(invalid());

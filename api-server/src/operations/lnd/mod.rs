@@ -116,17 +116,13 @@ impl<T: Wire> LndAdapter<T> {
             network: info.network,
             alias: info.alias,
             version: info.version,
-            status: NodeStatus {
-                node_id: self.config.binding.node_id.clone(),
-                status: NodeConnection::Online,
-                synced_to_chain: info.synced,
-                synced_to_graph: info.graph_synced,
-                block_height: info.height,
-                observed_at: Some(now),
-                checked_at: now,
-                stale: false,
-                error_code: None,
-            },
+            status: adapter::online_status(
+                &self.config.binding.node_id,
+                info.synced,
+                info.graph_synced,
+                info.height,
+                now,
+            ),
         })
     }
     async fn inventory(&self, b: &mut usize) -> Result<(Collection<Channel>, Value)> {
@@ -308,7 +304,7 @@ impl<T: Wire> LndAdapter<T> {
                         new.extend(old.iter().cloned());
                         new.sort();
                         new.dedup();
-                        if new.len() > 64 {
+                        if new.len() > evidence::MAX_CLOSE_TXIDS {
                             e.class = Class::Partial;
                             e.facts = None;
                             break;
@@ -570,17 +566,7 @@ impl<T: Wire> Adapter for LndAdapter<T> {
     }
     fn observe_exact(&self, q: ObservationQuery) -> ResponseFuture<'_, Evidence> {
         Box::pin(async move {
-            let fallback = Evidence {
-                operation_id: q.operation_id,
-                binding: q.binding.clone(),
-                generation: q.generation,
-                kind: q.kind,
-                claim_id: q.claim_id,
-                sequence: q.sequence,
-                reference: q.reference.clone(),
-                class: Class::Lost,
-                facts: None,
-            };
+            let fallback = Evidence::lost(&q);
             tokio::time::timeout(self.transport.deadline(), self.observe(q))
                 .await
                 .unwrap_or(fallback)
