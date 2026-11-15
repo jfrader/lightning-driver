@@ -496,7 +496,4 @@ impl Wire for Grpc {
     fn macaroon(&self) -> &str {
         &self.macaroon
     }
-    fn backend(&self) -> Backend {
-        Backend::LndGrpc
-    }
 }

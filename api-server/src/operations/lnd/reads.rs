@@ -508,6 +508,7 @@ pub(super) fn fees(node: &str, now: DateTime<Utc>) -> FeeEstimates {
         priority: None,
     }
 }
+#[cfg(test)]
 pub(super) fn fee_rate(v: &Value) -> Result<Option<Decimal>> {
     Ok(amount(v, "sat_per_kw")?.and_then(|n| Decimal::new(n.get().div_ceil(250)).ok()))
 }

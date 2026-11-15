@@ -29,6 +29,9 @@ pub(super) enum Rpc {
     Close,
     Address,
     Send,
+    /// The wallet-kit estimate is implemented for both transports and covered by its test, but no
+    /// operation issues it yet: the fee surface reports "not reported" until one does.
+    #[allow(dead_code)]
     EstimateFee,
     TowerInfo,
     TowerStats,
@@ -251,7 +254,6 @@ pub(super) trait Wire: Send + Sync {
     fn deadline(&self) -> Duration;
     fn byte_budget(&self) -> usize;
     fn macaroon(&self) -> &str;
-    fn backend(&self) -> Backend;
 }
 pub(super) struct Credentials {
     pub certificate: Vec<u8>,
@@ -480,8 +482,5 @@ impl Wire for Rest {
     }
     fn macaroon(&self) -> &str {
         &self.macaroon
-    }
-    fn backend(&self) -> Backend {
-        Backend::LndRest
     }
 }
