@@ -10,16 +10,29 @@ async function fixture(t, env = {}) {
   const root = await mkdtemp(join(tmpdir(), 'ld-ui-'));
   await writeFile(join(root, 'index.html'), '<html>UI</html>');
   const child = spawn(process.execPath, ['deploy/server.mjs'], {
-    env: { ...process.env, DIST: root, PORT: '0', HOST: '127.0.0.1', ...env },
+    env: {
+      ...process.env,
+      RELAY_ORIGINS: '',
+      TRUSTED_PROXY: '',
+      API_HOST: '127.0.0.1',
+      DIST: root,
+      PORT: '0',
+      HOST: '127.0.0.1',
+      ...env,
+    },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   t.after(async () => {
-    child.kill();
-    await new Promise(resolve => child.once('exit', resolve));
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill();
+      await new Promise(resolve => child.once('exit', resolve));
+    }
     await rm(root, { recursive: true, force: true });
   });
   const address = await new Promise((resolve, reject) => {
     child.once('error', reject);
+    // A startup failure exits before stdout; surface it instead of waiting forever.
+    child.once('exit', code => reject(new Error(`server exited before startup (${code})`)));
     child.stdout.once('data', data => resolve(String(data).match(/http:\/\/([^ ]+)/)[1]));
   });
   return { root, get: (path, headers) => new Promise((resolve, reject) => {
@@ -61,6 +74,8 @@ test('only a trusted proxy may name the client identity', async t => {
   assert.equal(received['x-forwarded-for'], undefined);
   await get('/api/v1/auth/bootstrap', { 'x-real-ip': 'not-an-ip' });
   assert.equal(received['x-real-ip'], '127.0.0.1');
+  await get('/api/v1/auth/bootstrap', { 'x-real-ip': '2001:0DB8:0:0:0:0:0:1' });
+  assert.equal(received['x-real-ip'], '2001:db8::1');
 });
 
 test('static files cannot escape into prefix siblings or external symlinks', async t => {

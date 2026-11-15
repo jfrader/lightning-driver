@@ -78,11 +78,24 @@ const TRUSTED_PROXY = new Set(
     .filter(Boolean),
 );
 
+function canonicalIp(text) {
+  const version = isIP(text);
+  if (version === 0) return null;
+  if (version === 4) return text;
+  // The API compares the header text with the canonical Rust rendering of the address, so an
+  // expanded or uppercase IPv6 claim must be compressed here before it is forwarded.
+  try {
+    return new URL(`http://[${text}]/`).hostname.slice(1, -1);
+  } catch {
+    return null;
+  }
+}
+
 function clientIdentity(req) {
   const peer = req.socket.remoteAddress?.replace(/^::ffff:/, '') ?? '';
   if (!TRUSTED_PROXY.has(peer)) return peer;
-  const claimed = String(req.headers['x-real-ip'] ?? '').trim();
-  return isIP(claimed) ? claimed : peer;
+  const claimed = canonicalIp(String(req.headers['x-real-ip'] ?? '').trim());
+  return claimed ?? peer;
 }
 
 function proxy(req, res) {

@@ -122,7 +122,7 @@ unit; the installer re-renders the main unit and would drop values written there
 ```sh
 sudo systemctl edit lightning-driver-ui
 # [Service]
-# Environment=RELAY_ORIGINS=wss://relay.example wss://relay2.example
+# Environment="RELAY_ORIGINS=wss://relay.example wss://relay2.example"
 sudo systemctl restart lightning-driver-ui.service
 ```
 

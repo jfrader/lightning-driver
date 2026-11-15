@@ -59,6 +59,10 @@ done
 [ -n "$BINARY" ] || fail "build as your own user first (cargo build --locked --release -p api-server) and pass --binary target/release/api-server; this installer never builds as root"
 [ -f "$UI_DIST/index.html" ] || fail "$UI_DIST does not look like a built UI (missing index.html)"
 [ -n "$MANIFEST" ] && [ -n "$MANIFEST_SHA256" ] || fail "trusted --artifact-manifest and --manifest-sha256 are required"
+# Resolve symlinks and parent components before the home-directory checks and unit rendering: a
+# prefix spelled outside home but linked into it would otherwise slip past ProtectHome=yes.
+PREFIX=$(realpath -m -- "$PREFIX") || fail "cannot resolve --prefix"
+STATE=$(realpath -m -- "$STATE") || fail "cannot resolve --state"
 command -v node >/dev/null || fail "node is required for artifact verification and the UI service"
 node "$ROOT/deploy/verify-artifacts.mjs" "$MANIFEST" "$MANIFEST_SHA256" "$UI_DIST" "$BINARY" || fail "artifact verification failed"
 [ -f "$STATE/config.toml" ] || fail "$STATE/config.toml is missing; write the configuration first"
@@ -84,6 +88,8 @@ STAGING=$(mktemp -d)
 trap 'rm -rf "$STAGING"' EXIT
 mkdir "$STAGING/ui"
 cp -R "$UI_DIST"/. "$STAGING/ui/"
+# Readability is fixed on the private staging copy; never chmod a caller-provided directory tree.
+chmod -R a+rX "$STAGING/ui"
 install -m 755 "$BINARY" "$STAGING/api-server"
 # Verify the private snapshot, not a mutable caller-owned path, before publication.
 if [ -n "${MANIFEST:-}" ]; then
@@ -97,7 +103,6 @@ install -m 755 "$STAGING/api-server" "$LIB/api-server"
 install -m 644 "$ROOT/deploy/server.mjs" "$LIB/server.mjs"
 rm -rf "$SHARE"
 cp -R "$STAGING/ui" "$SHARE"
-chmod -R a+rX "$SHARE" "$LIB"
 
 printf 'Rendering units into %s\n' "$UNIT_DIR"
 install -d -m 755 "$UNIT_DIR"

@@ -591,11 +591,12 @@ async fn cancelling_a_preparing_review_releases_its_shared_permit() {
             .code,
         ErrorCode::RateLimited
     );
-    assert!(f
+    let error = f
         .engine
         .dispatch_once(&f.context, &f.node, Uuid::new_v4(), "unused", None)
         .await
-        .is_err());
+        .expect_err("a full admission queue refuses dispatch");
+    assert_eq!(error.code, ErrorCode::StorageUnavailable);
     task.abort();
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(f.engine.tasks.available_permits(), 1);
@@ -627,11 +628,12 @@ async fn reviews_share_admission_with_reads_and_confirms_and_release_on_errors()
             .code,
         ErrorCode::RateLimited
     );
-    assert!(f
+    let error = f
         .engine
         .dispatch_once(&f.context, &f.node, Uuid::new_v4(), "unused", None)
         .await
-        .is_err());
+        .expect_err("a full admission queue refuses dispatch");
+    assert_eq!(error.code, ErrorCode::StorageUnavailable);
     drop(occupied);
     assert!(f
         .engine
