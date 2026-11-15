@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 mod adapter;
 mod cln;
 mod evidence;
@@ -435,6 +433,8 @@ impl Engine {
         Ok(response)
     }
 
+    /// Test convenience: the suite only needs the operation, not whether it was dispatched now.
+    #[cfg(test)]
     async fn confirm_once(
         &self,
         context: &Context,
