@@ -1,5 +1,5 @@
 [package]
-name = "api-server"
+name = "lightning-driver-api"
 version = "1.0.0"
 edition = "2021"
 description = "HTTP API with operator authentication, policy enforcement and a durable journal for Lightning and Bitcoin nodes"
@@ -12,6 +12,13 @@ rust-version = "1.89"
 
 [package.metadata.docs.rs]
 all-features = true
+
+[lib]
+name = "api_server"
+
+[[bin]]
+name = "api-server"
+path = "src/main.rs"
 
 [dependencies]
 actix-web = { workspace = true }

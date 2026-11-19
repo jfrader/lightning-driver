@@ -27,6 +27,10 @@ jobs:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false
+      - name: Release helper tests
+        run: python3 -B -m unittest discover -s tools -p 'test_release.py'
+      - name: Tag matches both crate versions
+        run: python3 tools/release.py
       - name: Toolchain prerequisites
         run: |
           rustc --version
@@ -41,22 +45,23 @@ jobs:
         run: cargo test --workspace --all-targets
       # https://crates.io/docs/trusted-publishing
       # Bootstrap once from the release checkout: use a crates.io API token with
-      # cargo login, then cargo publish -p lightning-client and cargo publish -p api-server.
+      # cargo login, then cargo publish -p lightning-client and cargo publish -p lightning-driver-api.
       # Each crate must exist before configuring Settings > Trusted Publishing:
       # owner jfrader, repository lightning-driver, workflow release.yml, no environment.
       # Later version tags (or dispatches on those tags) publish both crates and create the release.
       - name: Authenticate with crates.io
         id: auth
         uses: rust-lang/crates-io-auth-action@3268eb413133e2960fa4ae0e963ca76380c54cd9 # v1.0.6
-      - name: Publish shared client
-        run: cargo publish -p lightning-client
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-      - name: Publish API server
-        run: cargo publish -p api-server
+      - name: Publish missing crate versions in dependency order
+        run: python3 tools/release.py --publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
       - name: GitHub release
-        run: gh release create "$GITHUB_REF_NAME" --generate-notes
+        run: |
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "Release $GITHUB_REF_NAME already exists"
+          else
+            gh release create "$GITHUB_REF_NAME" --verify-tag --generate-notes
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}

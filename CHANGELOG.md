@@ -13,7 +13,7 @@ and this project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.ht
   Core Lightning (REST) and Bitcoin Core (RPC) nodes from one configuration.
 - `lightning-client`: shared node and operation models, monetary types, settings
   and validation, including local BOLT11 invoice decoding.
-- `api-server`: HTTP API and host enrollment/recovery commands, passkey and Nostr
+- `lightning-driver-api`: HTTP API and host enrollment/recovery commands, passkey and Nostr
   authentication, persistent sessions, node reads and policy-checked mutations
   backed by a SQLite operation journal.
 - Disposable synthetic nodes for development and tests, systemd installation

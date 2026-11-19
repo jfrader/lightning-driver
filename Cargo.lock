@@ -309,49 +309,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
-name = "api-server"
-version = "1.0.0"
-dependencies = [
- "actix-web",
- "base64 0.21.7",
- "bech32",
- "bitcoin",
- "chacha20poly1305",
- "chrono",
- "clap",
- "hex",
- "http-body",
- "hyper",
- "libc",
- "lightning-client",
- "lightning-invoice",
- "lnd_grpc_rust",
- "rand 0.8.5",
- "reqwest",
- "rusqlite",
- "rustix 1.1.2",
- "rustls 0.21.12",
- "rustls-pemfile",
- "secp256k1",
- "serde",
- "serde_json",
- "sha2",
- "subtle",
- "synthetic-node-harness",
- "tempfile",
- "thiserror 2.0.21",
- "tokio",
- "tokio-rustls 0.24.1",
- "tonic",
- "url",
- "uuid",
- "webauthn-authenticator-rs",
- "webauthn-rs",
- "x509-parser",
- "zeroize",
-]
-
-[[package]]
 name = "arraydeque"
 version = "0.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1760,6 +1717,49 @@ dependencies = [
  "thiserror 2.0.21",
  "url",
  "uuid",
+]
+
+[[package]]
+name = "lightning-driver-api"
+version = "1.0.0"
+dependencies = [
+ "actix-web",
+ "base64 0.21.7",
+ "bech32",
+ "bitcoin",
+ "chacha20poly1305",
+ "chrono",
+ "clap",
+ "hex",
+ "http-body",
+ "hyper",
+ "libc",
+ "lightning-client",
+ "lightning-invoice",
+ "lnd_grpc_rust",
+ "rand 0.8.5",
+ "reqwest",
+ "rusqlite",
+ "rustix 1.1.2",
+ "rustls 0.21.12",
+ "rustls-pemfile",
+ "secp256k1",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "synthetic-node-harness",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-rustls 0.24.1",
+ "tonic",
+ "url",
+ "uuid",
+ "webauthn-authenticator-rs",
+ "webauthn-rs",
+ "x509-parser",
+ "zeroize",
 ]
 
 [[package]]

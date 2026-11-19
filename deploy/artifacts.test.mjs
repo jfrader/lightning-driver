@@ -40,7 +40,7 @@ test('artifact verification fails closed for tampering, extra files and untruste
   const installer = await readFile('deploy/install.sh', 'utf8');
   const readme = await readFile('README.md', 'utf8');
   // The installer never builds as root; the documented build step requires the lockfile.
-  assert.match(readme, /cargo build --locked --release -p api-server/);
+  assert.match(readme, /cargo build --locked --release -p lightning-driver-api/);
   assert.match(installer, /never builds as root/);
   // A recording cargo stub proves the missing-binary path rejects without ever invoking a build.
   const bin = join(root, 'bin');
