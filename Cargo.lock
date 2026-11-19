@@ -310,7 +310,7 @@ checksum = "a23eb6b1614318a8071c9b2521f36b424b2c83db5eb3a0fead4a6c0809af6e61"
 
 [[package]]
 name = "api-server"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "actix-web",
  "base64 0.21.7",
@@ -1745,7 +1745,7 @@ dependencies = [
 
 [[package]]
 name = "lightning-client"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bitcoin",
  "chrono",
@@ -2913,7 +2913,7 @@ dependencies = [
 
 [[package]]
 name = "synthetic-node-harness"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "base64 0.21.7",
  "bitcoin",

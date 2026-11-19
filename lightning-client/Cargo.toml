@@ -1,7 +1,17 @@
 [package]
 name = "lightning-client"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
+description = "Shared models, monetary types, configuration and validation for Lightning Driver nodes."
+license = "MIT"
+repository = "https://github.com/jfrader/lightning-driver"
+readme = "../README.md"
+keywords = ["lightning", "bitcoin", "configuration", "validation"]
+categories = ["cryptography::cryptocurrencies", "config"]
+rust-version = "1.89"
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dependencies]
 config      = { workspace = true }
