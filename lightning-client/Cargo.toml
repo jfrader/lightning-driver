@@ -4,6 +4,7 @@ version = "1.0.0"
 edition = "2021"
 description = "Shared models, monetary types, configuration and validation for Lightning Driver nodes."
 license = "MIT"
+license-file = "../LICENSE"
 repository = "https://github.com/jfrader/lightning-driver"
 readme = "../README.md"
 keywords = ["lightning", "bitcoin", "configuration", "validation"]
