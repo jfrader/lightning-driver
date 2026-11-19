@@ -237,3 +237,16 @@ not a compatibility certification for a real daemon.
 - The API serves no frontend assets. `deploy/install.sh` installs the UI build behind a separate
   static-plus-proxy service on the same origin, routing `/api/v1/*` here.
 - There is no password or other login fallback.
+
+## Releasing
+
+For the first publish, from the release checkout run `cargo login` with a crates.io API token,
+then `cargo publish -p lightning-client`, then `cargo publish -p api-server`.
+Trusted publishing requires each crate to exist first. In each crate's crates.io
+Settings → Trusted Publishing, add GitHub owner `jfrader`, repository `lightning-driver`,
+workflow `release.yml`, and leave the environment empty. Revoke the bootstrap API token.
+
+For subsequent versions, update the manifests and lockfile, then push the matching `v*` tag.
+The release workflow checks the workspace, publishes `lightning-client` then `api-server`
+using trusted publishing, and creates a GitHub release with generated notes.
+Manual workflow dispatch must select a `v*` tag; branch dispatches are skipped.
