@@ -46,7 +46,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .open(&path)?
         .write_all(&serde_json::to_vec_pretty(&config)?)?;
     Settings::load(&path)?;
-    println!("Synthetic nodes only. In separate terminals, from the workspace root:\n\ncargo run -p api-server -- serve --config {}\ncargo run -p api-server -- auth enrollment --config {}\n\nBrowser origin: {public_origin}\nAPI listener: http://127.0.0.1:{DEVELOPMENT_API_PORT}\nStop the API before stopping this harness (Ctrl-C removes the disposable state).",path.display(),path.display());
+    println!("Synthetic nodes only. In separate terminals, from the workspace root:\n\ncargo run -p lightning-driver-api -- serve --config {}\ncargo run -p lightning-driver-api -- auth enrollment --config {}\n\nBrowser origin: {public_origin}\nAPI listener: http://127.0.0.1:{DEVELOPMENT_API_PORT}\nStop the API before stopping this harness (Ctrl-C removes the disposable state).",path.display(),path.display());
     tokio::signal::ctrl_c().await?;
     for harness in harnesses {
         harness.stop().await;

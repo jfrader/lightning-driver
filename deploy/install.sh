@@ -56,7 +56,7 @@ while [ $# -gt 0 ]; do
 done
 
 [ -n "$UI_DIST" ] || fail "--ui-dist is required"
-[ -n "$BINARY" ] || fail "build as your own user first (cargo build --locked --release -p api-server) and pass --binary target/release/api-server; this installer never builds as root"
+[ -n "$BINARY" ] || fail "build as your own user first (cargo build --locked --release -p lightning-driver-api) and pass --binary target/release/api-server; this installer never builds as root"
 [ -f "$UI_DIST/index.html" ] || fail "$UI_DIST does not look like a built UI (missing index.html)"
 [ -n "$MANIFEST" ] && [ -n "$MANIFEST_SHA256" ] || fail "trusted --artifact-manifest and --manifest-sha256 are required"
 # Resolve symlinks and parent components before the home-directory checks and unit rendering: a
