@@ -1,0 +1,17 @@
+.git
+target
+graphify-out
+**/state
+runtime
+**/node_modules
+**/.env
+**/*.sqlite*
+**/*.db*
+**/*.key
+**/*.macaroon
+**/*.rune
+**/*.pem
+**/.cookie
+config.toml
+session_key.bin
+cookies.txt

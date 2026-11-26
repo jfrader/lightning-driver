@@ -1,0 +1,6 @@
+{$LIGHTNING_HOST} {
+	request_body {
+		max_size 128KB
+	}
+	reverse_proxy app:4400
+}

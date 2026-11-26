@@ -1,0 +1,15 @@
+# Remove this line before adding [[nodes]] entries.
+nodes = []
+
+[api]
+bind = "127.0.0.1:8080"
+public_origin = "http://localhost:4400"
+rp_id = "localhost"
+database = "manager.sqlite"
+invoice_key_file = "pending-invoice.key"
+allow_insecure_loopback = true
+
+# For the Caddy profile, replace these three api fields (do not add another table):
+# public_origin = "https://manager.example.com"
+# rp_id = "manager.example.com"
+# allow_insecure_loopback = false
