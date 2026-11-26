@@ -20,9 +20,12 @@ it for you as root.
 Open **http://localhost:4400** (not an IP address: the passkey hostname is
 `localhost`). On a remote host use SSH forwarding, for example
 `ssh -L 4400:127.0.0.1:4400 user@host`, then open that same localhost URL.
-No node is needed to open the UI. Only the UI/proxy port is published, on host
-loopback. API and proxy share one container; the API listens on 127.0.0.1:8080
-inside it. Do not publish that port or use host networking.
+No node is needed to open the UI.
+
+The UI proxy listens on all container interfaces so Docker's host-published
+port can reach it. By default, the host publishes only `127.0.0.1:4400`. The API
+shares the container but listens only on `127.0.0.1:8080` inside it and is never published.
+Do not publish the API port or use host networking.
 
 ## State and nodes
 
@@ -99,7 +102,10 @@ host and permit inbound TCP 80/443. Caddy obtains and renews certificates.
 
 Origin and rp_id must name the same exact host. A hostname change requires
 enrolling a passkey for that hostname. Keep `bind = "127.0.0.1:8080"`.
-Caddy forwards Host and Origin unchanged and caps request bodies at 128KB.
+Caddy's [documented default](https://caddyserver.com/docs/caddyfile/directives/reverse_proxy#defaults)
+passes Host and Origin through to this HTTP upstream; this Caddyfile adds no
+header overrides and caps request bodies at 128KB. Real-domain HTTPS and
+Host/Origin forwarding through Caddy have not been verified end to end.
 Its certificates live in the `caddy_data` volume; do not remove that volume
 during upgrades. Use `docker compose --profile https down` to stop both services.
 

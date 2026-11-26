@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { mkdtemp, readFile, writeFile, mkdir, rm, chmod, stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -27,6 +27,7 @@ test('Compose keeps the API private and defaults to only the hardened app contai
   assert.ok(app.volumes.some((mount) => mount.type === 'bind'
     && mount.source === resolve('deploy/docker/state') && mount.target === '/state' && !mount.read_only));
   assert.deepEqual(caddy.profiles, ['https']);
+  assert.match(caddy.image, /^caddy:[^@\s]+@sha256:[a-f0-9]{64}$/);
   assert.deepEqual(caddy.ports.map((port) => port.target).sort((a, b) => a - b), [80, 443]);
   for (const service of [app, caddy]) {
     assert.ok(!service.privileged);
@@ -37,6 +38,57 @@ test('Compose keeps the API private and defaults to only the hardened app contai
     encoding: 'utf8', env: { ...process.env, COMPOSE_PROFILES: '' },
   });
   assert.equal(defaults.trim(), 'app');
+});
+
+test('all Docker build stages pin their base image tag and digest', async () => {
+  const dockerfile = await readFile('deploy/docker/Dockerfile', 'utf8');
+  const bases = [...dockerfile.matchAll(/^FROM (\S+) AS (\S+)$/gm)];
+  assert.deepEqual(bases.map((match) => match[2]), ['api-build', 'ui-build', 'runtime']);
+  for (const [, image] of bases) assert.match(image, /^(rust|node):[^@\s]+@sha256:[a-f0-9]{64}$/);
+  assert.equal(bases[1][1], bases[2][1], 'UI builder and runtime must use the same Node image');
+});
+
+function assertCaddyPolicy(text) {
+  // Only the reviewed site, body limit and UI upstream are allowed. Extra directives fail closed.
+  const withoutComments = text.replace(/^\s*#.*$/gm, '').trim();
+  assert.match(withoutComments, /^\{\$LIGHTNING_HOST\}\s*\{\s*request_body\s*\{\s*max_size\s+128KB\s*\}\s*reverse_proxy\s+app:4400\s*\}$/);
+}
+
+test('Caddyfile allows only the UI upstream and body limit, without header/CORS rewrites', async (t) => {
+  const text = await readFile('deploy/docker/Caddyfile', 'utf8');
+  assertCaddyPolicy(text);
+  for (const changed of [
+    text.replace('app:4400', 'app:8080'),
+    text.replace('app:4400', 'https://external.example'),
+    text.replace('reverse_proxy app:4400', 'header Access-Control-Allow-Origin *\n\treverse_proxy app:4400'),
+    text.replace('reverse_proxy app:4400', 'reverse_proxy app:4400 {\n\t\theader_up Host other.example\n\t}'),
+    text.replace('reverse_proxy app:4400', 'reverse_proxy app:4400 {\n\t\theader_up Origin https://other.example\n\t}'),
+  ]) assert.throws(() => assertCaddyPolicy(changed));
+
+  const env = { ...process.env, LIGHTNING_HOST: 'manager.example.com' };
+  const binary = spawnSync('caddy', ['version'], { encoding: 'utf8' });
+  if (!binary.error) {
+    assert.equal(binary.status, 0, binary.stderr);
+    execFileSync('caddy', ['validate', '--config', resolve('deploy/docker/Caddyfile')], { env, stdio: 'pipe' });
+    t.diagnostic('Validated with the installed Caddy binary');
+    return;
+  }
+  assert.equal(binary.error.code, 'ENOENT', 'Unexpected error checking the Caddy binary');
+  const compose = JSON.parse(execFileSync('docker', [
+    'compose', '-f', 'deploy/docker/compose.yaml', '--profile', 'https', 'config', '--format', 'json',
+  ], { encoding: 'utf8' }));
+  const image = compose.services.caddy.image;
+  const available = spawnSync('docker', ['image', 'inspect', image], { stdio: 'ignore' });
+  if (available.status === 0) {
+    execFileSync('docker', [
+      'run', '--rm', '--network', 'none', '--env', 'LIGHTNING_HOST=manager.example.com',
+      '--mount', `type=bind,source=${resolve('deploy/docker/Caddyfile')},target=/etc/caddy/Caddyfile,readonly`,
+      image, 'caddy', 'validate', '--config', '/etc/caddy/Caddyfile',
+    ], { stdio: 'pipe' });
+    t.diagnostic('Validated with the locally available pinned Caddy image');
+    return;
+  }
+  t.diagnostic('No local Caddy binary/image available; strict text policy passed (no image pulled)');
 });
 
 test('localhost config matches loopback auth rules and keeps state paths relative', async () => {

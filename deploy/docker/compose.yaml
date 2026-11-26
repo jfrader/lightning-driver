@@ -27,7 +27,8 @@ services:
       start_period: 15s
       retries: 3
   caddy:
-    image: caddy:2.10-alpine
+    # Update only by reviewing the upstream release and replacing the digest and tag together.
+    image: caddy:2.10-alpine@sha256:4c6e91c6ed0e2fa03efd5b44747b625fec79bc9cd06ac5235a779726618e530d
     profiles: [https]
     environment:
       LIGHTNING_HOST: "${LIGHTNING_HOST:-localhost}"

@@ -34,7 +34,8 @@ systemd creates `/var/lib/lightning-driver` owned by the dedicated user, mode
 0700. The shared `deploy/run.sh` creates `config.toml` there on first start
 only, then supervises API and UI; failure of either restarts the service.
 Open **http://localhost:4400**, or forward that port over SSH for a remote host.
-Both listeners are loopback-only. No node is needed for the shell to open.
+With this standalone unit, both listeners are loopback-only. No node is needed
+for the shell to open.
 
 To configure nodes, stop the service, edit `/var/lib/lightning-driver/config.toml`
 using the root README's node examples, and place all credentials under that
