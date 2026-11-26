@@ -10,6 +10,10 @@ source-to-txt.sh
 
 # Local runtime state and protected node material.
 /state/
+/deploy/docker/state/
+/deploy/docker/.env
+/deploy/docker/lightning-driver-state.tar.gz
+/ui-build/
 /runtime/
 *.sqlite
 *.sqlite3

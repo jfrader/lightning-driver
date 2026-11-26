@@ -1,0 +1,49 @@
+name: lightning-driver
+
+services:
+  app:
+    build:
+      context: ../..
+      dockerfile: deploy/docker/Dockerfile
+    user: "${APP_UID:-1000}:${APP_GID:-1000}"
+    environment:
+      LIGHTNING_HOST: "${LIGHTNING_HOST:-localhost:4400}"
+    ports:
+      - "127.0.0.1:4400:4400"
+    volumes:
+      - ./state:/state
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+    healthcheck:
+      test: ["CMD", "node", "/opt/lightning-driver/healthcheck.mjs"]
+      interval: 10s
+      timeout: 8s
+      start_period: 15s
+      retries: 3
+  caddy:
+    image: caddy:2.10-alpine
+    profiles: [https]
+    environment:
+      LIGHTNING_HOST: "${LIGHTNING_HOST:-localhost}"
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      app:
+        condition: service_healthy
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+volumes:
+  caddy_data:
+  caddy_config:

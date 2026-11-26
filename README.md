@@ -27,7 +27,34 @@ The API contract is [`api-server/openapi.json`](api-server/openapi.json); the UI
 - `synthetic-node-harness`: disposable loopback nodes for development and tests.
 - `deploy`: systemd units, the installer and the UI static server.
 
-## Requirements
+## Installation
+
+### Docker (recommended simple path)
+
+Requires Docker with Compose and Git. From this checkout:
+
+```sh
+cd deploy/docker
+install -d -m 0700 state
+export APP_UID=$(id -u) APP_GID=$(id -g)
+docker compose up -d --build
+```
+
+Open **http://localhost:4400**. No node is required to open the UI. The first
+start creates `deploy/docker/state/config.toml`; all persistent state stays in
+that directory. See [Docker setup](deploy/docker/README.md) for enrollment,
+node credentials, backups and optional domain HTTPS with Caddy.
+
+For hosts without Docker, [the simple systemd unit](deploy/standalone/README.md)
+uses one dedicated account and the same process supervisor.
+
+### Hardened host installation
+
+`deploy/install.sh` keeps API and UI in separate accounts and verifies artifact
+manifests. The requirements, configuration and install commands below apply to
+this hardened path.
+
+## Host requirements
 
 - Rust 1.93.1 and Cargo, a C build toolchain, `pkg-config`, OpenSSL headers and `protoc` for the LND
   gRPC bindings. SQLite is bundled.
@@ -84,7 +111,7 @@ A `bitcoin_rpc` node takes `expected_genesis` and the RPC cookie instead of the 
 set `tls_verification = "pinned"` and point `certificate_file` at that exact `tls.cert`; a rotated
 certificate needs the new file and a restart. CLN is CA-verified.
 
-## Running it
+## Running it (hardened host path)
 
 `deploy/install.sh` installs the release API and a static-plus-proxy server as system services with
 distinct `lightning-driver-api` and `lightning-driver-ui` accounts. Create these unprivileged system
@@ -218,12 +245,16 @@ journal and configuration.
 These are the CI steps:
 
 ```sh
+node --test deploy/*.test.mjs
 cargo fmt --all -- --check
 CARGO_BUILD_JOBS=2 cargo clippy --workspace --all-targets -- -D warnings
 CARGO_BUILD_JOBS=2 cargo test --workspace
 CARGO_BUILD_JOBS=2 cargo check -p lightning-client --no-default-features
 CARGO_BUILD_JOBS=2 cargo check --workspace --all-features
 ```
+
+Deployment tests require Node, Docker Compose (configuration parsing only; no
+image build or daemon needed) and Python 3.11+ for the standard TOML parser.
 
 Set `HTTP_EVIDENCE_DIR` while running `cargo test -p lightning-driver-api --lib journeys` to capture actual
 response JSON, then validate it with `python3 tools/validate-journey-responses.py <dir>`. The
