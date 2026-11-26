@@ -103,7 +103,7 @@ Build as your own user first: the installer requires root, and building as root 
 install with the manifest and digest produced by `deploy/manifest.mjs` (see below):
 
 ```sh
-cargo build --locked --release -p api-server
+cargo build --locked --release -p lightning-driver-api
 sudo deploy/install.sh --ui-dist /path/to/lightning-driver-ui/dist \
   --binary target/release/api-server \
   --artifact-manifest /path/to/manifest.json --manifest-sha256 <trusted-manifest-sha256>
@@ -162,7 +162,7 @@ The installer verifies a private staged snapshot before installing it. It never 
 For API-only work, run the server directly:
 
 ```sh
-CARGO_BUILD_JOBS=2 cargo run -p api-server -- serve --config /path/to/state/config.toml
+CARGO_BUILD_JOBS=2 cargo run -p lightning-driver-api -- serve --config /path/to/state/config.toml
 ```
 
 The first `serve` creates `invoice_key_file` with mode `0600`. Logs are JSON Lines on stderr;
@@ -181,7 +181,7 @@ CLN runes are checked with `checkrune` before dispatch.
 Register an authenticator with a token printed once on the host:
 
 ```sh
-cargo run --quiet -p api-server -- auth enrollment --config /path/to/state/config.toml
+cargo run --quiet -p lightning-driver-api -- auth enrollment --config /path/to/state/config.toml
 ```
 
 Submit the token in the UI and complete the passkey or NIP-07 ceremony. Tokens last
@@ -191,7 +191,7 @@ does not create a second operator or revoke the first.
 If every authenticator is lost, reset authentication from the host:
 
 ```sh
-cargo run --quiet -p api-server -- auth recovery \
+cargo run --quiet -p lightning-driver-api -- auth recovery \
   --config /path/to/state/config.toml \
   --confirm-reset-authentication
 ```
@@ -225,7 +225,7 @@ CARGO_BUILD_JOBS=2 cargo check -p lightning-client --no-default-features
 CARGO_BUILD_JOBS=2 cargo check --workspace --all-features
 ```
 
-Set `HTTP_EVIDENCE_DIR` while running `cargo test -p api-server --lib journeys` to capture actual
+Set `HTTP_EVIDENCE_DIR` while running `cargo test -p lightning-driver-api --lib journeys` to capture actual
 response JSON, then validate it with `python3 tools/validate-journey-responses.py <dir>`. The
 validator needs the `jsonschema` Python package.
 
@@ -237,3 +237,18 @@ not a compatibility certification for a real daemon.
 - The API serves no frontend assets. `deploy/install.sh` installs the UI build behind a separate
   static-plus-proxy service on the same origin, routing `/api/v1/*` here.
 - There is no password or other login fallback.
+
+## Releasing
+
+For the first publish, from the release checkout run `cargo login` with a crates.io API token,
+then `cargo publish -p lightning-client`, then `cargo publish -p lightning-driver-api`.
+Trusted publishing requires each crate to exist first. In each crate's crates.io
+Settings → Trusted Publishing, add GitHub owner `jfrader`, repository `lightning-driver`,
+workflow `release.yml`, and leave the environment empty. Revoke the bootstrap API token.
+
+For subsequent versions, update the manifests and lockfile, then push the matching `v*` tag.
+The release workflow requires the tag to match both crate versions, checks the workspace,
+and publishes `lightning-client` then `lightning-driver-api` using trusted publishing.
+Already-published versions are skipped; registry errors fail the run. It creates a GitHub
+release with generated notes unless that release already exists.
+Manual workflow dispatch must select a `v*` tag; branch dispatches are skipped.
